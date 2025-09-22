@@ -35,6 +35,7 @@ A real-time options trading dashboard that integrates with the Schwab API to pro
 - Customizable chart colors
 - Toggle between different chart types
 - Auto-update streaming data
+ - Choose exposure weighting: Open Interest (default) or Volume
 
 ## Installation
 
@@ -130,6 +131,7 @@ A real-time options trading dashboard that integrates with the Schwab API to pro
 - Show/hide calls, puts, or net exposure
 - Color intensity based on exposure values
 - Multiple expiration date support
+ - Use Volume for Exposures: When enabled, all exposure formulas (GEX/DEX/VEX/etc.) are weighted by traded volume instead of open interest
 
 ### Color Customization
 - Customizable call and put colors

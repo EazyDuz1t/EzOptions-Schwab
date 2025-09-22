@@ -318,7 +318,7 @@ def format_display_ticker(ticker):
         return ['SPXW', '$SPX']
     return [ticker]
 
-def fetch_options_for_date(ticker, date):
+def fetch_options_for_date(ticker, date, use_volume_exposure: bool = False):
     try:
         expiry = datetime.strptime(date, '%Y-%m-%d').date()
         chain_response = client.option_chains(
@@ -399,7 +399,7 @@ def fetch_options_for_date(ticker, date):
                             'rho': rho
                         }
                         option_data['side'] = infer_side(option_data['lastPrice'], option_data['bid'], option_data['ask'])
-                        exposures = calculate_greek_exposures(option_data, S, is_put=False)
+                        exposures = calculate_greek_exposures(option_data, S, is_put=False, use_volume_exposure=use_volume_exposure)
                         option_data.update(exposures)
                         calls_data.append(option_data)
         
@@ -456,7 +456,7 @@ def fetch_options_for_date(ticker, date):
                             'rho': rho
                         }
                         option_data['side'] = infer_side(option_data['lastPrice'], option_data['bid'], option_data['ask'])
-                        exposures = calculate_greek_exposures(option_data, S, is_put=True)
+                        exposures = calculate_greek_exposures(option_data, S, is_put=True, use_volume_exposure=use_volume_exposure)
                         option_data.update(exposures)
                         puts_data.append(option_data)
         
@@ -494,9 +494,11 @@ def implied_volatility(S, K, T, r, price, is_put=False):
         # If Brent's method fails, return a default value
         return 0.2  # Default to 20% volatility
 
-def calculate_greek_exposures(option, S, is_put=False):
-    """Calculate accurate Greek exposures"""
+def calculate_greek_exposures(option, S, is_put: bool = False, use_volume_exposure: bool = False):
+    """Calculate accurate Greek exposures, weighted by OI (default) or Volume."""
     oi = int(option['openInterest'])
+    vol_contracts = int(option.get('volume', 0))
+    weight = vol_contracts if use_volume_exposure else oi
     contract_size = 100
     multiplier = 100
     
@@ -509,10 +511,10 @@ def calculate_greek_exposures(option, S, is_put=False):
     
     # Calculate exposures
     # DEX: First derivative with respect to price
-    dex = delta * oi * contract_size * multiplier
+    dex = delta * weight * contract_size * multiplier
     
     # GEX: Second derivative with respect to price
-    gex = gamma * oi * contract_size * multiplier * (-1 if is_put else 1)
+    gex = gamma * weight * contract_size * multiplier * (-1 if is_put else 1)
     
     # VEX: Second derivative with respect to price and volatility
     # Use standard Black-Scholes vanna formula
@@ -528,20 +530,20 @@ def calculate_greek_exposures(option, S, is_put=False):
     
     # Vanna: Second derivative with respect to price and volatility
     vanna = -norm.pdf(d1) * d2 / vol if vol > 0 else 0
-    vanna_exposure = vanna * oi * contract_size * multiplier
+    vanna_exposure = vanna * weight * contract_size * multiplier
     
     # Charm: Second derivative with respect to price and time
     r = 0.05  # risk-free rate (5% as default)
     charm = -norm.pdf(d1) * (r / (S * vol * math.sqrt(t)) + d2 / (2 * t)) if S > 0 and vol > 0 and t > 0 else 0
-    charm_exposure = charm * oi * contract_size * multiplier
+    charm_exposure = charm * weight * contract_size * multiplier
     
     # Speed: Third derivative with respect to price
     speed = -gamma * (d1 + vol * math.sqrt(t)) / (S * vol * math.sqrt(t)) if S > 0 and vol > 0 and t > 0 else 0
-    speed_exposure = speed * oi * contract_size * multiplier
+    speed_exposure = speed * weight * contract_size * multiplier
     
     # Vomma: Second derivative with respect to volatility
     vomma = vega * d1 * d2 / vol if vol > 0 else 0
-    vomma_exposure = vomma * oi * contract_size * multiplier
+    vomma_exposure = vomma * weight * contract_size * multiplier
     
     return {
         'DEX': dex,
@@ -1031,8 +1033,8 @@ def update_options_chain(ticker, expiration_date=None):
         return  # Don't update if less than 1 second has passed
         
     try:
-        # Fetch new options chain data
-        new_chain = fetch_options_for_date(ticker, expiration_date)
+        # Fetch new options chain data (default to OI-weighted exposures for background cache)
+        new_chain = fetch_options_for_date(ticker, expiration_date, use_volume_exposure=False)
         if new_chain and not new_chain[0].empty and not new_chain[1].empty:
             current_chain = {
                 'calls': new_chain[0].to_dict('records'),
@@ -2262,14 +2264,14 @@ def infer_side(last, bid, ask):
     else:
         return 0  # indeterminate
 
-def fetch_options_for_multiple_dates(ticker, dates):
+def fetch_options_for_multiple_dates(ticker, dates, use_volume_exposure: bool = False):
     """Fetch options for multiple expiration dates and combine them"""
     all_calls = []
     all_puts = []
     
     for date in dates:
         try:
-            calls, puts = fetch_options_for_date(ticker, date)
+            calls, puts = fetch_options_for_date(ticker, date, use_volume_exposure=use_volume_exposure)
             if not calls.empty:
                 all_calls.append(calls)
             if not puts.empty:
@@ -2711,6 +2713,11 @@ def index():
                         <input type="range" id="strike_range" min="1" max="20" value="2" step="0.5">
                         <span class="range-value" id="strike_range_value">2%</span>
                     </div>
+                    <div class="control-group" title="When enabled, exposure formulas (GEX/DEX/VEX/Charm/Speed/Vomma) are weighted by traded volume (contracts) instead of open interest. Applies to all exposure charts for the selected expiries.">
+                        <input type="checkbox" id="use_volume_exposure">
+                        <label for="use_volume_exposure">Weight exposures by Volume (instead of Open Interest)</label>
+                        <span style="font-size: 11px; color: #AAAAAA; cursor: help;" title="When enabled, exposure formulas (GEX/DEX/VEX/Charm/Speed/Vomma) are weighted by traded volume (contracts) instead of open interest. Applies to all exposure charts for the selected expiries.">[?]</span>
+                    </div>
                     <div class="control-group">
                         <input type="checkbox" id="show_calls">
                         <label for="show_calls">Calls</label>
@@ -2894,6 +2901,7 @@ def index():
             const showPercentGexLevels = document.getElementById('show_percent_gex_levels').checked;
             const useHeikinAshi = document.getElementById('use_heikin_ashi').checked;
             const useRange = document.getElementById('use_range').checked;
+            const useVolumeExposure = document.getElementById('use_volume_exposure').checked;
             const strikeRange = parseFloat(document.getElementById('strike_range').value) / 100;
             
             // Get visible charts
@@ -2931,6 +2939,7 @@ def index():
                     show_percent_gex_levels: showPercentGexLevels,
                     use_heikin_ashi: useHeikinAshi,
                     use_range: useRange,
+                    use_volume_exposure: useVolumeExposure,
                     strike_range: strikeRange,
                     call_color: callColor,
                     put_color: putColor,
@@ -3450,11 +3459,14 @@ def update():
         expiry_dates = [expiry]
         
     try:
+        # Setting: use volume or OI for exposure weighting
+        use_volume_exposure = data.get('use_volume_exposure', False)
+
         # Fetch options data for multiple dates
         if len(expiry_dates) == 1:
-            calls, puts = fetch_options_for_date(ticker, expiry_dates[0])
+            calls, puts = fetch_options_for_date(ticker, expiry_dates[0], use_volume_exposure=use_volume_exposure)
         else:
-            calls, puts = fetch_options_for_multiple_dates(ticker, expiry_dates)
+            calls, puts = fetch_options_for_multiple_dates(ticker, expiry_dates, use_volume_exposure=use_volume_exposure)
         
         if calls.empty and puts.empty:
             return jsonify({'error': 'No options data found'})
