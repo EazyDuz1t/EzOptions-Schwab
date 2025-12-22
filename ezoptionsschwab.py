@@ -495,12 +495,11 @@ def implied_volatility(S, K, T, r, price, is_put=False):
         return 0.2  # Default to 20% volatility
 
 def calculate_greek_exposures(option, S, is_put: bool = False, use_volume_exposure: bool = False):
-    """Calculate accurate Greek exposures, weighted by OI (default) or Volume."""
+    """Calculate accurate Greek exposures per $1 move, weighted by OI (default) or Volume."""
     oi = int(option['openInterest'])
     vol_contracts = int(option.get('volume', 0))
     weight = vol_contracts if use_volume_exposure else oi
-    contract_size = 100
-    multiplier = 100
+    contract_size = 100  # SPX options contract multiplier
     
     # Get Greeks from our manual calculations
     delta = option['delta']
@@ -509,15 +508,6 @@ def calculate_greek_exposures(option, S, is_put: bool = False, use_volume_exposu
     vega = option['vega']
     vol = option['impliedVolatility']
     
-    # Calculate exposures
-    # DEX: First derivative with respect to price
-    dex = delta * weight * contract_size * multiplier
-    
-    # GEX: Second derivative with respect to price
-    gex = gamma * weight * contract_size * multiplier * (-1 if is_put else 1)
-    
-    # VEX: Second derivative with respect to price and volatility
-    # Use standard Black-Scholes vanna formula
     # Calculate time to expiration in years
     expiry_date = option['expiration']
     if isinstance(expiry_date, str):
@@ -525,25 +515,37 @@ def calculate_greek_exposures(option, S, is_put: bool = False, use_volume_exposu
     today = datetime.now().date()
     t = max((expiry_date - today).days / 365.0, 1/1440)  # Minimum 1 minute
     
+    # Calculate d1 and d2 for higher-order Greeks
     d1 = (math.log(S / option['strike']) + (0.5 * vol**2) * t) / (vol * math.sqrt(t))
     d2 = d1 - vol * math.sqrt(t)
     
+    # Calculate exposures (per $1 move in underlying)
+    # DEX: Delta exposure - dollar change in option value per $1 move
+    # For SPX: delta × OI × 100 (contract multiplier)
+    dex = delta * weight * contract_size
+    
+    # GEX: Gamma exposure - dollar change in delta exposure per $1 move
+    # Standard formula: gamma × OI × contract_size × spot_price
+    # Multiply by S to scale properly, flip sign for puts (dealer positioning)
+    gex = gamma * weight * contract_size * S * (-1 if is_put else 1)
+    
+    # VEX: Vanna exposure - change in delta per $1 move AND 1% change in volatility
     # Vanna: Second derivative with respect to price and volatility
     vanna = -norm.pdf(d1) * d2 / vol if vol > 0 else 0
-    vanna_exposure = vanna * weight * contract_size * multiplier
+    vanna_exposure = vanna * weight * contract_size * S
     
-    # Charm: Second derivative with respect to price and time
+    # Charm: Change in delta per $1 move AND 1 day passing
     r = 0.05  # risk-free rate (5% as default)
     charm = -norm.pdf(d1) * (r / (S * vol * math.sqrt(t)) + d2 / (2 * t)) if S > 0 and vol > 0 and t > 0 else 0
-    charm_exposure = charm * weight * contract_size * multiplier
+    charm_exposure = charm * weight * contract_size * S
     
-    # Speed: Third derivative with respect to price
+    # Speed: Change in gamma per $1 move (third derivative)
     speed = -gamma * (d1 + vol * math.sqrt(t)) / (S * vol * math.sqrt(t)) if S > 0 and vol > 0 and t > 0 else 0
-    speed_exposure = speed * weight * contract_size * multiplier
+    speed_exposure = speed * weight * contract_size * S
     
-    # Vomma: Second derivative with respect to volatility
+    # Vomma: Change in vega per 1% change in volatility (second derivative wrt vol)
     vomma = vega * d1 * d2 / vol if vol > 0 else 0
-    vomma_exposure = vomma * weight * contract_size * multiplier
+    vomma_exposure = vomma * weight * contract_size * S
     
     return {
         'DEX': dex,
