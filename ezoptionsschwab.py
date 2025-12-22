@@ -532,12 +532,15 @@ def calculate_greek_exposures(option, S, is_put: bool = False, use_volume_exposu
     
     # VEX: Vanna exposure - change in delta per 1% change in volatility
     # Vanna: Second derivative with respect to price and volatility
-    vanna = -norm.pdf(d1) * d2 / vol if vol > 0 else 0
+    # Formula: vega / S * (1 - d1 / (vol * sqrt(t))) is one way, but standard is:
+    vanna = vega / S * (1 - d1 / (vol * math.sqrt(t))) if S > 0 and vol > 0 and t > 0 else 0
     vanna_exposure = vanna * 0.01 * weight * contract_size * S * (-1 if is_put else 1)
     
     # Charm: Change in delta per 1 day passing
     # Charm: Second derivative with respect to price and time
-    charm = norm.pdf(d1) * (d2 / (2 * t) - r / (vol * math.sqrt(t))) if vol > 0 and t > 0 else 0
+    # Standard Charm (Delta Decay) formula
+    q = 0 # dividend yield
+    charm = -math.exp(-q * t) * norm.pdf(d1) * (2 * (r - q) * t - d2 * vol * math.sqrt(t)) / (2 * t * vol * math.sqrt(t)) if vol > 0 and t > 0 else 0
     charm_exposure = (charm / 365) * weight * contract_size * S * (-1 if is_put else 1)
     
     # Speed: Change in gamma per $1 move (third derivative)
@@ -545,8 +548,9 @@ def calculate_greek_exposures(option, S, is_put: bool = False, use_volume_exposu
     speed_exposure = speed * weight * contract_size * S * (-1 if is_put else 1)
     
     # Vomma: Change in vega per 1% change in volatility (second derivative wrt vol)
+    # Note: Vomma is already in dollars (from Vega), so we don't multiply by S
     vomma = vega * d1 * d2 / vol if vol > 0 else 0
-    vomma_exposure = vomma * 0.01 * weight * contract_size * S * (-1 if is_put else 1)
+    vomma_exposure = vomma * 0.01 * weight * contract_size * (-1 if is_put else 1)
     
     return {
         'DEX': dex,
