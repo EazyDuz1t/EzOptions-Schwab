@@ -499,7 +499,7 @@ def calculate_greek_exposures(option, S, is_put: bool = False, use_volume_exposu
     oi = int(option['openInterest'])
     vol_contracts = int(option.get('volume', 0))
     weight = vol_contracts if use_volume_exposure else oi
-    contract_size = 100  # SPX options contract multiplier
+    contract_size = 100
     
     # Get Greeks from our manual calculations
     delta = option['delta']
@@ -516,36 +516,37 @@ def calculate_greek_exposures(option, S, is_put: bool = False, use_volume_exposu
     t = max((expiry_date - today).days / 365.0, 1/1440)  # Minimum 1 minute
     
     # Calculate d1 and d2 for higher-order Greeks
-    d1 = (math.log(S / option['strike']) + (0.5 * vol**2) * t) / (vol * math.sqrt(t))
+    r = 0.05  # risk-free rate
+    d1 = (math.log(S / option['strike']) + (r + 0.5 * vol**2) * t) / (vol * math.sqrt(t))
     d2 = d1 - vol * math.sqrt(t)
     
     # Calculate exposures (per $1 move in underlying)
-    # DEX: Delta exposure - dollar change in option value per $1 move
-    # For SPX: delta × OI × 100 (contract multiplier)
-    dex = delta * weight * contract_size
+    # DEX: Delta exposure - total dollar notional value of the delta hedge
+    # For SPX: delta × OI × 100 (contract multiplier) × S
+    dex = delta * weight * contract_size * S
     
     # GEX: Gamma exposure - dollar change in delta exposure per $1 move
     # Standard formula: gamma × OI × contract_size × spot_price
-    # Multiply by S to scale properly, flip sign for puts (dealer positioning)
+    # Multiply by S to scale per $1 move, flip sign for puts (dealer positioning)
     gex = gamma * weight * contract_size * S * (-1 if is_put else 1)
     
-    # VEX: Vanna exposure - change in delta per $1 move AND 1% change in volatility
+    # VEX: Vanna exposure - change in delta per 1% change in volatility
     # Vanna: Second derivative with respect to price and volatility
     vanna = -norm.pdf(d1) * d2 / vol if vol > 0 else 0
-    vanna_exposure = vanna * weight * contract_size * S
+    vanna_exposure = vanna * 0.01 * weight * contract_size * S * (-1 if is_put else 1)
     
-    # Charm: Change in delta per $1 move AND 1 day passing
-    r = 0.05  # risk-free rate (5% as default)
-    charm = -norm.pdf(d1) * (r / (S * vol * math.sqrt(t)) + d2 / (2 * t)) if S > 0 and vol > 0 and t > 0 else 0
-    charm_exposure = charm * weight * contract_size * S
+    # Charm: Change in delta per 1 day passing
+    # Charm: Second derivative with respect to price and time
+    charm = norm.pdf(d1) * (d2 / (2 * t) - r / (vol * math.sqrt(t))) if vol > 0 and t > 0 else 0
+    charm_exposure = (charm / 365) * weight * contract_size * S * (-1 if is_put else 1)
     
     # Speed: Change in gamma per $1 move (third derivative)
-    speed = -gamma * (d1 + vol * math.sqrt(t)) / (S * vol * math.sqrt(t)) if S > 0 and vol > 0 and t > 0 else 0
-    speed_exposure = speed * weight * contract_size * S
+    speed = -gamma * (d1 / (vol * math.sqrt(t)) + 1) / S if S > 0 and vol > 0 and t > 0 else 0
+    speed_exposure = speed * weight * contract_size * S * (-1 if is_put else 1)
     
     # Vomma: Change in vega per 1% change in volatility (second derivative wrt vol)
     vomma = vega * d1 * d2 / vol if vol > 0 else 0
-    vomma_exposure = vomma * weight * contract_size * S
+    vomma_exposure = vomma * 0.01 * weight * contract_size * S * (-1 if is_put else 1)
     
     return {
         'DEX': dex,
@@ -691,12 +692,9 @@ def create_exposure_chart(calls, puts, exposure_type, title, S, strike_range=0.0
             call_value = calls_df[calls_df['strike'] == strike][exposure_type].sum() if not calls_df.empty else 0
             put_value = puts_df[puts_df['strike'] == strike][exposure_type].sum() if not puts_df.empty else 0
             
-            if exposure_type == 'GEX':
-                # For gamma exposure, sum the contributions (puts are already negative from calculation)
-                net_value = call_value + put_value
-            else:
-                # For other exposures, take the larger absolute value
-                net_value = call_value if abs(call_value) >= abs(put_value) else put_value
+            # All exposures are now signed (Calls positive, Puts negative)
+            # so we sum them to get the net exposure
+            net_value = call_value + put_value
                 
             net_exposure.append(net_value)
         
