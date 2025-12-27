@@ -1,4 +1,4 @@
 options_data.db
-.env
+*.env
 tokens.json
 my.env

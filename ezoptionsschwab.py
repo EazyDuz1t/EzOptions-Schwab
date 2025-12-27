@@ -196,7 +196,7 @@ def store_interval_data(ticker, price, strike_range, calls, puts):
         delta = row['DEX']
         vanna = row['VEX']
         exposure_by_strike[strike] = {
-            'gamma': exposure_by_strike.get(strike, {}).get('gamma', 0) + gamma,
+            'gamma': exposure_by_strike.get(strike, {}).get('gamma', 0) - gamma,
             'delta': exposure_by_strike.get(strike, {}).get('delta', 0) + delta,
             'vanna': exposure_by_strike.get(strike, {}).get('vanna', 0) + vanna
         }
@@ -318,7 +318,36 @@ def format_display_ticker(ticker):
         return ['SPXW', '$SPX']
     return [ticker]
 
-def fetch_options_for_date(ticker, date, use_volume_exposure: bool = False):
+def calculate_time_to_expiration(expiry_date):
+    """
+    Calculate time to expiration in years using Eastern Time.
+    expiry_date: datetime.date object or string 'YYYY-MM-DD'
+    Returns: time in years (float)
+    """
+    try:
+        et_tz = pytz.timezone('US/Eastern')
+        now_et = datetime.now(et_tz)
+        
+        if isinstance(expiry_date, str):
+            expiry_date = datetime.strptime(expiry_date, "%Y-%m-%d").date()
+        elif isinstance(expiry_date, datetime):
+            expiry_date = expiry_date.date()
+            
+        # Set expiration to 4:00 PM ET on the expiration date
+        expiry_dt = datetime.combine(expiry_date, datetime.min.time()) + timedelta(hours=16)
+        expiry_dt = et_tz.localize(expiry_dt)
+        
+        # Calculate time difference in years
+        diff = expiry_dt - now_et
+        t = diff.total_seconds() / (365 * 24 * 3600)
+        
+        return t
+             
+    except Exception as e:
+        print(f"Error calculating time to expiration: {e}")
+        return 0
+
+def fetch_options_for_date(ticker, date, use_volume_exposure: bool = False, delta_adjusted: bool = False):
     try:
         expiry = datetime.strptime(date, '%Y-%m-%d').date()
         chain_response = client.option_chains(
@@ -339,9 +368,9 @@ def fetch_options_for_date(ticker, date, use_volume_exposure: bool = False):
             return pd.DataFrame(), pd.DataFrame()
         
         # Calculate time to expiration in years
-        today = datetime.now().date()
-        t = max((expiry - today).days / 365.0, 1/1440)  # Minimum 1 minute
-        r = 0.05  # risk-free rate (5% as default)
+        t = calculate_time_to_expiration(expiry)
+        t = max(t, 1/1440)  # Minimum 1 minute
+        r = 0.02  # risk-free rate (2% as default to match Yahoo script)
         
         calls_data = []
         puts_data = []
@@ -399,7 +428,7 @@ def fetch_options_for_date(ticker, date, use_volume_exposure: bool = False):
                             'rho': rho
                         }
                         option_data['side'] = infer_side(option_data['lastPrice'], option_data['bid'], option_data['ask'])
-                        exposures = calculate_greek_exposures(option_data, S, is_put=False, use_volume_exposure=use_volume_exposure)
+                        exposures = calculate_greek_exposures(option_data, S, is_put=False, use_volume_exposure=use_volume_exposure, delta_adjusted=delta_adjusted)
                         option_data.update(exposures)
                         calls_data.append(option_data)
         
@@ -456,7 +485,7 @@ def fetch_options_for_date(ticker, date, use_volume_exposure: bool = False):
                             'rho': rho
                         }
                         option_data['side'] = infer_side(option_data['lastPrice'], option_data['bid'], option_data['ask'])
-                        exposures = calculate_greek_exposures(option_data, S, is_put=True, use_volume_exposure=use_volume_exposure)
+                        exposures = calculate_greek_exposures(option_data, S, is_put=True, use_volume_exposure=use_volume_exposure, delta_adjusted=delta_adjusted)
                         option_data.update(exposures)
                         puts_data.append(option_data)
         
@@ -494,7 +523,7 @@ def implied_volatility(S, K, T, r, price, is_put=False):
         # If Brent's method fails, return a default value
         return 0.2  # Default to 20% volatility
 
-def calculate_greek_exposures(option, S, is_put: bool = False, use_volume_exposure: bool = False):
+def calculate_greek_exposures(option, S, is_put: bool = False, use_volume_exposure: bool = False, delta_adjusted: bool = False):
     """Calculate accurate Greek exposures per $1 move, weighted by OI (default) or Volume."""
     oi = int(option['openInterest'])
     vol_contracts = int(option.get('volume', 0))
@@ -510,13 +539,11 @@ def calculate_greek_exposures(option, S, is_put: bool = False, use_volume_exposu
     
     # Calculate time to expiration in years
     expiry_date = option['expiration']
-    if isinstance(expiry_date, str):
-        expiry_date = datetime.strptime(expiry_date, '%Y-%m-%d').date()
-    today = datetime.now().date()
-    t = max((expiry_date - today).days / 365.0, 1/1440)  # Minimum 1 minute
+    t = calculate_time_to_expiration(expiry_date)
+    t = max(t, 1/1440)  # Minimum 1 minute
     
     # Calculate d1 and d2 for higher-order Greeks
-    r = 0.05  # risk-free rate
+    r = 0.02  # risk-free rate
     d1 = (math.log(S / option['strike']) + (r + 0.5 * vol**2) * t) / (vol * math.sqrt(t))
     d2 = d1 - vol * math.sqrt(t)
     
@@ -526,31 +553,44 @@ def calculate_greek_exposures(option, S, is_put: bool = False, use_volume_exposu
     dex = delta * weight * contract_size * S
     
     # GEX: Gamma exposure - dollar change in delta exposure per $1 move
-    # Standard formula: gamma × OI × contract_size × spot_price
-    # Multiply by S to scale per $1 move, flip sign for puts (dealer positioning)
-    gex = gamma * weight * contract_size * S * (-1 if is_put else 1)
+    # GEX = Gamma * Volume/OI * Contract Size * Spot Price^2 * 0.01 (Dollar Gamma per 1% move in underlying)
+    gex = gamma * weight * contract_size * S * S * 0.01
     
     # VEX: Vanna exposure - change in delta per 1% change in volatility
     # Vanna: Second derivative with respect to price and volatility
-    # Formula: vega / S * (1 - d1 / (vol * sqrt(t))) is one way, but standard is:
-    vanna = vega / S * (1 - d1 / (vol * math.sqrt(t))) if S > 0 and vol > 0 and t > 0 else 0
-    vanna_exposure = vanna * 0.01 * weight * contract_size * S * (-1 if is_put else 1)
+    # Calculate vanna using the standard formula: -norm.pdf(d1) * d2 / sigma
+    vanna = -norm.pdf(d1) * d2 / vol if vol > 0 else 0
+    # VEX = Vanna * Volume/OI * Contract Size * Spot Price * 0.01 (Dollar Vanna per 1 vol point change)
+    vanna_exposure = vanna * weight * contract_size * S * 0.01
     
     # Charm: Change in delta per 1 day passing
     # Charm: Second derivative with respect to price and time
-    # Standard Charm (Delta Decay) formula
-    q = 0 # dividend yield
-    charm = -math.exp(-q * t) * norm.pdf(d1) * (2 * (r - q) * t - d2 * vol * math.sqrt(t)) / (2 * t * vol * math.sqrt(t)) if vol > 0 and t > 0 else 0
-    charm_exposure = (charm / 365) * weight * contract_size * S * (-1 if is_put else 1)
+    # Standard Charm (Delta Decay) formula (same for calls and puts when q=0)
+    norm_d1 = norm.pdf(d1)
+    charm = -norm_d1 * (2 * r * t - d2 * vol * math.sqrt(t)) / (2 * t * vol * math.sqrt(t)) if vol > 0 and t > 0 else 0
+    # Charm = Charm * Volume/OI * Contract Size * Spot Price / 365 (Dollar Charm per 1 day decay)
+    charm_exposure = charm * weight * contract_size * S / 365.0
     
     # Speed: Change in gamma per $1 move (third derivative)
+    # Speed = -Gamma * (d1/(sigma * sqrt(t)) + 1) / S
     speed = -gamma * (d1 / (vol * math.sqrt(t)) + 1) / S if S > 0 and vol > 0 and t > 0 else 0
-    speed_exposure = speed * weight * contract_size * S * (-1 if is_put else 1)
+    # Speed = Speed * Volume/OI * Contract Size * Spot Price^2 * 0.01 (Dollar Speed per 1% move)
+    speed_exposure = speed * weight * contract_size * S * S * 0.01
     
     # Vomma: Change in vega per 1% change in volatility (second derivative wrt vol)
-    # Note: Vomma is already in dollars (from Vega), so we don't multiply by S
+    # Vomma = Vega * d1 * d2 / sigma
     vomma = vega * d1 * d2 / vol if vol > 0 else 0
-    vomma_exposure = vomma * 0.01 * weight * contract_size * (-1 if is_put else 1)
+    # Vomma = Vomma * Volume/OI * Contract Size * 0.01 (Dollar Vomma per 1 vol point change)
+    vomma_exposure = vomma * weight * contract_size * 0.01
+
+    # Apply delta adjustment if enabled
+    if delta_adjusted:
+        abs_delta = abs(delta)
+        gex *= abs_delta
+        vanna_exposure *= abs_delta
+        charm_exposure *= abs_delta
+        speed_exposure *= abs_delta
+        vomma_exposure *= abs_delta
     
     return {
         'DEX': dex,
@@ -631,11 +671,14 @@ def create_exposure_chart(calls, puts, exposure_type, title, S, strike_range=0.0
     total_put_exposure = puts_df[exposure_type].sum() if not puts_df.empty else 0
     
     if exposure_type == 'GEX':
-        # For gamma exposure, sum the contributions (puts are already negative from calculation)
+        # For gamma exposure, subtract puts from calls (puts are positive in calculation)
+        total_net_exposure = total_call_exposure - total_put_exposure
+    elif exposure_type == 'DEX':
+        # For delta exposure, sum them (puts are negative in calculation)
         total_net_exposure = total_call_exposure + total_put_exposure
     else:
-        # For other exposures, take the larger absolute value
-        total_net_exposure = total_call_exposure if abs(total_call_exposure) >= abs(total_put_exposure) else total_put_exposure
+        # For other exposures, sum them (puts are same sign as calls usually)
+        total_net_exposure = total_call_exposure + total_put_exposure
     
     # Create the main title and net exposure as separate annotations
     fig = go.Figure()
@@ -678,7 +721,7 @@ def create_exposure_chart(calls, puts, exposure_type, title, S, strike_range=0.0
             
         fig.add_trace(go.Bar(
             x=puts_df['strike'].tolist(),
-            y=puts_df[exposure_type].tolist(),
+            y=(-puts_df[exposure_type]).tolist(),
             name='Put',
             marker_color=put_colors,
             text=puts_df[exposure_type].round(2).tolist(),
@@ -696,9 +739,12 @@ def create_exposure_chart(calls, puts, exposure_type, title, S, strike_range=0.0
             call_value = calls_df[calls_df['strike'] == strike][exposure_type].sum() if not calls_df.empty else 0
             put_value = puts_df[puts_df['strike'] == strike][exposure_type].sum() if not puts_df.empty else 0
             
-            # All exposures are now signed (Calls positive, Puts negative)
-            # so we sum them to get the net exposure
-            net_value = call_value + put_value
+            if exposure_type == 'GEX':
+                net_value = call_value - put_value
+            elif exposure_type == 'DEX':
+                net_value = call_value + put_value
+            else:
+                net_value = call_value + put_value
                 
             net_exposure.append(net_value)
         
@@ -1421,7 +1467,7 @@ def create_price_chart(price_data, calls=None, puts=None, show_gamma_levels=Fals
                 
         for _, row in puts.iterrows():
             strike = row['strike']
-            put_gamma = row['GEX']
+            put_gamma = -row['GEX']
             call_gamma = gamma_levels.get(strike, 0)
             # Take the larger absolute value
             if abs(put_gamma) >= abs(call_gamma):
@@ -1489,7 +1535,7 @@ def create_price_chart(price_data, calls=None, puts=None, show_gamma_levels=Fals
                 
         for _, row in range_puts.iterrows():
             strike = row['strike']
-            put_gamma = row['GEX']
+            put_gamma = -row['GEX']
             call_gamma = gamma_levels.get(strike, 0)
             # Take the larger absolute value
             if abs(put_gamma) >= abs(call_gamma):
@@ -2268,14 +2314,14 @@ def infer_side(last, bid, ask):
     else:
         return 0  # indeterminate
 
-def fetch_options_for_multiple_dates(ticker, dates, use_volume_exposure: bool = False):
+def fetch_options_for_multiple_dates(ticker, dates, use_volume_exposure: bool = False, delta_adjusted: bool = False):
     """Fetch options for multiple expiration dates and combine them"""
     all_calls = []
     all_puts = []
     
     for date in dates:
         try:
-            calls, puts = fetch_options_for_date(ticker, date, use_volume_exposure=use_volume_exposure)
+            calls, puts = fetch_options_for_date(ticker, date, use_volume_exposure=use_volume_exposure, delta_adjusted=delta_adjusted)
             if not calls.empty:
                 all_calls.append(calls)
             if not puts.empty:
@@ -2722,6 +2768,10 @@ def index():
                         <label for="use_volume_exposure">Weight exposures by Volume (instead of Open Interest)</label>
                         <span style="font-size: 11px; color: #AAAAAA; cursor: help;" title="When enabled, exposure formulas (GEX/DEX/VEX/Charm/Speed/Vomma) are weighted by traded volume (contracts) instead of open interest. Applies to all exposure charts for the selected expiries.">[?]</span>
                     </div>
+                    <div class="control-group" title="When enabled, exposure formulas are adjusted by delta.">
+                        <input type="checkbox" id="delta_adjusted_exposures">
+                        <label for="delta_adjusted_exposures">Delta-Adjusted Exposures</label>
+                    </div>
                     <div class="control-group">
                         <input type="checkbox" id="show_calls">
                         <label for="show_calls">Calls</label>
@@ -2906,6 +2956,7 @@ def index():
             const useHeikinAshi = document.getElementById('use_heikin_ashi').checked;
             const useRange = document.getElementById('use_range').checked;
             const useVolumeExposure = document.getElementById('use_volume_exposure').checked;
+            const deltaAdjusted = document.getElementById('delta_adjusted_exposures').checked;
             const strikeRange = parseFloat(document.getElementById('strike_range').value) / 100;
             
             // Get visible charts
@@ -2944,6 +2995,7 @@ def index():
                     use_heikin_ashi: useHeikinAshi,
                     use_range: useRange,
                     use_volume_exposure: useVolumeExposure,
+                    delta_adjusted: deltaAdjusted,
                     strike_range: strikeRange,
                     call_color: callColor,
                     put_color: putColor,
@@ -3465,12 +3517,13 @@ def update():
     try:
         # Setting: use volume or OI for exposure weighting
         use_volume_exposure = data.get('use_volume_exposure', False)
+        delta_adjusted = data.get('delta_adjusted', False)
 
         # Fetch options data for multiple dates
         if len(expiry_dates) == 1:
-            calls, puts = fetch_options_for_date(ticker, expiry_dates[0], use_volume_exposure=use_volume_exposure)
+            calls, puts = fetch_options_for_date(ticker, expiry_dates[0], use_volume_exposure=use_volume_exposure, delta_adjusted=delta_adjusted)
         else:
-            calls, puts = fetch_options_for_multiple_dates(ticker, expiry_dates, use_volume_exposure=use_volume_exposure)
+            calls, puts = fetch_options_for_multiple_dates(ticker, expiry_dates, use_volume_exposure=use_volume_exposure, delta_adjusted=delta_adjusted)
         
         if calls.empty and puts.empty:
             return jsonify({'error': 'No options data found'})
