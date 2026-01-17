@@ -2118,7 +2118,7 @@ def create_large_trades_table(calls, puts, S, strike_range, call_color='#00FF00'
 
 
 
-def create_historical_bubble_levels_chart(ticker, strike_range, call_color='#00FFA3', put_color='#FF3B3B', exposure_type='gamma'):
+def create_historical_bubble_levels_chart(ticker, strike_range, call_color='#00FFA3', put_color='#FF3B3B', exposure_type='gamma', perspective='Customer'):
     """Create a chart showing price and exposure (gamma, delta, or vanna) over time for the last hour."""
     # Get interval data from database
     interval_data = get_interval_data(ticker)
@@ -2163,6 +2163,10 @@ def create_historical_bubble_levels_chart(ticker, strike_range, call_color='#00F
             exposure = net_vanna
         elif exposure_type == 'charm':
             exposure = net_charm
+        
+        # Apply perspective (Dealer = Short, flip the sign of values)
+        if perspective == 'Dealer':
+            exposure = exposure * -1
             
         if exposure is None:
             exposure = 0
@@ -4238,22 +4242,22 @@ def update():
             )
         
         if data.get('show_gex_historical_bubble', True):
-            img_bytes = create_historical_bubble_levels_chart(ticker, strike_range, call_color, put_color, 'gamma')
+            img_bytes = create_historical_bubble_levels_chart(ticker, strike_range, call_color, put_color, 'gamma', perspective)
             if img_bytes:
                 response['gex_historical_bubble'] = f"data:image/png;base64,{base64.b64encode(img_bytes).decode('utf-8')}"
         
         if data.get('show_dex_historical_bubble', True):
-            img_bytes = create_historical_bubble_levels_chart(ticker, strike_range, call_color, put_color, 'delta')
+            img_bytes = create_historical_bubble_levels_chart(ticker, strike_range, call_color, put_color, 'delta', perspective)
             if img_bytes:
                 response['dex_historical_bubble'] = f"data:image/png;base64,{base64.b64encode(img_bytes).decode('utf-8')}"
         
         if data.get('show_vanna_historical_bubble', True):
-            img_bytes = create_historical_bubble_levels_chart(ticker, strike_range, call_color, put_color, 'vanna')
+            img_bytes = create_historical_bubble_levels_chart(ticker, strike_range, call_color, put_color, 'vanna', perspective)
             if img_bytes:
                 response['vanna_historical_bubble'] = f"data:image/png;base64,{base64.b64encode(img_bytes).decode('utf-8')}"
         
         if data.get('show_charm_historical_bubble', True):
-            img_bytes = create_historical_bubble_levels_chart(ticker, strike_range, call_color, put_color, 'charm')
+            img_bytes = create_historical_bubble_levels_chart(ticker, strike_range, call_color, put_color, 'charm', perspective)
             if img_bytes:
                 response['charm_historical_bubble'] = f"data:image/png;base64,{base64.b64encode(img_bytes).decode('utf-8')}"
         
