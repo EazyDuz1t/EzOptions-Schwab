@@ -1,6 +1,7 @@
 from flask import Flask, render_template_string, jsonify, request
 import pandas as pd
 import plotly.graph_objects as go
+import numpy as np
 from datetime import datetime, timedelta
 import math
 import time
@@ -13,6 +14,8 @@ from contextlib import closing
 from scipy.stats import norm
 from scipy.optimize import brentq
 import base64
+import warnings
+
 
 # Load environment variables
 load_dotenv()
@@ -34,9 +37,16 @@ def init_db():
                     net_gamma REAL NOT NULL,
                     net_delta REAL NOT NULL,
                     net_vanna REAL NOT NULL,
+                    net_charm REAL,
                     date TEXT NOT NULL
                 )
             ''')
+            # Try to add net_charm column if it doesn't exist (for existing databases)
+            try:
+                cursor.execute('ALTER TABLE interval_data ADD COLUMN net_charm REAL')
+            except sqlite3.OperationalError:
+                pass 
+            
             # Add centroid data table
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS centroid_data (
@@ -184,10 +194,12 @@ def store_interval_data(ticker, price, strike_range, calls, puts):
         gamma = row['GEX']
         delta = row['DEX']
         vanna = row['VEX']
+        charm = row['Charm']
         exposure_by_strike[strike] = {
             'gamma': exposure_by_strike.get(strike, {}).get('gamma', 0) + gamma,
             'delta': exposure_by_strike.get(strike, {}).get('delta', 0) + delta,
-            'vanna': exposure_by_strike.get(strike, {}).get('vanna', 0) + vanna
+            'vanna': exposure_by_strike.get(strike, {}).get('vanna', 0) + vanna,
+            'charm': exposure_by_strike.get(strike, {}).get('charm', 0) + charm
         }
         
     for _, row in range_puts.iterrows():
@@ -195,10 +207,12 @@ def store_interval_data(ticker, price, strike_range, calls, puts):
         gamma = row['GEX']
         delta = row['DEX']
         vanna = row['VEX']
+        charm = row['Charm']
         exposure_by_strike[strike] = {
             'gamma': exposure_by_strike.get(strike, {}).get('gamma', 0) - gamma,
             'delta': exposure_by_strike.get(strike, {}).get('delta', 0) + delta,
-            'vanna': exposure_by_strike.get(strike, {}).get('vanna', 0) + vanna
+            'vanna': exposure_by_strike.get(strike, {}).get('vanna', 0) + vanna,
+            'charm': exposure_by_strike.get(strike, {}).get('charm', 0) + charm
         }
     
     # Store data for each strike
@@ -206,9 +220,9 @@ def store_interval_data(ticker, price, strike_range, calls, puts):
         with closing(conn.cursor()) as cursor:
             for strike, exposure in exposure_by_strike.items():
                 cursor.execute('''
-                    INSERT INTO interval_data (ticker, timestamp, price, strike, net_gamma, net_delta, net_vanna, date)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ''', (ticker, current_time, price, strike, exposure['gamma'], exposure['delta'], exposure['vanna'], current_date))
+                    INSERT INTO interval_data (ticker, timestamp, price, strike, net_gamma, net_delta, net_vanna, net_charm, date)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (ticker, current_time, price, strike, exposure['gamma'], exposure['delta'], exposure['vanna'], exposure['charm'], current_date))
             conn.commit()
 
 # Function to get interval data
@@ -219,7 +233,7 @@ def get_interval_data(ticker, date=None):
     with closing(sqlite3.connect('options_data.db')) as conn:
         with closing(conn.cursor()) as cursor:
             cursor.execute('''
-                SELECT timestamp, price, strike, net_gamma, net_delta, net_vanna
+                SELECT timestamp, price, strike, net_gamma, net_delta, net_vanna, net_charm
                 FROM interval_data
                 WHERE ticker = ? AND date = ?
                 ORDER BY timestamp, strike
@@ -318,6 +332,23 @@ def format_display_ticker(ticker):
         return ['SPXW', '$SPX']
     return [ticker]
 
+def format_large_number(num):
+    """Format large numbers with suffixes (K, M, B, T)"""
+    if num is None:
+        return "0"
+    
+    abs_num = abs(num)
+    if abs_num >= 1e12:
+        return f"{num/1e12:.2f}T"
+    elif abs_num >= 1e9:
+        return f"{num/1e9:.2f}B"
+    elif abs_num >= 1e6:
+        return f"{num/1e6:.2f}M"
+    elif abs_num >= 1e3:
+        return f"{num/1e3:.2f}K"
+    else:
+        return f"{num:,.0f}"
+
 def calculate_time_to_expiration(expiry_date):
     """
     Calculate time to expiration in years using Eastern Time.
@@ -347,7 +378,80 @@ def calculate_time_to_expiration(expiry_date):
         print(f"Error calculating time to expiration: {e}")
         return 0
 
-def fetch_options_for_date(ticker, date, use_volume_exposure: bool = False, delta_adjusted: bool = False):
+def fetch_options_for_date(ticker, date, exposure_metric="Open Interest", delta_adjusted: bool = False, calculate_in_notional: bool = True, S=None):
+    if ticker == "MARKET":
+        # Get prices for scaling (Base price is $SPX)
+        spx_price = S if S else get_current_price("$SPX")
+        spy_price = get_current_price("SPY")
+        qqq_price = get_current_price("QQQ")
+        iwm_price = get_current_price("IWM")
+        
+        if not spx_price:
+             return pd.DataFrame(), pd.DataFrame()
+        
+        calls_list = []
+        puts_list = []
+        
+        # Helper to fetch and scale by moneyness
+        def add_scaled_data(tick, etf_price):
+            try:
+                # Fetch ETF options
+                # Note: We pass exposure_metric and delta_adjusted to recursive calls
+                c, p = fetch_options_for_date(tick, date, exposure_metric, delta_adjusted, calculate_in_notional)
+                
+                if not c.empty:
+                    c = c.copy()
+                    # Calculate moneyness (strike / spot) for each ETF option
+                    c['moneyness'] = c['strike'] / etf_price
+                    # Map to SPX strikes by moneyness: SPX_strike = moneyness * SPX_price
+                    c['strike'] = (c['moneyness'] * spx_price / 10).round() * 10
+                    c.drop(columns=['moneyness'], inplace=True)
+                    
+                    # Scale prices by price ratio (options are more expensive on higher priced underlyings)
+                    price_ratio = spx_price / etf_price
+                    for col in ['lastPrice', 'bid', 'ask', 'change']:
+                        if col in c.columns:
+                            c[col] = c[col] * price_ratio
+                    
+                    # Scale Greeks (Exposure scales with Spot Price)
+                    greek_cols = ['GEX', 'DEX', 'VEX', 'Charm', 'Speed', 'Vomma', 'Color']
+                    for col in greek_cols:
+                        if col in c.columns:
+                            c[col] = c[col] * price_ratio
+                    
+                    calls_list.append(c)
+                
+                if not p.empty:
+                    p = p.copy()
+                    p['moneyness'] = p['strike'] / etf_price
+                    p['strike'] = (p['moneyness'] * spx_price / 10).round() * 10
+                    p.drop(columns=['moneyness'], inplace=True)
+                    
+                    price_ratio = spx_price / etf_price
+                    for col in ['lastPrice', 'bid', 'ask', 'change']:
+                        if col in p.columns:
+                            p[col] = p[col] * price_ratio
+
+                    # Scale Greeks (Exposure scales with Spot Price)
+                    greek_cols = ['GEX', 'DEX', 'VEX', 'Charm', 'Speed', 'Vomma', 'Color']
+                    for col in greek_cols:
+                        if col in p.columns:
+                            p[col] = p[col] * price_ratio
+                    
+                    puts_list.append(p)
+            except Exception:
+                pass 
+
+        # Add scaled data from ETFs
+        if spy_price: add_scaled_data("SPY", spy_price)
+        if qqq_price: add_scaled_data("QQQ", qqq_price)
+        if iwm_price: add_scaled_data("IWM", iwm_price)
+        
+        combined_calls = pd.concat(calls_list, ignore_index=True) if calls_list else pd.DataFrame()
+        combined_puts = pd.concat(puts_list, ignore_index=True) if puts_list else pd.DataFrame()
+        
+        return combined_calls, combined_puts
+
     try:
         expiry = datetime.strptime(date, '%Y-%m-%d').date()
         chain_response = client.option_chains(
@@ -369,7 +473,7 @@ def fetch_options_for_date(ticker, date, use_volume_exposure: bool = False, delt
         
         # Calculate time to expiration in years
         t = calculate_time_to_expiration(expiry)
-        t = max(t, 1/1440)  # Minimum 1 minute
+        t = max(t, 1e-5)  # Minimum 1 minute
         r = 0.02  # risk-free rate (2% as default to match Yahoo script)
         
         calls_data = []
@@ -380,33 +484,22 @@ def fetch_options_for_date(ticker, date, use_volume_exposure: bool = False, delt
             for strike, options in strikes.items():
                 for option in options:
                     if any(option['symbol'].startswith(t) for t in display_tickers):
-                        # Calculate implied volatility from market price
-                        market_price = float(option['last'])
-                        if market_price <= 0:
-                            market_price = (float(option['bid']) + float(option['ask'])) / 2
+                        # Calculate implied volatility from mid price if possible
+                        bid = float(option['bid'])
+                        ask = float(option['ask'])
+                        market_price = (bid + ask) / 2 if (bid > 0 and ask > 0) else float(option['last'])
                         
                         K = float(option['strikePrice'])
+                        vol = 0.2
                         if market_price > 0:
-                            vol = implied_volatility(S, K, t, r, market_price, is_put=False)
-                        else:
-                            vol = 0.2  # Default to 20% if we can't calculate
+                            vol = calculate_implied_volatility(market_price, S, K, t, r, 'c', 0)
+                            if vol is None: vol = 0.2
                         
-                        # Calculate BSM Greeks
+                        # Calculate Greeks
                         if t > 0 and vol > 0 and K > 0:
-                            d1 = (math.log(S/K) + (r + vol**2/2)*t) / (vol * math.sqrt(t))
-                            d2 = d1 - vol * math.sqrt(t)
-                            
-                            # Calculate standard normal PDF and CDF
-                            phi_d1 = math.exp(-d1**2/2) / math.sqrt(2 * math.pi)
-                            N_d1 = 0.5 * (1 + math.erf(d1 / math.sqrt(2)))
-                            N_d2 = 0.5 * (1 + math.erf(d2 / math.sqrt(2)))
-                            
-                            # Calculate Greeks
-                            delta = N_d1
-                            gamma = phi_d1 / (S * vol * math.sqrt(t))
-                            theta = -S * phi_d1 * vol / (2 * math.sqrt(t)) - r * K * math.exp(-r * t) * N_d2
-                            vega = S * math.sqrt(t) * phi_d1
-                            rho = K * t * math.exp(-r * t) * N_d2
+                            delta, gamma, vega, vanna = calculate_greeks('c', S, K, t, vol, r, 0)
+                            theta = calculate_theta('c', S, K, t, vol, r, 0)
+                            rho = calculate_rho('c', S, K, t, vol, r, 0)
                         else:
                             delta = gamma = theta = vega = rho = 0
                         
@@ -428,42 +521,28 @@ def fetch_options_for_date(ticker, date, use_volume_exposure: bool = False, delt
                             'rho': rho
                         }
                         option_data['side'] = infer_side(option_data['lastPrice'], option_data['bid'], option_data['ask'])
-                        exposures = calculate_greek_exposures(option_data, S, is_put=False, use_volume_exposure=use_volume_exposure, delta_adjusted=delta_adjusted)
-                        option_data.update(exposures)
                         calls_data.append(option_data)
         
         for exp_date, strikes in chain.get('putExpDateMap', {}).items():
             for strike, options in strikes.items():
                 for option in options:
                     if any(option['symbol'].startswith(t) for t in display_tickers):
-                        # Calculate implied volatility from market price
-                        market_price = float(option['last'])
-                        if market_price <= 0:
-                            market_price = (float(option['bid']) + float(option['ask'])) / 2
+                        # Calculate implied volatility from mid price if possible
+                        bid = float(option['bid'])
+                        ask = float(option['ask'])
+                        market_price = (bid + ask) / 2 if (bid > 0 and ask > 0) else float(option['last'])
                         
                         K = float(option['strikePrice'])
+                        vol = 0.2
                         if market_price > 0:
-                            vol = implied_volatility(S, K, t, r, market_price, is_put=True)
-                        else:
-                            vol = 0.2  # Default to 20% if we can't calculate
+                            vol = calculate_implied_volatility(market_price, S, K, t, r, 'p', 0)
+                            if vol is None: vol = 0.2
                         
-                        # Calculate BSM Greeks
+                        # Calculate Greeks
                         if t > 0 and vol > 0 and K > 0:
-                            d1 = (math.log(S/K) + (r + vol**2/2)*t) / (vol * math.sqrt(t))
-                            d2 = d1 - vol * math.sqrt(t)
-                            
-                            # Calculate standard normal PDF and CDF
-                            phi_d1 = math.exp(-d1**2/2) / math.sqrt(2 * math.pi)
-                            N_d1 = 0.5 * (1 + math.erf(d1 / math.sqrt(2)))
-                            N_d2 = 0.5 * (1 + math.erf(d2 / math.sqrt(2)))
-                            N_neg_d2 = 0.5 * (1 + math.erf(-d2 / math.sqrt(2)))
-                            
-                            # Calculate Greeks
-                            delta = N_d1 - 1
-                            gamma = phi_d1 / (S * vol * math.sqrt(t))
-                            theta = -S * phi_d1 * vol / (2 * math.sqrt(t)) + r * K * math.exp(-r * t) * N_neg_d2
-                            vega = S * math.sqrt(t) * phi_d1
-                            rho = -K * t * math.exp(-r * t) * N_neg_d2
+                            delta, gamma, vega, vanna = calculate_greeks('p', S, K, t, vol, r, 0)
+                            theta = calculate_theta('p', S, K, t, vol, r, 0)
+                            rho = calculate_rho('p', S, K, t, vol, r, 0)
                         else:
                             delta = gamma = theta = vega = rho = 0
                         
@@ -485,10 +564,39 @@ def fetch_options_for_date(ticker, date, use_volume_exposure: bool = False, delt
                             'rho': rho
                         }
                         option_data['side'] = infer_side(option_data['lastPrice'], option_data['bid'], option_data['ask'])
-                        exposures = calculate_greek_exposures(option_data, S, is_put=True, use_volume_exposure=use_volume_exposure, delta_adjusted=delta_adjusted)
-                        option_data.update(exposures)
                         puts_data.append(option_data)
         
+        # Calculate exposures with selected metric
+        max_vol = 1
+        if exposure_metric == 'OI Weighted by Volume':
+            max_vol_calls = max((o['volume'] for o in calls_data), default=0)
+            max_vol_puts = max((o['volume'] for o in puts_data), default=0)
+            max_vol = max(max_vol_calls, max_vol_puts, 1)
+
+        for option_data in calls_data:
+            weight = 0
+            if exposure_metric == 'Volume':
+                weight = option_data['volume']
+            elif exposure_metric == 'OI Weighted by Volume':
+                weight = option_data['openInterest'] * (1 + option_data['volume'] / max_vol)
+            else: # Open Interest
+                weight = option_data['openInterest']
+                
+            exposures = calculate_greek_exposures(option_data, S, weight, delta_adjusted=delta_adjusted, calculate_in_notional=calculate_in_notional)
+            option_data.update(exposures)
+
+        for option_data in puts_data:
+            weight = 0
+            if exposure_metric == 'Volume':
+                weight = option_data['volume']
+            elif exposure_metric == 'OI Weighted by Volume':
+                weight = option_data['openInterest'] * (1 + option_data['volume'] / max_vol)
+            else: # Open Interest
+                weight = option_data['openInterest']
+                
+            exposures = calculate_greek_exposures(option_data, S, weight, delta_adjusted=delta_adjusted, calculate_in_notional=calculate_in_notional)
+            option_data.update(exposures)
+
         calls = pd.DataFrame(calls_data)
         puts = pd.DataFrame(puts_data)
         return calls, puts
@@ -497,91 +605,217 @@ def fetch_options_for_date(ticker, date, use_volume_exposure: bool = False, delt
         print(f"Error fetching options chain: {e}")
         return pd.DataFrame(), pd.DataFrame()
 
-def black_scholes_price(S, K, T, r, sigma, is_put=False):
-    """Calculate Black-Scholes option price"""
-    d1 = (math.log(S/K) + (r + sigma**2/2)*T) / (sigma * math.sqrt(T))
-    d2 = d1 - sigma * math.sqrt(T)
-    
-    if is_put:
-        price = K * math.exp(-r*T) * norm.cdf(-d2) - S * norm.cdf(-d1)
-    else:
-        price = S * norm.cdf(d1) - K * math.exp(-r*T) * norm.cdf(d2)
-    
-    return price
-
-def implied_volatility(S, K, T, r, price, is_put=False):
-    """Calculate implied volatility using Brent's method"""
-    def objective(sigma):
-        return black_scholes_price(S, K, T, r, sigma, is_put) - price
-    
+def calculate_bs_price(flag, S, K, t, r, sigma, q=0):
+    """Calculate Black-Scholes option price with dividends."""
     try:
-        # Use Brent's method to find the root
-        # Set bounds for volatility (0.001 to 5.0)
-        vol = brentq(objective, 0.001, 5.0)
-        return vol
-    except ValueError:
-        # If Brent's method fails, return a default value
-        return 0.2  # Default to 20% volatility
+        d1 = (np.log(S / K) + (r - q + 0.5 * sigma**2) * t) / (sigma * np.sqrt(t))
+        d2 = d1 - sigma * np.sqrt(t)
+        
+        if flag == 'c':
+            price = S * np.exp(-q * t) * norm.cdf(d1) - K * np.exp(-r * t) * norm.cdf(d2)
+        else:
+            price = K * np.exp(-r * t) * norm.cdf(-d2) - S * np.exp(-q * t) * norm.cdf(-d1)
+        return price
+    except:
+        return 0.0
 
-def calculate_greek_exposures(option, S, is_put: bool = False, use_volume_exposure: bool = False, delta_adjusted: bool = False):
-    """Calculate accurate Greek exposures per $1 move, weighted by OI (default) or Volume."""
-    oi = int(option['openInterest'])
-    vol_contracts = int(option.get('volume', 0))
-    weight = vol_contracts if use_volume_exposure else oi
+def calculate_bs_vega(S, K, t, r, sigma, q=0):
+    """Calculate Black-Scholes Vega with dividends."""
+    try:
+        d1 = (np.log(S / K) + (r - q + 0.5 * sigma**2) * t) / (sigma * np.sqrt(t))
+        return S * np.exp(-q * t) * norm.pdf(d1) * np.sqrt(t)
+    except:
+        return 0.0
+
+def calculate_implied_volatility(price, S, K, t, r, flag, q=0):
+    """Calculate Implied Volatility using Newton-Raphson method."""
+    sigma = 0.5  # Initial guess
+    for i in range(100):
+        bs_price = calculate_bs_price(flag, S, K, t, r, sigma, q)
+        diff = price - bs_price
+        
+        if abs(diff) < 1e-5:
+            return sigma
+            
+        vega = calculate_bs_vega(S, K, t, r, sigma, q)
+        if abs(vega) < 1e-8:
+            return None
+            
+        sigma = sigma + diff / vega
+        
+        if sigma <= 0:
+            sigma = 0.001 # Reset if negative
+        if sigma > 5:
+            sigma = 5.0 # Cap if too high
+            
+    return 0.2 # Default if failed
+
+def calculate_greeks(flag, S, K, t, sigma, r=0.02, q=0):
+    """Calculate delta, gamma, vega, vanna."""
+    try:
+        t = max(t, 1e-5)
+        d1 = (np.log(S / K) + (r - q + 0.5 * sigma**2) * t) / (sigma * np.sqrt(t))
+        d2 = d1 - sigma * np.sqrt(t)
+        
+        # Delta
+        if flag == 'c':
+            delta = np.exp(-q * t) * norm.cdf(d1)
+        else:
+            delta = np.exp(-q * t) * (norm.cdf(d1) - 1)
+        
+        # Gamma
+        gamma = np.exp(-q * t) * norm.pdf(d1) / (S * sigma * np.sqrt(t))
+        
+        # Vega
+        vega = S * np.exp(-q * t) * norm.pdf(d1) * np.sqrt(t)
+        
+        # Vanna
+        vanna = -np.exp(-q * t) * norm.pdf(d1) * d2 / sigma
+        
+        return delta, gamma, vega, vanna
+    except Exception as e:
+        return 0, 0, 0, 0
+
+def calculate_theta(flag, S, K, t, sigma, r=0.02, q=0):
+    try:
+        t = max(t, 1e-5)
+        d1 = (np.log(S / K) + (r - q + 0.5 * sigma**2) * t) / (sigma * np.sqrt(t))
+        d2 = d1 - sigma * np.sqrt(t)
+        
+        term1 = -S * np.exp(-q * t) * norm.pdf(d1) * sigma / (2 * np.sqrt(t))
+        
+        if flag == 'c':
+            theta = term1 - r * K * np.exp(-r * t) * norm.cdf(d2) + q * S * np.exp(-q * t) * norm.cdf(d1)
+        else:
+            theta = term1 + r * K * np.exp(-r * t) * norm.cdf(-d2) - q * S * np.exp(-q * t) * norm.cdf(-d1)
+        return theta
+    except:
+        return 0
+
+def calculate_rho(flag, S, K, t, sigma, r=0.02, q=0):
+    try:
+        t = max(t, 1e-5)
+        d1 = (np.log(S / K) + (r - q + 0.5 * sigma**2) * t) / (sigma * np.sqrt(t))
+        d2 = d1 - sigma * np.sqrt(t)
+        
+        if flag == 'c':
+            rho = K * t * np.exp(-r * t) * norm.cdf(d2)
+        else:
+            rho = -K * t * np.exp(-r * t) * norm.cdf(-d2)
+        return rho
+    except:
+        return 0
+
+def calculate_charm(flag, S, K, t, sigma, r=0.02, q=0):
+    try:
+        t = max(t, 1e-5)
+        d1 = (np.log(S / K) + (r - q + 0.5 * sigma**2) * t) / (sigma * np.sqrt(t))
+        d2 = d1 - sigma * np.sqrt(t)
+        norm_d1 = norm.pdf(d1)
+        
+        if flag == 'c':
+            charm = -np.exp(-q * t) * (norm_d1 * (2*(r-q)*t - d2*sigma*np.sqrt(t)) / (2*t*sigma*np.sqrt(t)) - q * norm.cdf(d1))
+        else:
+            charm = -np.exp(-q * t) * (norm_d1 * (2*(r-q)*t - d2*sigma*np.sqrt(t)) / (2*t*sigma*np.sqrt(t)) + q * norm.cdf(-d1))
+        return charm
+    except:
+        return 0
+
+def calculate_speed(flag, S, K, t, sigma, r=0.02, q=0):
+    try:
+        t = max(t, 1e-5)
+        d1 = (np.log(S / K) + (r - q + 0.5 * sigma**2) * t) / (sigma * np.sqrt(t))
+        gamma = np.exp(-q * t) * norm.pdf(d1) / (S * sigma * np.sqrt(t))
+        speed = -gamma * (d1/(sigma * np.sqrt(t)) + 1) / S
+        return speed
+    except:
+        return 0
+
+def calculate_vomma(flag, S, K, t, sigma, r=0.02, q=0):
+    try:
+        t = max(t, 1e-5)
+        d1 = (np.log(S / K) + (r - q + 0.5 * sigma**2) * t) / (sigma * np.sqrt(t))
+        d2 = d1 - sigma * np.sqrt(t)
+        vega = S * np.exp(-q * t) * norm.pdf(d1) * np.sqrt(t)
+        vomma = vega * (d1 * d2) / sigma
+        return vomma
+    except:
+        return 0
+
+def calculate_color(flag, S, K, t, sigma, r=0.02, q=0):
+    try:
+        t = max(t, 1e-5)
+        d1 = (np.log(S / K) + (r - q + 0.5 * sigma**2) * t) / (sigma * np.sqrt(t))
+        d2 = d1 - sigma * np.sqrt(t)
+        norm_d1 = norm.pdf(d1)
+        term1 = 2 * (r - q) * t
+        term2 = d2 * sigma * np.sqrt(t)
+        color = -np.exp(-q*t) * (norm_d1 / (2 * S * t * sigma * np.sqrt(t))) * \
+                (1 + (term1 - term2) * d1 / (2 * t * sigma * np.sqrt(t)))
+        return color
+    except:
+        return 0
+
+def calculate_greek_exposures(option, S, weight, delta_adjusted: bool = False, calculate_in_notional: bool = True):
+    """Calculate accurate Greek exposures per $1 move, weighted by the provided weight."""
     contract_size = 100
     
-    # Get Greeks from our manual calculations
-    delta = option['delta']
-    gamma = option['gamma']
-    theta = option['theta']
-    vega = option['vega']
+    # Recalculate Greeks to ensure consistency with S and t
     vol = option['impliedVolatility']
     
     # Calculate time to expiration in years
     expiry_date = option['expiration']
     t = calculate_time_to_expiration(expiry_date)
-    t = max(t, 1/1440)  # Minimum 1 minute
+    t = max(t, 1e-5)  # Minimum time to prevent division by zero
     
-    # Calculate d1 and d2 for higher-order Greeks
+    # Determine flag (c/p) based on symbol if possible, or use parameter
+    flag = 'c'
+    if 'P' in option['contractSymbol'] and not 'C' in option['contractSymbol']:
+         flag = 'p'
+    import re
+    match = re.search(r'\d{6}([CP])', option['contractSymbol'])
+    if match:
+        flag = match.group(1).lower()
+
     r = 0.02  # risk-free rate
-    d1 = (math.log(S / option['strike']) + (r + 0.5 * vol**2) * t) / (vol * math.sqrt(t))
-    d2 = d1 - vol * math.sqrt(t)
-    
+    q = 0
+
+    # Re-calculate Greeks using consistent inputs
+    K = option['strike']
+    delta, gamma, _, vanna = calculate_greeks(flag, S, K, t, vol, r, q)
+
     # Calculate exposures (per $1 move in underlying)
-    # DEX: Delta exposure - total dollar notional value of the delta hedge
-    # For SPX: delta × OI × 100 (contract multiplier) × S
-    dex = delta * weight * contract_size * S
+    # Check if calculation should be in notional (dollars) or standard (shares)
+    spot_multiplier = S if calculate_in_notional else 1.0
     
-    # GEX: Gamma exposure - dollar change in delta exposure per $1 move
-    # GEX = Gamma * Volume/OI * Contract Size * Spot Price^2 * 0.01 (Dollar Gamma per 1% move in underlying)
-    gex = gamma * weight * contract_size * S * S * 0.01
+    # DEX: Delta exposure
+    # Delta is unitless (shares/contract / 100). 
+    # Notional DEX = Delta * 100 * S. (Dollar Value of Delta).
+    dex = delta * weight * contract_size * spot_multiplier
     
-    # VEX: Vanna exposure - change in delta per 1% change in volatility
-    # Vanna: Second derivative with respect to price and volatility
-    # Calculate vanna using the standard formula: -norm.pdf(d1) * d2 / sigma
-    vanna = -norm.pdf(d1) * d2 / vol if vol > 0 else 0
-    # VEX = Vanna * Volume/OI * Contract Size * Spot Price * 0.01 (Dollar Vanna per 1 vol point change)
-    vanna_exposure = vanna * weight * contract_size * S * 0.01
+    # GEX: Gamma exposure
+    # GEX (Notional) ~ Gamma * S * S * 0.01
+    gex = gamma * weight * contract_size * S * spot_multiplier * 0.01
     
-    # Charm: Change in delta per 1 day passing
-    # Charm: Second derivative with respect to price and time
-    # Standard Charm (Delta Decay) formula (same for calls and puts when q=0)
-    norm_d1 = norm.pdf(d1)
-    charm = -norm_d1 * (2 * r * t - d2 * vol * math.sqrt(t)) / (2 * t * vol * math.sqrt(t)) if vol > 0 and t > 0 else 0
-    # Charm = Charm * Volume/OI * Contract Size * Spot Price / 365 (Dollar Charm per 1 day decay)
-    charm_exposure = charm * weight * contract_size * S / 365.0
+    # VEX: Vanna exposure
+    vanna_exposure = vanna * weight * contract_size * spot_multiplier * 0.01
     
-    # Speed: Change in gamma per $1 move (third derivative)
-    # Speed = -Gamma * (d1/(sigma * sqrt(t)) + 1) / S
-    speed = -gamma * (d1 / (vol * math.sqrt(t)) + 1) / S if S > 0 and vol > 0 and t > 0 else 0
-    # Speed = Speed * Volume/OI * Contract Size * Spot Price^2 * 0.01 (Dollar Speed per 1% move)
-    speed_exposure = speed * weight * contract_size * S * S * 0.01
+    # Charm
+    charm = calculate_charm(flag, S, K, t, vol, r, q)
+    charm_exposure = charm * weight * contract_size * spot_multiplier / 365.0
     
-    # Vomma: Change in vega per 1% change in volatility (second derivative wrt vol)
-    # Vomma = Vega * d1 * d2 / sigma
-    vomma = vega * d1 * d2 / vol if vol > 0 else 0
-    # Vomma = Vomma * Volume/OI * Contract Size * 0.01 (Dollar Vomma per 1 vol point change)
+    # Speed
+    # Speed Exposure (Notional) ~ Speed * S * S * 0.01 (Matches ezoptions.py Speed * S * spot_multiplier)
+    speed = calculate_speed(flag, S, K, t, vol, r, q)
+    speed_exposure = speed * weight * contract_size * S * spot_multiplier * 0.01
+    
+    # Vomma
+    vomma = calculate_vomma(flag, S, K, t, vol, r, q)
     vomma_exposure = vomma * weight * contract_size * 0.01
+
+    # Color
+    color = calculate_color(flag, S, K, t, vol, r, q)
+    color_exposure = color * weight * contract_size * S * spot_multiplier * 0.01 / 365.0
 
     # Apply delta adjustment if enabled
     if delta_adjusted:
@@ -591,6 +825,8 @@ def calculate_greek_exposures(option, S, is_put: bool = False, use_volume_exposu
         charm_exposure *= abs_delta
         speed_exposure *= abs_delta
         vomma_exposure *= abs_delta
+        color_exposure *= abs_delta
+
     
     return {
         'DEX': dex,
@@ -598,10 +834,13 @@ def calculate_greek_exposures(option, S, is_put: bool = False, use_volume_exposu
         'VEX': vanna_exposure,
         'Charm': charm_exposure,
         'Speed': speed_exposure,
-        'Vomma': vomma_exposure
+        'Vomma': vomma_exposure,
+        'Color': color_exposure
     }
 
 def get_current_price(ticker):
+    if ticker == "MARKET":
+        ticker = "$SPX"
     try:
         quote_response = client.quotes(ticker)
         if not quote_response.ok:
@@ -615,6 +854,8 @@ def get_current_price(ticker):
         return None
 
 def get_option_expirations(ticker):
+    if ticker == "MARKET":
+        ticker = "$SPX"
     try:
         response = client.option_expiration_chain(ticker)
         if not response.ok:
@@ -644,7 +885,7 @@ def get_color_with_opacity(value, max_value, base_color, color_intensity=True):
         return f'rgba({r}, {g}, {b}, {opacity})'
     return base_color
 
-def create_exposure_chart(calls, puts, exposure_type, title, S, strike_range=0.02, show_calls=True, show_puts=True, show_net=True, color_intensity=True, call_color='#00FF00', put_color='#FF0000', selected_expiries=None):
+def create_exposure_chart(calls, puts, exposure_type, title, S, strike_range=0.02, show_calls=True, show_puts=True, show_net=True, color_intensity=True, call_color='#00FF00', put_color='#FF0000', selected_expiries=None, perspective='Customer'):
     # Ensure the exposure_type column exists
     if exposure_type not in calls.columns or exposure_type not in puts.columns:
         print(f"Warning: {exposure_type} not found in data")  # Fixed f-string syntax
@@ -680,6 +921,10 @@ def create_exposure_chart(calls, puts, exposure_type, title, S, strike_range=0.0
         # For other exposures, sum them (puts are same sign as calls usually)
         total_net_exposure = total_call_exposure + total_put_exposure
     
+    # Apply perspective (Dealer = Short, flip the sign of Net values)
+    if perspective == 'Dealer':
+        total_net_exposure = total_net_exposure * -1
+    
     # Create the main title and net exposure as separate annotations
     fig = go.Figure()
     
@@ -703,9 +948,9 @@ def create_exposure_chart(calls, puts, exposure_type, title, S, strike_range=0.0
             y=calls_df[exposure_type].tolist(),
             name='Call',
             marker_color=call_colors,
-            text=calls_df[exposure_type].round(2).tolist(),
+            text=[format_large_number(val) for val in calls_df[exposure_type]],
             textposition='auto',
-            hovertemplate='Strike: %{x}<br>Value: %{y:.2f}<extra></extra>',
+            hovertemplate='Strike: %{x}<br>Value: %{text}<extra></extra>',
             marker_line_width=0
         ))
     
@@ -724,9 +969,9 @@ def create_exposure_chart(calls, puts, exposure_type, title, S, strike_range=0.0
             y=(-puts_df[exposure_type]).tolist(),
             name='Put',
             marker_color=put_colors,
-            text=puts_df[exposure_type].round(2).tolist(),
+            text=[format_large_number(val) for val in puts_df[exposure_type]],
             textposition='auto',
-            hovertemplate='Strike: %{x}<br>Value: %{y:.2f}<extra></extra>',
+            hovertemplate='Strike: %{x}<br>Value: %{text}<extra></extra>',
             marker_line_width=0
         ))
     
@@ -745,6 +990,10 @@ def create_exposure_chart(calls, puts, exposure_type, title, S, strike_range=0.0
                 net_value = call_value + put_value
             else:
                 net_value = call_value + put_value
+            
+            # Apply perspective (Dealer = Short, flip the sign of Net values)
+            if perspective == 'Dealer':
+                net_value = net_value * -1
                 
             net_exposure.append(net_value)
         
@@ -765,9 +1014,9 @@ def create_exposure_chart(calls, puts, exposure_type, title, S, strike_range=0.0
             y=net_exposure,
             name='Net',
             marker_color=net_colors,
-            text=[f"{val:.2f}" for val in net_exposure],
+            text=[format_large_number(val) for val in net_exposure],
             textposition='auto',
-            hovertemplate='Strike: %{x}<br>Net Value: %{y:.2f}<extra></extra>',
+            hovertemplate='Strike: %{x}<br>Net Value: %{text}<extra></extra>',
             marker_line_width=0
         ))
     
@@ -802,7 +1051,7 @@ def create_exposure_chart(calls, puts, exposure_type, title, S, strike_range=0.0
         ),
         annotations=list(fig.layout.annotations) + [
             dict(
-                text=f"Net: {abs(total_net_exposure):,.2f}",
+                text=f"Net: {format_large_number(abs(total_net_exposure))}",
                 x=1.05,
                 y=1.05,  # Adjusted from 1.1 to 1.05 to move it slightly down
                 xref='paper',
@@ -893,7 +1142,7 @@ def create_volume_chart(call_volume, put_volume, use_itm=True, call_color='#00FF
     
     return fig.to_json()
 
-def create_options_volume_chart(calls, puts, S, strike_range=0.02, call_color='#00FF00', put_color='#FF0000', color_intensity=True, show_calls=True, show_puts=True, show_net=True, selected_expiries=None):
+def create_options_volume_chart(calls, puts, S, strike_range=0.02, call_color='#00FF00', put_color='#FF0000', color_intensity=True, show_calls=True, show_puts=True, show_net=True, selected_expiries=None, perspective='Customer'):
     # Filter strikes within range
     min_strike = S * (1 - strike_range)
     max_strike = S * (1 + strike_range)
@@ -962,6 +1211,11 @@ def create_options_volume_chart(calls, puts, S, strike_range=0.02, call_color='#
             call_vol = calls[calls['strike'] == strike]['volume'].sum() if not calls.empty else 0
             put_vol = puts[puts['strike'] == strike]['volume'].sum() if not puts.empty else 0
             net_vol = call_vol - put_vol
+            
+            # Apply perspective (Dealer = Short, flip the sign of Net values)
+            if perspective == 'Dealer':
+                net_vol = net_vol * -1
+                
             net_volume.append(net_vol)
         
         if color_intensity:
@@ -1084,7 +1338,7 @@ def update_options_chain(ticker, expiration_date=None):
         
     try:
         # Fetch new options chain data (default to OI-weighted exposures for background cache)
-        new_chain = fetch_options_for_date(ticker, expiration_date, use_volume_exposure=False)
+        new_chain = fetch_options_for_date(ticker, expiration_date, exposure_metric="Open Interest")
         if new_chain and not new_chain[0].empty and not new_chain[1].empty:
             current_chain = {
                 'calls': new_chain[0].to_dict('records'),
@@ -1097,6 +1351,8 @@ def update_options_chain(ticker, expiration_date=None):
         print(f"Error updating options chain: {e}")
 
 def get_price_history(ticker):
+    if ticker == "MARKET":
+        ticker = "$SPX"
     try:
         # Get current time in EST
         est = datetime.now(pytz.timezone('US/Eastern'))
@@ -1210,7 +1466,14 @@ def convert_to_heikin_ashi(candles):
     
     return ha_candles
 
-def create_price_chart(price_data, calls=None, puts=None, show_gamma_levels=False, call_color='#00FF00', put_color='#FF0000', show_percent_gex_levels=False, strike_range=0.02, use_heikin_ashi=False):
+def create_price_chart(price_data, calls=None, puts=None, exposure_levels_types=[], exposure_levels_count=3, call_color='#00FF00', put_color='#FF0000', strike_range=0.02, use_heikin_ashi=False):
+    # Handle backward compatibility or empty default
+    if isinstance(exposure_levels_types, str):
+        if exposure_levels_types == 'None':
+            exposure_levels_types = []
+        else:
+            exposure_levels_types = [exposure_levels_types]
+            
     if not price_data or 'candles' not in price_data or not price_data['candles']:
         return go.Figure().to_json()
     
@@ -1451,140 +1714,98 @@ def create_price_chart(price_data, calls=None, puts=None, show_gamma_levels=Fals
         ]
     )
     
-    # Add gamma levels if enabled
-    if show_gamma_levels and calls is not None and puts is not None:
-        # Calculate net gamma exposure for each strike
-        gamma_levels = {}
-        for _, row in calls.iterrows():
-            strike = row['strike']
-            call_gamma = row['GEX']
-            put_gamma = gamma_levels.get(strike, {}).get('put', 0)
-            # Take the larger absolute value
-            if abs(call_gamma) >= abs(put_gamma):
-                gamma_levels[strike] = call_gamma
-            else:
-                gamma_levels[strike] = put_gamma
-                
-        for _, row in puts.iterrows():
-            strike = row['strike']
-            put_gamma = -row['GEX']
-            call_gamma = gamma_levels.get(strike, 0)
-            # Take the larger absolute value
-            if abs(put_gamma) >= abs(call_gamma):
-                gamma_levels[strike] = put_gamma
-        
-        # Sort by absolute gamma exposure and get top levels
-        sorted_levels = sorted(gamma_levels.items(), key=lambda x: abs(x[1]), reverse=True)
-        top_levels = sorted_levels[:5]  # Show top 5 levels
-        
-        # Add horizontal lines for each gamma level
-        for strike, gamma in top_levels:
-            # Calculate color intensity based on gamma value
-            max_gamma = max(abs(gamma) for _, gamma in top_levels)
-            intensity = max(0.1, min(1.0, abs(gamma) / max_gamma))
-            # Convert hex to rgba
-            color = call_color if gamma > 0 else put_color
-            r = int(color[1:3], 16)
-            g = int(color[3:5], 16)
-            b = int(color[5:7], 16)
-            rgba_color = f'rgba({r}, {g}, {b}, {intensity:.2f})'
-            
-            # Add the horizontal line
-            fig.add_hline(
-                y=strike,
-                line_dash="dash",
-                line_color=rgba_color,
-                line_width=1
-            )
-            
-            # Add separate annotation for the text
-            fig.add_annotation(
-                x=1,
-                y=strike,
-                xref="paper",
-                yref="y",
-                text=f"GEX: {gamma:,.0f}",
-                showarrow=False,
-                font=dict(
-                    size=10,
-                    color=rgba_color
-                ),
-                xanchor='left',
-                yanchor='bottom',
-                xshift=-95,
-                yshift=5
-            )
-    
-    # Add % GEX levels if enabled
-    if show_percent_gex_levels and calls is not None and puts is not None:
-        # Filter options within strike range
+    # Logic to add Exposure Levels to Price Chart
+    if exposure_levels_types and calls is not None and puts is not None:
+        # Filter options within strike range for better visualization
         range_calls = calls[(calls['strike'] >= min_strike) & (calls['strike'] <= max_strike)]
         range_puts = puts[(puts['strike'] >= min_strike) & (puts['strike'] <= max_strike)]
         
-        # Calculate net gamma exposure for each strike
-        gamma_levels = {}
-        for _, row in range_calls.iterrows():
-            strike = row['strike']
-            call_gamma = row['GEX']
-            put_gamma = gamma_levels.get(strike, {}).get('put', 0)
-            # Take the larger absolute value
-            if abs(call_gamma) >= abs(put_gamma):
-                gamma_levels[strike] = call_gamma
-            else:
-                gamma_levels[strike] = put_gamma
+        # Define dash styles to differentiate if multiple types are selected
+        dash_styles = ['dot', 'dash', 'longdash', 'dashdot', 'longdashdot']
+        
+        for i, exposure_levels_type in enumerate(exposure_levels_types):
+            # Determine column name based on type
+            col_name = exposure_levels_type
+            if exposure_levels_type == 'Vanna': col_name = 'VEX'
+            
+            # Check if column exists
+            if col_name in range_calls.columns and col_name in range_puts.columns:
+                # Calculate aggregated exposure for each strike
+                call_ex = range_calls.groupby('strike')[col_name].sum().to_dict() if not range_calls.empty else {}
+                put_ex = range_puts.groupby('strike')[col_name].sum().to_dict() if not range_puts.empty else {}
                 
-        for _, row in range_puts.iterrows():
-            strike = row['strike']
-            put_gamma = -row['GEX']
-            call_gamma = gamma_levels.get(strike, 0)
-            # Take the larger absolute value
-            if abs(put_gamma) >= abs(call_gamma):
-                gamma_levels[strike] = put_gamma
-        
-        # Sort by absolute gamma exposure and get top levels within strike range
-        sorted_levels = sorted(gamma_levels.items(), key=lambda x: abs(x[1]), reverse=True)
-        top_levels = sorted_levels[:5]  # Show top 5 levels
-        
-        # Add horizontal lines for each gamma level
-        for strike, gamma in top_levels:
-            # Calculate color intensity based on gamma value
-            max_gamma = max(abs(gamma) for _, gamma in top_levels)
-            intensity = max(0.1, min(1.0, abs(gamma) / max_gamma))
-            # Convert hex to rgba
-            color = call_color if gamma > 0 else put_color
-            r = int(color[1:3], 16)
-            g = int(color[3:5], 16)
-            b = int(color[5:7], 16)
-            rgba_color = f'rgba({r}, {g}, {b}, {intensity:.2f})'
-            
-            # Add the horizontal line
-            fig.add_hline(
-                y=strike,
-                line_dash="dot",
-                line_color=rgba_color,
-                line_width=1
-            )
-            
-            # Add separate annotation for the text
-            fig.add_annotation(
-                x=1,
-                y=strike,
-                xref="paper",
-                yref="y",
-                text=f"% GEX: {gamma:,.0f}",
-                showarrow=False,
-                font=dict(
-                    size=10,
-                    color=rgba_color
-                ),
-                xanchor='left',
-                yanchor='top',
-                xshift=-95,
-                yshift=-5
-            )
-    
+                levels = {}
+                all_strikes = set(call_ex.keys()) | set(put_ex.keys())
+                
+                for strike in all_strikes:
+                    c_val = call_ex.get(strike, 0)
+                    p_val = put_ex.get(strike, 0)
+                    
+                    # Calculate Net Exposure based on type logic
+                    if exposure_levels_type == 'GEX':
+                        # GEX is Call - Put (puts are positive in calculation)
+                        net_val = c_val - p_val
+                    elif exposure_levels_type == 'DEX':
+                         # DEX: Call + Put. (Puts have negative delta).
+                         net_val = c_val + p_val
+                    else: 
+                         # Others: Call + Put.
+                         net_val = c_val + p_val
+                    
+                    levels[strike] = net_val
 
-    
+                # Sort by absolute exposure and get top levels
+                sorted_levels = sorted(levels.items(), key=lambda x: abs(x[1]), reverse=True)
+                top_levels = sorted_levels[:exposure_levels_count]
+                
+                # Pick dash style
+                dash_style = dash_styles[i % len(dash_styles)]
+                
+                # Add horizontal lines for each level
+                for strike, val in top_levels:
+                     # Calculate color intensity based on value
+                    max_val = max(abs(v) for _, v in top_levels)
+                    if max_val == 0: max_val = 1
+                    intensity = max(0.1, min(1.0, abs(val) / max_val))
+                    
+                    # Determine color: Green for positive, Red for negative
+                    is_positive = val >= 0
+                    color = call_color if is_positive else put_color
+                    
+                    r = int(color[1:3], 16)
+                    g = int(color[3:5], 16)
+                    b = int(color[5:7], 16)
+                    rgba_color = f'rgba({r}, {g}, {b}, {intensity:.2f})'
+                    
+                    # Add the horizontal line
+                    fig.add_hline(
+                        y=strike,
+                        line_dash=dash_style,
+                        line_color=rgba_color,
+                        line_width=1
+                    )
+                    
+                    # Add separate annotation for the text
+                    # Offset vertically by index to prevent stacking perfectly
+                    y_offset_pixels = 5 + (i * 15)
+                    
+                    fig.add_annotation(
+                        x=1,
+                        y=strike,
+                        xref="paper",
+                        yref="y",
+                        text=f"{exposure_levels_type}: {val:,.0f}",
+                        showarrow=False,
+                        font=dict(
+                            size=10,
+                            color=rgba_color
+                        ),
+                        xanchor='left',
+                        yanchor='top',
+                        xshift=-105, # Moved further left to accommodate type name
+                        yshift=-y_offset_pixels
+                    )
+
     return fig.to_json()
 
 def create_large_trades_table(calls, puts, S, strike_range, call_color='#00FF00', put_color='#FF0000', selected_expiries=None):
@@ -1772,6 +1993,11 @@ def create_historical_bubble_levels_chart(ticker, strike_range, call_color='#00F
         net_gamma = row[3]
         net_delta = row[4]
         net_vanna = row[5]
+        # Check if net_charm exists (for backward compatibility during readout)
+        if len(row) > 6:
+            net_charm = row[6] if row[6] is not None else 0
+        else:
+            net_charm = 0
         
         if timestamp not in data_by_time:
             data_by_time[timestamp] = {
@@ -1780,12 +2006,18 @@ def create_historical_bubble_levels_chart(ticker, strike_range, call_color='#00F
             }
         
         # Store the exposure value based on the requested type
+        exposure = 0
         if exposure_type == 'gamma':
             exposure = net_gamma
         elif exposure_type == 'delta':
             exposure = net_delta
         elif exposure_type == 'vanna':
             exposure = net_vanna
+        elif exposure_type == 'charm':
+            exposure = net_charm
+            
+        if exposure is None:
+            exposure = 0
             
         data_by_time[timestamp]['strikes'].append((strike, exposure))
     
@@ -1882,7 +2114,8 @@ def create_historical_bubble_levels_chart(ticker, strike_range, call_color='#00F
     exposure_name = {
         'gamma': 'Gamma',
         'delta': 'Delta',
-        'vanna': 'Vanna'
+        'vanna': 'Vanna',
+        'charm': 'Charm'
     }.get(exposure_type, 'Exposure')
     
     fig.add_trace(go.Scatter(
@@ -1970,7 +2203,7 @@ def create_historical_bubble_levels_chart(ticker, strike_range, call_color='#00F
 
 
 
-def create_premium_chart(calls, puts, S, strike_range=0.02, call_color='#00FF00', put_color='#FF0000', color_intensity=True, show_calls=True, show_puts=True, show_net=True, selected_expiries=None):
+def create_premium_chart(calls, puts, S, strike_range=0.02, call_color='#00FF00', put_color='#FF0000', color_intensity=True, show_calls=True, show_puts=True, show_net=True, selected_expiries=None, perspective='Customer'):
     # Filter strikes within range
     min_strike = S * (1 - strike_range)
     max_strike = S * (1 + strike_range)
@@ -2031,6 +2264,11 @@ def create_premium_chart(calls, puts, S, strike_range=0.02, call_color='#00FF00'
             call_prem = calls[calls['strike'] == strike]['lastPrice'].sum() if not calls.empty else 0
             put_prem = puts[puts['strike'] == strike]['lastPrice'].sum() if not puts.empty else 0
             net_prem = call_prem - put_prem
+            
+            # Apply perspective (Dealer = Short, flip the sign of Net values)
+            if perspective == 'Dealer':
+                net_prem = net_prem * -1
+                
             net_premium.append(net_prem)
         
         if color_intensity:
@@ -2314,14 +2552,14 @@ def infer_side(last, bid, ask):
     else:
         return 0  # indeterminate
 
-def fetch_options_for_multiple_dates(ticker, dates, use_volume_exposure: bool = False, delta_adjusted: bool = False):
+def fetch_options_for_multiple_dates(ticker, dates, exposure_metric="Open Interest", delta_adjusted: bool = False, calculate_in_notional: bool = True):
     """Fetch options for multiple expiration dates and combine them"""
     all_calls = []
     all_puts = []
     
     for date in dates:
         try:
-            calls, puts = fetch_options_for_date(ticker, date, use_volume_exposure=use_volume_exposure, delta_adjusted=delta_adjusted)
+            calls, puts = fetch_options_for_date(ticker, date, exposure_metric=exposure_metric, delta_adjusted=delta_adjusted, calculate_in_notional=calculate_in_notional)
             if not calls.empty:
                 all_calls.append(calls)
             if not puts.empty:
@@ -2480,6 +2718,66 @@ def index():
         }
         .expiry-buttons button:hover {
             background-color: #555;
+        }
+        .levels-dropdown {
+            position: relative;
+            min-width: 150px;
+        }
+        .levels-display {
+            padding: 8px 12px;
+            border-radius: 6px;
+            border: 1px solid #444;
+            background-color: #333;
+            color: white;
+            cursor: pointer;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            user-select: none;
+        }
+        .levels-display:hover {
+            border-color: #555;
+            background-color: #3a3a3a;
+        }
+        .levels-display::after {
+            content: '▼';
+            font-size: 12px;
+            color: #888;
+        }
+        .levels-options {
+            position: absolute;
+            top: 100%;
+            left: 0;
+            right: 0;
+            background-color: #333;
+            border: 1px solid #444;
+            border-radius: 6px;
+            border-top: none;
+            border-top-left-radius: 0;
+            border-top-right-radius: 0;
+            max-height: 200px;
+            overflow-y: auto;
+            z-index: 1000;
+            display: none;
+        }
+        .levels-options.open {
+            display: block;
+        }
+        .levels-option {
+            padding: 8px 12px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            transition: background-color 0.2s;
+        }
+        .levels-option:hover {
+            background-color: #444;
+        }
+        .levels-option input[type="checkbox"] {
+            width: 16px;
+            height: 16px;
+            accent-color: #00FF00;
         }
         .control-group label {
             white-space: nowrap;
@@ -2763,14 +3061,21 @@ def index():
                         <input type="range" id="strike_range" min="1" max="20" value="2" step="0.5">
                         <span class="range-value" id="strike_range_value">2%</span>
                     </div>
-                    <div class="control-group" title="When enabled, exposure formulas (GEX/DEX/VEX/Charm/Speed/Vomma) are weighted by traded volume (contracts) instead of open interest. Applies to all exposure charts for the selected expiries.">
-                        <input type="checkbox" id="use_volume_exposure">
-                        <label for="use_volume_exposure">Weight exposures by Volume (instead of Open Interest)</label>
-                        <span style="font-size: 11px; color: #AAAAAA; cursor: help;" title="When enabled, exposure formulas (GEX/DEX/VEX/Charm/Speed/Vomma) are weighted by traded volume (contracts) instead of open interest. Applies to all exposure charts for the selected expiries.">[?]</span>
+                    <div class="control-group">
+                        <label for="exposure_metric">Exposure Metric:</label>
+                        <select id="exposure_metric" title="Select the metric used to weight exposure formulas (GEX/DEX/VEX etc)">
+                            <option value="Open Interest" selected>Open Interest</option>
+                            <option value="Volume">Volume</option>
+                            <option value="OI Weighted by Volume">OI Weighted by Volume</option>
+                        </select>
                     </div>
                     <div class="control-group" title="When enabled, exposure formulas are adjusted by delta.">
                         <input type="checkbox" id="delta_adjusted_exposures">
                         <label for="delta_adjusted_exposures">Delta-Adjusted Exposures</label>
+                    </div>
+                    <div class="control-group" title="When enabled, exposures are calculated in notional value (Dollars). When disabled, in share equivalents.">
+                        <input type="checkbox" id="calculate_in_notional" checked>
+                        <label for="calculate_in_notional">Notional Calc</label>
                     </div>
                     <div class="control-group">
                         <input type="checkbox" id="show_calls">
@@ -2785,16 +3090,36 @@ def index():
                         <label for="show_net">Net</label>
                     </div>
                     <div class="control-group">
+                        <label for="perspective">Perspective:</label>
+                        <select id="perspective">
+                            <option value="Customer" selected>Customer</option>
+                            <option value="Dealer">Dealer</option>
+                        </select>
+                    </div>
+                    <div class="control-group">
                         <input type="checkbox" id="color_intensity" checked>
                         <label for="color_intensity">Color Intensity</label>
                     </div>
                     <div class="control-group">
-                        <input type="checkbox" id="show_gamma_levels">
-                        <label for="show_gamma_levels">GEX Levels (overall)</label>
+                        <label>Price Levels:</label>
+                        <div class="levels-dropdown">
+                            <div class="levels-display" id="levels-display">
+                                <span id="levels-text">None</span>
+                            </div>
+                            <div class="levels-options" id="levels-options">
+                                <div class="levels-option"><input type="checkbox" value="GEX" id="lvl-GEX"><label for="lvl-GEX">GEX</label></div>
+                                <div class="levels-option"><input type="checkbox" value="DEX" id="lvl-DEX"><label for="lvl-DEX">DEX</label></div>
+                                <div class="levels-option"><input type="checkbox" value="VEX" id="lvl-VEX"><label for="lvl-VEX">Vanna</label></div>
+                                <div class="levels-option"><input type="checkbox" value="Charm" id="lvl-Charm"><label for="lvl-Charm">Charm</label></div>
+                                <div class="levels-option"><input type="checkbox" value="Speed" id="lvl-Speed"><label for="lvl-Speed">Speed</label></div>
+                                <div class="levels-option"><input type="checkbox" value="Vomma" id="lvl-Vomma"><label for="lvl-Vomma">Vomma</label></div>
+                                <div class="levels-option"><input type="checkbox" value="Color" id="lvl-Color"><label for="lvl-Color">Color</label></div>
+                            </div>
+                        </div>
                     </div>
                     <div class="control-group">
-                        <input type="checkbox" id="show_percent_gex_levels">
-                        <label for="show_percent_gex_levels">% GEX Levels</label>
+                        <label for="levels_count">Top #:</label>
+                        <input type="number" id="levels_count" min="1" max="10" value="3" style="width: 50px;">
                     </div>
                     <div class="control-group">
                         <input type="checkbox" id="use_heikin_ashi">
@@ -2836,6 +3161,10 @@ def index():
                 <label for="vanna_historical_bubble">Vanna Historical Bubble Levels</label>
             </div>
             <div class="chart-checkbox">
+                <input type="checkbox" id="charm_historical_bubble" checked>
+                <label for="charm_historical_bubble">Charm Historical Bubble Levels</label>
+            </div>
+            <div class="chart-checkbox">
                 <input type="checkbox" id="gamma" checked>
                 <label for="gamma">Gamma Exposure</label>
             </div>
@@ -2852,12 +3181,16 @@ def index():
                 <label for="charm">Charm Exposure</label>
             </div>
             <div class="chart-checkbox">
-                <input type="checkbox" id="speed" checked>
+                <input type="checkbox" id="speed">
                 <label for="speed">Speed Exposure</label>
             </div>
             <div class="chart-checkbox">
-                <input type="checkbox" id="vomma" checked>
+                <input type="checkbox" id="vomma">
                 <label for="vomma">Vomma Exposure</label>
+            </div>
+            <div class="chart-checkbox">
+                <input type="checkbox" id="color">
+                <label for="color">Color Exposure</label>
             </div>
 
             <div class="chart-checkbox">
@@ -2929,6 +3262,39 @@ def index():
             document.getElementById('strike_range_value').textContent = this.value + '%';
             updateData();
         });
+
+        // Perspective listener
+        document.getElementById('perspective').addEventListener('change', updateData);
+        document.getElementById('exposure_metric').addEventListener('change', updateData);
+        document.getElementById('levels_count').addEventListener('input', updateData);
+
+        // Levels dropdown handlers
+        function updateLevelsDisplay() {
+            const checkedBoxes = document.querySelectorAll('.levels-option input[type="checkbox"]:checked');
+            const levelsText = document.getElementById('levels-text');
+            
+            if (checkedBoxes.length === 0) {
+                levelsText.textContent = 'None';
+            } else if (checkedBoxes.length === 1) {
+                levelsText.textContent = checkedBoxes[0].value;
+            } else {
+                levelsText.textContent = `${checkedBoxes.length} selected`;
+            }
+        }
+
+        document.getElementById('levels-display').addEventListener('click', function(e) {
+            e.stopPropagation();
+            const options = document.getElementById('levels-options');
+            options.classList.toggle('open');
+        });
+        
+        // Add event listeners for level checkboxes
+        document.querySelectorAll('.levels-option input[type="checkbox"]').forEach(checkbox => {
+            checkbox.addEventListener('change', function() {
+                updateLevelsDisplay();
+                updateData();
+            });
+        });
         
         function updateData() {
             if (updateInProgress) {
@@ -2951,13 +3317,15 @@ def index():
             const showPuts = document.getElementById('show_puts').checked;
             const showNet = document.getElementById('show_net').checked;
             const colorIntensity = document.getElementById('color_intensity').checked;
-            const showGammaLevels = document.getElementById('show_gamma_levels').checked;
-            const showPercentGexLevels = document.getElementById('show_percent_gex_levels').checked;
+            const levelsTypes = Array.from(document.querySelectorAll('.levels-option input:checked')).map(cb => cb.value);
+            const levelsCount = parseInt(document.getElementById('levels_count').value);
             const useHeikinAshi = document.getElementById('use_heikin_ashi').checked;
             const useRange = document.getElementById('use_range').checked;
-            const useVolumeExposure = document.getElementById('use_volume_exposure').checked;
+            const exposureMetric = document.getElementById('exposure_metric').value;
             const deltaAdjusted = document.getElementById('delta_adjusted_exposures').checked;
+            const calculateInNotional = document.getElementById('calculate_in_notional').checked;
             const strikeRange = parseFloat(document.getElementById('strike_range').value) / 100;
+            const perspective = document.getElementById('perspective').value;
             
             // Get visible charts
             const visibleCharts = {
@@ -2965,12 +3333,14 @@ def index():
                 show_gex_historical_bubble: document.getElementById('gex_historical_bubble').checked,
                 show_dex_historical_bubble: document.getElementById('dex_historical_bubble').checked,
                 show_vanna_historical_bubble: document.getElementById('vanna_historical_bubble').checked,
+                show_charm_historical_bubble: document.getElementById('charm_historical_bubble').checked,
                 show_gamma: document.getElementById('gamma').checked,
                 show_delta: document.getElementById('delta').checked,
                 show_vanna: document.getElementById('vanna').checked,
                 show_charm: document.getElementById('charm').checked,
                 show_speed: document.getElementById('speed').checked,
                 show_vomma: document.getElementById('vomma').checked,
+                show_color: document.getElementById('color').checked,
                 show_options_volume: document.getElementById('options_volume').checked,
                 show_volume: document.getElementById('volume').checked,
                 show_large_trades: document.getElementById('large_trades').checked,
@@ -2990,13 +3360,15 @@ def index():
                     show_puts: showPuts,
                     show_net: showNet,
                     color_intensity: colorIntensity,
-                    show_gamma_levels: showGammaLevels,
-                    show_percent_gex_levels: showPercentGexLevels,
+                    levels_types: levelsTypes,
+                    levels_count: levelsCount,
                     use_heikin_ashi: useHeikinAshi,
                     use_range: useRange,
-                    use_volume_exposure: useVolumeExposure,
+                    exposure_metric: exposureMetric,
                     delta_adjusted: deltaAdjusted,
+                    calculate_in_notional: calculateInNotional,
                     strike_range: strikeRange,
+                    perspective: perspective,
                     call_color: callColor,
                     put_color: putColor,
                     ...visibleCharts
@@ -3030,12 +3402,14 @@ def index():
                 gex_historical_bubble: document.getElementById('gex_historical_bubble').checked,
                 dex_historical_bubble: document.getElementById('dex_historical_bubble').checked,
                 vanna_historical_bubble: document.getElementById('vanna_historical_bubble').checked,
+                charm_historical_bubble: document.getElementById('charm_historical_bubble').checked,
                 gamma: document.getElementById('gamma').checked,
                 delta: document.getElementById('delta').checked,
                 vanna: document.getElementById('vanna').checked,
                 charm: document.getElementById('charm').checked,
                 speed: document.getElementById('speed').checked,
                 vomma: document.getElementById('vomma').checked,
+                color: document.getElementById('color').checked,
                 options_volume: document.getElementById('options_volume').checked,
                 volume: document.getElementById('volume').checked,
                 large_trades: document.getElementById('large_trades').checked,
@@ -3118,7 +3492,7 @@ def index():
             }
             
             // Handle historical bubble levels and centroid
-            const historicalBubbles = ['gex_historical_bubble', 'dex_historical_bubble', 'vanna_historical_bubble', 'centroid'];
+            const historicalBubbles = ['gex_historical_bubble', 'dex_historical_bubble', 'vanna_historical_bubble', 'charm_historical_bubble', 'centroid'];
             const historicalBubblesRow = document.getElementById('historical-bubbles-row');
             
             // Count enabled historical bubble levels
@@ -3399,8 +3773,14 @@ def index():
         document.addEventListener('click', function(e) {
             const dropdown = document.querySelector('.expiry-dropdown');
             const options = document.getElementById('expiry-options');
-            if (!dropdown.contains(e.target)) {
+            if (dropdown && !dropdown.contains(e.target)) {
                 options.classList.remove('open');
+            }
+            
+            const levelsDropdown = document.querySelector('.levels-dropdown');
+            const levelsOptions = document.getElementById('levels-options');
+            if (levelsDropdown && !levelsDropdown.contains(e.target)) {
+                levelsOptions.classList.remove('open');
             }
         });
         
@@ -3516,14 +3896,20 @@ def update():
         
     try:
         # Setting: use volume or OI for exposure weighting
-        use_volume_exposure = data.get('use_volume_exposure', False)
+        exposure_metric = data.get('exposure_metric', "Open Interest")
         delta_adjusted = data.get('delta_adjusted', False)
+        # Default calculate_in_notional to True if not present, but handle string 'true' just in case
+        cin_val = data.get('calculate_in_notional', True)
+        if isinstance(cin_val, str):
+            calculate_in_notional = cin_val.lower() == 'true'
+        else:
+            calculate_in_notional = bool(cin_val)
 
         # Fetch options data for multiple dates
         if len(expiry_dates) == 1:
-            calls, puts = fetch_options_for_date(ticker, expiry_dates[0], use_volume_exposure=use_volume_exposure, delta_adjusted=delta_adjusted)
+            calls, puts = fetch_options_for_date(ticker, expiry_dates[0], exposure_metric=exposure_metric, delta_adjusted=delta_adjusted, calculate_in_notional=calculate_in_notional)
         else:
-            calls, puts = fetch_options_for_multiple_dates(ticker, expiry_dates, use_volume_exposure=use_volume_exposure, delta_adjusted=delta_adjusted)
+            calls, puts = fetch_options_for_multiple_dates(ticker, expiry_dates, exposure_metric=exposure_metric, delta_adjusted=delta_adjusted, calculate_in_notional=calculate_in_notional)
         
         if calls.empty and puts.empty:
             return jsonify({'error': 'No options data found'})
@@ -3610,9 +3996,10 @@ def update():
         color_intensity = data.get('color_intensity', True)
         call_color = data.get('call_color', '#00ff00')
         put_color = data.get('put_color', '#ff0000')
-        show_gamma_levels = data.get('show_gamma_levels', False)
-        show_percent_gex_levels = data.get('show_percent_gex_levels', False)
+        exposure_levels_types = data.get('levels_types', [])
+        exposure_levels_count = int(data.get('levels_count', 3))
         use_heikin_ashi = data.get('use_heikin_ashi', False)
+        perspective = data.get('perspective', 'Customer')
  
         
         response = {}
@@ -3623,10 +4010,10 @@ def update():
                 price_data=price_data,
                 calls=calls,
                 puts=puts,
-                show_gamma_levels=show_gamma_levels,
+                exposure_levels_types=exposure_levels_types,
+                exposure_levels_count=exposure_levels_count,
                 call_color=call_color,
                 put_color=put_color,
-                show_percent_gex_levels=show_percent_gex_levels,
                 strike_range=strike_range,
                 use_heikin_ashi=use_heikin_ashi
             )
@@ -3646,32 +4033,40 @@ def update():
             if img_bytes:
                 response['vanna_historical_bubble'] = f"data:image/png;base64,{base64.b64encode(img_bytes).decode('utf-8')}"
         
+        if data.get('show_charm_historical_bubble', True):
+            img_bytes = create_historical_bubble_levels_chart(ticker, strike_range, call_color, put_color, 'charm')
+            if img_bytes:
+                response['charm_historical_bubble'] = f"data:image/png;base64,{base64.b64encode(img_bytes).decode('utf-8')}"
+        
         if data.get('show_gamma', True):
-            response['gamma'] = create_exposure_chart(calls, puts, "GEX", "Gamma Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, color_intensity, call_color, put_color, expiry_dates)
+            response['gamma'] = create_exposure_chart(calls, puts, "GEX", "Gamma Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, color_intensity, call_color, put_color, expiry_dates, perspective)
         
         if data.get('show_delta', True):
-            response['delta'] = create_exposure_chart(calls, puts, "DEX", "Delta Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, color_intensity, call_color, put_color, expiry_dates)
+            response['delta'] = create_exposure_chart(calls, puts, "DEX", "Delta Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, color_intensity, call_color, put_color, expiry_dates, perspective)
         
         if data.get('show_vanna', True):
-            response['vanna'] = create_exposure_chart(calls, puts, "VEX", "Vanna Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, color_intensity, call_color, put_color, expiry_dates)
+            response['vanna'] = create_exposure_chart(calls, puts, "VEX", "Vanna Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, color_intensity, call_color, put_color, expiry_dates, perspective)
         
         if data.get('show_charm', True):
-            response['charm'] = create_exposure_chart(calls, puts, "Charm", "Charm Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, color_intensity, call_color, put_color, expiry_dates)
+            response['charm'] = create_exposure_chart(calls, puts, "Charm", "Charm Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, color_intensity, call_color, put_color, expiry_dates, perspective)
         
         if data.get('show_speed', True):
-            response['speed'] = create_exposure_chart(calls, puts, "Speed", "Speed Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, color_intensity, call_color, put_color, expiry_dates)
+            response['speed'] = create_exposure_chart(calls, puts, "Speed", "Speed Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, color_intensity, call_color, put_color, expiry_dates, perspective)
         
         if data.get('show_vomma', True):
-            response['vomma'] = create_exposure_chart(calls, puts, "Vomma", "Vomma Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, color_intensity, call_color, put_color, expiry_dates)
+            response['vomma'] = create_exposure_chart(calls, puts, "Vomma", "Vomma Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, color_intensity, call_color, put_color, expiry_dates, perspective)
+
+        if data.get('show_color', True):
+            response['color'] = create_exposure_chart(calls, puts, "Color", "Color Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, color_intensity, call_color, put_color, expiry_dates, perspective)
         
         if data.get('show_volume', True):
             response['volume'] = create_volume_chart(call_volume, put_volume, use_range, call_color, put_color, expiry_dates)
         
         if data.get('show_options_volume', True):
-            response['options_volume'] = create_options_volume_chart(calls, puts, S, strike_range, call_color, put_color, color_intensity, show_calls, show_puts, show_net, expiry_dates)
+            response['options_volume'] = create_options_volume_chart(calls, puts, S, strike_range, call_color, put_color, color_intensity, show_calls, show_puts, show_net, expiry_dates, perspective)
         
         if data.get('show_premium', True):
-            response['premium'] = create_premium_chart(calls, puts, S, strike_range, call_color, put_color, color_intensity, show_calls, show_puts, show_net, expiry_dates)
+            response['premium'] = create_premium_chart(calls, puts, S, strike_range, call_color, put_color, color_intensity, show_calls, show_puts, show_net, expiry_dates, perspective)
         
         if data.get('show_large_trades', True):
             response['large_trades'] = create_large_trades_table(calls, puts, S, strike_range, call_color, put_color, expiry_dates)
