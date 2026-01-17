@@ -885,7 +885,7 @@ def get_color_with_opacity(value, max_value, base_color, color_intensity=True):
         return f'rgba({r}, {g}, {b}, {opacity})'
     return base_color
 
-def create_exposure_chart(calls, puts, exposure_type, title, S, strike_range=0.02, show_calls=True, show_puts=True, show_net=True, color_intensity=True, call_color='#00FF00', put_color='#FF0000', selected_expiries=None, perspective='Customer', horizontal=False):
+def create_exposure_chart(calls, puts, exposure_type, title, S, strike_range=0.02, show_calls=True, show_puts=True, show_net=True, color_intensity=True, call_color='#00FF00', put_color='#FF0000', selected_expiries=None, perspective='Customer', horizontal=False, show_abs_gex_area=False, abs_gex_opacity=0.2):
     # Ensure the exposure_type column exists
     if exposure_type not in calls.columns or exposure_type not in puts.columns:
         print(f"Warning: {exposure_type} not found in data")  # Fixed f-string syntax
@@ -928,6 +928,48 @@ def create_exposure_chart(calls, puts, exposure_type, title, S, strike_range=0.0
     # Create the main title and net exposure as separate annotations
     fig = go.Figure()
     
+    # Add Absolute GEX Area Chart if enabled
+    if exposure_type == 'GEX' and show_abs_gex_area:
+        try:
+            # Get all unique strikes in the range
+            all_strikes_abs = sorted(list(set(calls_df['strike'].tolist() + puts_df['strike'].tolist())))
+            abs_gex_values = []
+            
+            for strike in all_strikes_abs:
+                # Calculate absolute gamma at this strike (Total Gamma)
+                c_val = calls_df[calls_df['strike'] == strike][exposure_type].sum() if not calls_df.empty else 0
+                p_val = puts_df[puts_df['strike'] == strike][exposure_type].sum() if not puts_df.empty else 0
+                
+                # Use absolute values to get total magnitude
+                total_abs_val = abs(c_val) + abs(p_val)
+                abs_gex_values.append(total_abs_val)
+                
+            # Add the area trace
+            if horizontal:
+                fig.add_trace(go.Scatter(
+                    y=all_strikes_abs,
+                    x=abs_gex_values,
+                    mode='none',
+                    fill='tozerox',
+                    name='Abs GEX Total',
+                    fillcolor=f'rgba(200, 200, 200, {abs_gex_opacity})',
+                    hoverinfo='skip',
+                    showlegend=False
+                ))
+            else:
+                fig.add_trace(go.Scatter(
+                    x=all_strikes_abs,
+                    y=abs_gex_values,
+                    mode='none',
+                    fill='tozeroy',
+                    name='Abs GEX Total',
+                    fillcolor=f'rgba(200, 200, 200, {abs_gex_opacity})',
+                    hoverinfo='skip',
+                    showlegend=False
+                ))
+        except Exception as e:
+            print(f"Error adding Abs GEX area: {e}")
+
     # Define colors
     grid_color = '#333333'
     text_color = '#CCCCCC'
@@ -3345,6 +3387,15 @@ def index():
                         <input type="checkbox" id="horizontal_bars">
                         <label for="horizontal_bars">Horizontal Bars</label>
                     </div>
+                    <!-- New Absolute GEX Settings -->
+                    <div class="control-group">
+                        <input type="checkbox" id="show_abs_gex">
+                        <label for="show_abs_gex">Show Abs GEX Area</label>
+                    </div>
+                    <div class="control-group">
+                        <label for="abs_gex_opacity">Abs GEX Opacity:</label>
+                        <input type="range" id="abs_gex_opacity" min="0" max="100" value="20" style="width: 80px;">
+                    </div>
                     <div class="control-group">
                         <input type="checkbox" id="use_range">
                         <label for="use_range">% Range Volume</label>
@@ -3487,6 +3538,7 @@ def index():
         document.getElementById('perspective').addEventListener('change', updateData);
         document.getElementById('exposure_metric').addEventListener('change', updateData);
         document.getElementById('levels_count').addEventListener('input', updateData);
+        document.getElementById('abs_gex_opacity').addEventListener('input', updateData);
 
         // Levels dropdown handlers
         function updateLevelsDisplay() {
@@ -3541,6 +3593,8 @@ def index():
             const levelsCount = parseInt(document.getElementById('levels_count').value);
             const useHeikinAshi = document.getElementById('use_heikin_ashi').checked;
             const horizontalBars = document.getElementById('horizontal_bars').checked;
+            const showAbsGex = document.getElementById('show_abs_gex').checked;
+            const absGexOpacity = parseInt(document.getElementById('abs_gex_opacity').value) / 100;
             const useRange = document.getElementById('use_range').checked;
             const exposureMetric = document.getElementById('exposure_metric').value;
             const deltaAdjusted = document.getElementById('delta_adjusted_exposures').checked;
@@ -3585,6 +3639,8 @@ def index():
                     levels_count: levelsCount,
                     use_heikin_ashi: useHeikinAshi,
                     horizontal_bars: horizontalBars,
+                    show_abs_gex: showAbsGex,
+                    abs_gex_opacity: absGexOpacity,
                     use_range: useRange,
                     exposure_metric: exposureMetric,
                     delta_adjusted: deltaAdjusted,
@@ -4223,6 +4279,8 @@ def update():
         use_heikin_ashi = data.get('use_heikin_ashi', False)
         perspective = data.get('perspective', 'Customer')
         horizontal = data.get('horizontal_bars', False)
+        show_abs_gex = data.get('show_abs_gex', False)
+        abs_gex_opacity = float(data.get('abs_gex_opacity', 0.2))
  
         
         response = {}
@@ -4262,7 +4320,7 @@ def update():
                 response['charm_historical_bubble'] = f"data:image/png;base64,{base64.b64encode(img_bytes).decode('utf-8')}"
         
         if data.get('show_gamma', True):
-            response['gamma'] = create_exposure_chart(calls, puts, "GEX", "Gamma Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, color_intensity, call_color, put_color, expiry_dates, perspective, horizontal)
+            response['gamma'] = create_exposure_chart(calls, puts, "GEX", "Gamma Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, color_intensity, call_color, put_color, expiry_dates, perspective, horizontal, show_abs_gex_area=show_abs_gex, abs_gex_opacity=abs_gex_opacity)
         
         if data.get('show_delta', True):
             response['delta'] = create_exposure_chart(calls, puts, "DEX", "Delta Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, color_intensity, call_color, put_color, expiry_dates, perspective, horizontal)
