@@ -885,7 +885,7 @@ def get_color_with_opacity(value, max_value, base_color, color_intensity=True):
         return f'rgba({r}, {g}, {b}, {opacity})'
     return base_color
 
-def create_exposure_chart(calls, puts, exposure_type, title, S, strike_range=0.02, show_calls=True, show_puts=True, show_net=True, color_intensity=True, call_color='#00FF00', put_color='#FF0000', selected_expiries=None, perspective='Customer'):
+def create_exposure_chart(calls, puts, exposure_type, title, S, strike_range=0.02, show_calls=True, show_puts=True, show_net=True, color_intensity=True, call_color='#00FF00', put_color='#FF0000', selected_expiries=None, perspective='Customer', horizontal=False):
     # Ensure the exposure_type column exists
     if exposure_type not in calls.columns or exposure_type not in puts.columns:
         print(f"Warning: {exposure_type} not found in data")  # Fixed f-string syntax
@@ -942,17 +942,30 @@ def create_exposure_chart(calls, puts, exposure_type, title, S, strike_range=0.0
             call_colors = [get_color_with_opacity(volume, max_call_value, call_color, color_intensity) for volume in calls_df[exposure_type]]
         else:
             call_colors = call_color
-            
-        fig.add_trace(go.Bar(
-            x=calls_df['strike'].tolist(),
-            y=calls_df[exposure_type].tolist(),
-            name='Call',
-            marker_color=call_colors,
-            text=[format_large_number(val) for val in calls_df[exposure_type]],
-            textposition='auto',
-            hovertemplate='Strike: %{x}<br>Value: %{text}<extra></extra>',
-            marker_line_width=0
-        ))
+        
+        if horizontal:
+            fig.add_trace(go.Bar(
+                y=calls_df['strike'].tolist(),
+                x=calls_df[exposure_type].tolist(),
+                name='Call',
+                marker_color=call_colors,
+                text=[format_large_number(val) for val in calls_df[exposure_type]],
+                textposition='auto',
+                orientation='h',
+                hovertemplate='Strike: %{y}<br>Value: %{text}<extra></extra>',
+                marker_line_width=0
+            ))
+        else:
+            fig.add_trace(go.Bar(
+                x=calls_df['strike'].tolist(),
+                y=calls_df[exposure_type].tolist(),
+                name='Call',
+                marker_color=call_colors,
+                text=[format_large_number(val) for val in calls_df[exposure_type]],
+                textposition='auto',
+                hovertemplate='Strike: %{x}<br>Value: %{text}<extra></extra>',
+                marker_line_width=0
+            ))
     
     if show_puts and not puts_df.empty:
         if color_intensity:
@@ -964,16 +977,29 @@ def create_exposure_chart(calls, puts, exposure_type, title, S, strike_range=0.0
         else:
             put_colors = put_color
             
-        fig.add_trace(go.Bar(
-            x=puts_df['strike'].tolist(),
-            y=(-puts_df[exposure_type]).tolist(),
-            name='Put',
-            marker_color=put_colors,
-            text=[format_large_number(val) for val in puts_df[exposure_type]],
-            textposition='auto',
-            hovertemplate='Strike: %{x}<br>Value: %{text}<extra></extra>',
-            marker_line_width=0
-        ))
+        if horizontal:
+            fig.add_trace(go.Bar(
+                y=puts_df['strike'].tolist(),
+                x=(-puts_df[exposure_type]).tolist(),
+                name='Put',
+                marker_color=put_colors,
+                text=[format_large_number(val) for val in puts_df[exposure_type]],
+                textposition='auto',
+                orientation='h',
+                hovertemplate='Strike: %{y}<br>Value: %{text}<extra></extra>',
+                marker_line_width=0
+            ))
+        else:
+            fig.add_trace(go.Bar(
+                x=puts_df['strike'].tolist(),
+                y=(-puts_df[exposure_type]).tolist(),
+                name='Put',
+                marker_color=put_colors,
+                text=[format_large_number(val) for val in puts_df[exposure_type]],
+                textposition='auto',
+                hovertemplate='Strike: %{x}<br>Value: %{text}<extra></extra>',
+                marker_line_width=0
+            ))
     
     if show_net and not (calls_df.empty and puts_df.empty):
         # Create net exposure by combining calls and puts
@@ -1009,28 +1035,54 @@ def create_exposure_chart(calls, puts, exposure_type, title, S, strike_range=0.0
         else:
             net_colors = [call_color if volume >= 0 else put_color for volume in net_exposure]
         
-        fig.add_trace(go.Bar(
-            x=all_strikes,
-            y=net_exposure,
-            name='Net',
-            marker_color=net_colors,
-            text=[format_large_number(val) for val in net_exposure],
-            textposition='auto',
-            hovertemplate='Strike: %{x}<br>Net Value: %{text}<extra></extra>',
-            marker_line_width=0
-        ))
+        if horizontal:
+            fig.add_trace(go.Bar(
+                y=all_strikes,
+                x=net_exposure,
+                name='Net',
+                marker_color=net_colors,
+                text=[format_large_number(val) for val in net_exposure],
+                textposition='auto',
+                orientation='h',
+                hovertemplate='Strike: %{y}<br>Net Value: %{text}<extra></extra>',
+                marker_line_width=0
+            ))
+        else:
+            fig.add_trace(go.Bar(
+                x=all_strikes,
+                y=net_exposure,
+                name='Net',
+                marker_color=net_colors,
+                text=[format_large_number(val) for val in net_exposure],
+                textposition='auto',
+                hovertemplate='Strike: %{x}<br>Net Value: %{text}<extra></extra>',
+                marker_line_width=0
+            ))
     
-    # Add current price line with improved styling
-    fig.add_vline(
-        x=S,
-        line_dash="dash",
-        line_color=text_color,
-        opacity=0.5,
-        annotation_text=f"{S:.2f}",
-        annotation_position="top",
-        annotation_font_color=text_color,
-        line_width=1
-    )
+    if horizontal:
+        # Add current price line
+        fig.add_hline(
+            y=S,
+            line_dash="dash",
+            line_color=text_color,
+            opacity=0.5,
+            annotation_text=f"{S:.2f}",
+            annotation_position="right",
+            annotation_font_color=text_color,
+            line_width=1
+        )
+    else:
+        # Add current price line with improved styling
+        fig.add_vline(
+            x=S,
+            line_dash="dash",
+            line_color=text_color,
+            opacity=0.5,
+            annotation_text=f"{S:.2f}",
+            annotation_position="top",
+            annotation_font_color=text_color,
+            line_width=1
+        )
     
     # Calculate padding as percentage of price range
     padding = (max_strike - min_strike) * 0.1
@@ -1040,6 +1092,67 @@ def create_exposure_chart(calls, puts, exposure_type, title, S, strike_range=0.0
     if selected_expiries and len(selected_expiries) > 1:
         chart_title = f"{title} ({len(selected_expiries)} expiries)"
     
+    xaxis_config = dict(
+        title='',
+        title_font=dict(color=text_color),
+        tickfont=dict(color=text_color, size=12),
+        gridcolor=grid_color,
+        linecolor=grid_color,
+        showgrid=False,
+        zeroline=True,
+        zerolinecolor=grid_color
+    )
+    
+    yaxis_config = dict(
+        title='',
+        title_font=dict(color=text_color),
+        tickfont=dict(color=text_color),
+        gridcolor=grid_color,
+        linecolor=grid_color,
+        showgrid=False,
+        zeroline=True,
+        zerolinecolor=grid_color
+    )
+    
+    # Configure axes based on orientation
+    if horizontal:
+        # Strike axis is Y
+        yaxis_config.update(dict(
+            range=[min_strike - padding, max_strike + padding],
+            tickmode='linear',
+            dtick=math.ceil((max_strike - min_strike) / 10),
+            tickformat='.0f',
+            showticklabels=True,
+            ticks='outside',
+            ticklen=5,
+            tickwidth=1,
+            tickcolor=text_color,
+            automargin=True
+        ))
+        # Value axis is X
+        xaxis_config.update(dict(
+            showticklabels=True
+        ))
+    else:
+        # Strike axis is X
+        xaxis_config.update(dict(
+            range=[min_strike - padding, max_strike + padding],
+            tickmode='linear',
+            dtick=math.ceil((max_strike - min_strike) / 10),
+            tickangle=45,
+            tickformat='.0f',
+            showticklabels=True,
+            ticks='outside',
+            ticklen=5,
+            tickwidth=1,
+            tickcolor=text_color,
+            automargin=True
+        ))
+        # Value axis is Y
+        yaxis_config.update(dict(
+            showticklabels=True
+        ))
+
     # Update layout with improved styling and split title
     fig.update_layout(
         title=dict(
@@ -1065,39 +1178,10 @@ def create_exposure_chart(calls, puts, exposure_type, title, S, strike_range=0.0
                 )
             )
         ],
-        xaxis=dict(
-            title='',
-            title_font=dict(color=text_color),
-            tickfont=dict(color=text_color, size=12),
-            gridcolor=grid_color,
-            linecolor=grid_color,
-            range=[min_strike - padding, max_strike + padding],
-            tickmode='linear',
-            dtick=math.ceil((max_strike - min_strike) / 10),
-            showgrid=False,
-            zeroline=True,
-            zerolinecolor=grid_color,
-            tickangle=45,
-            tickformat='.0f',
-            showticklabels=True,
-            ticks='outside',
-            ticklen=5,
-            tickwidth=1,
-            tickcolor=text_color,
-            automargin=True
-        ),
-        yaxis=dict(
-            title='',
-            title_font=dict(color=text_color),
-            tickfont=dict(color=text_color),
-            gridcolor=grid_color,
-            linecolor=grid_color,
-            showgrid=False,
-            zeroline=True,
-            zerolinecolor=grid_color
-        ),
+        xaxis=xaxis_config,
+        yaxis=yaxis_config,
         barmode='relative',
-        hovermode='x unified',
+        hovermode='y unified' if horizontal else 'x unified',
         plot_bgcolor=background_color,
         paper_bgcolor=background_color,
         font=dict(color=text_color),
@@ -1142,7 +1226,7 @@ def create_volume_chart(call_volume, put_volume, use_itm=True, call_color='#00FF
     
     return fig.to_json()
 
-def create_options_volume_chart(calls, puts, S, strike_range=0.02, call_color='#00FF00', put_color='#FF0000', color_intensity=True, show_calls=True, show_puts=True, show_net=True, selected_expiries=None, perspective='Customer'):
+def create_options_volume_chart(calls, puts, S, strike_range=0.02, call_color='#00FF00', put_color='#FF0000', color_intensity=True, show_calls=True, show_puts=True, show_net=True, selected_expiries=None, perspective='Customer', horizontal=False):
     # Filter strikes within range
     min_strike = S * (1 - strike_range)
     max_strike = S * (1 + strike_range)
@@ -1166,16 +1250,29 @@ def create_options_volume_chart(calls, puts, S, strike_range=0.02, call_color='#
         else:
             call_colors = call_color
             
-        fig.add_trace(go.Bar(
-            x=calls['strike'].tolist(),
-            y=calls['volume'].tolist(),
-            name='Call',
-            marker_color=call_colors,
-            text=calls['volume'].tolist(),
-            textposition='auto',
-            hovertemplate='Strike: %{x}<br>Volume: %{y}<extra></extra>',
-            marker_line_width=0
-        ))
+        if horizontal:
+            fig.add_trace(go.Bar(
+                y=calls['strike'].tolist(),
+                x=calls['volume'].tolist(),
+                name='Call',
+                marker_color=call_colors,
+                text=calls['volume'].tolist(),
+                textposition='auto',
+                orientation='h',
+                hovertemplate='Strike: %{y}<br>Volume: %{x}<extra></extra>',
+                marker_line_width=0
+            ))
+        else:
+            fig.add_trace(go.Bar(
+                x=calls['strike'].tolist(),
+                y=calls['volume'].tolist(),
+                name='Call',
+                marker_color=call_colors,
+                text=calls['volume'].tolist(),
+                textposition='auto',
+                hovertemplate='Strike: %{x}<br>Volume: %{y}<extra></extra>',
+                marker_line_width=0
+            ))
     
     # Add put volume bars (as negative values)
     if show_puts and not puts.empty:
@@ -1190,16 +1287,29 @@ def create_options_volume_chart(calls, puts, S, strike_range=0.02, call_color='#
         else:
             put_colors = put_color
             
-        fig.add_trace(go.Bar(
-            x=puts['strike'].tolist(),
-            y=[-v for v in puts['volume'].tolist()],  # Make put volumes negative
-            name='Put',
-            marker_color=put_colors,
-            text=puts['volume'].tolist(),
-            textposition='auto',
-            hovertemplate='Strike: %{x}<br>Volume: %{text}<extra></extra>',  # Show positive value in hover
-            marker_line_width=0
-        ))
+        if horizontal:
+            fig.add_trace(go.Bar(
+                y=puts['strike'].tolist(),
+                x=[-v for v in puts['volume'].tolist()],  # Make put volumes negative
+                name='Put',
+                marker_color=put_colors,
+                text=puts['volume'].tolist(),
+                textposition='auto',
+                orientation='h',
+                hovertemplate='Strike: %{y}<br>Volume: %{text}<extra></extra>',  # Show positive value in hover
+                marker_line_width=0
+            ))
+        else:
+            fig.add_trace(go.Bar(
+                x=puts['strike'].tolist(),
+                y=[-v for v in puts['volume'].tolist()],  # Make put volumes negative
+                name='Put',
+                marker_color=put_colors,
+                text=puts['volume'].tolist(),
+                textposition='auto',
+                hovertemplate='Strike: %{x}<br>Volume: %{text}<extra></extra>',  # Show positive value in hover
+                marker_line_width=0
+            ))
     
     # Add net volume bars if enabled
     if show_net and not (calls.empty and puts.empty):
@@ -1230,34 +1340,98 @@ def create_options_volume_chart(calls, puts, S, strike_range=0.02, call_color='#
         else:
             net_colors = [call_color if volume >= 0 else put_color for volume in net_volume]
         
-        fig.add_trace(go.Bar(
-            x=all_strikes,
-            y=net_volume,
-            name='Net',
-            marker_color=net_colors,
-            text=[f"{vol:,.0f}" for vol in net_volume],
-            textposition='auto',
-            hovertemplate='Strike: %{x}<br>Net Volume: %{y}<extra></extra>',
-            marker_line_width=0
-        ))
+        if horizontal:
+            fig.add_trace(go.Bar(
+                y=all_strikes,
+                x=net_volume,
+                name='Net',
+                marker_color=net_colors,
+                text=[f"{vol:,.0f}" for vol in net_volume],
+                textposition='auto',
+                orientation='h',
+                hovertemplate='Strike: %{y}<br>Net Volume: %{x}<extra></extra>',
+                marker_line_width=0
+            ))
+        else:
+            fig.add_trace(go.Bar(
+                x=all_strikes,
+                y=net_volume,
+                name='Net',
+                marker_color=net_colors,
+                text=[f"{vol:,.0f}" for vol in net_volume],
+                textposition='auto',
+                hovertemplate='Strike: %{x}<br>Net Volume: %{y}<extra></extra>',
+                marker_line_width=0
+            ))
     
-    # Add current price line
-    fig.add_vline(
-        x=S,
-        line_dash="dash",
-        line_color="white",
-        opacity=0.5,
-        annotation_text=f"{S:.2f}",
-        annotation_position="top",
-        annotation_font_color="white",
-        line_width=1
-    )
+    if horizontal:
+        # Add current price line
+        fig.add_hline(
+            y=S,
+            line_dash="dash",
+            line_color="white",
+            opacity=0.5,
+            annotation_text=f"{S:.2f}",
+            annotation_position="right",
+            annotation_font_color="white",
+            line_width=1
+        )
+    else:
+        # Add current price line
+        fig.add_vline(
+            x=S,
+            line_dash="dash",
+            line_color="white",
+            opacity=0.5,
+            annotation_text=f"{S:.2f}",
+            annotation_position="top",
+            annotation_font_color="white",
+            line_width=1
+        )
     
     # Add expiry info to title if multiple expiries are selected
     chart_title = 'Options Volume by Strike'
     if selected_expiries and len(selected_expiries) > 1:
         chart_title = f"Options Volume by Strike ({len(selected_expiries)} expiries)"
     
+    xaxis_config = dict(
+        title='',
+        title_font=dict(color='#CCCCCC'),
+        tickfont=dict(color='#CCCCCC'),
+        gridcolor='#333333',
+        linecolor='#333333',
+        showgrid=False,
+        zeroline=True,
+        zerolinecolor='#333333',
+        automargin=True
+    )
+    
+    yaxis_config = dict(
+        title='',
+        title_font=dict(color='#CCCCCC'),
+        tickfont=dict(color='#CCCCCC'),
+        gridcolor='#333333',
+        linecolor='#333333',
+        showgrid=False,
+        zeroline=True,
+        zerolinecolor='#333333'
+    )
+    
+    if horizontal:
+         yaxis_config.update(dict(
+            range=[min_strike - (max_strike - min_strike) * 0.1, max_strike + (max_strike - min_strike) * 0.1]
+         ))
+    else:
+        xaxis_config.update(dict(
+            tickangle=45,
+            tickformat='.0f',
+            showticklabels=True,
+            ticks='outside',
+            ticklen=5,
+            tickwidth=1,
+            tickcolor='#CCCCCC'
+        ))
+
     # Update layout
     fig.update_layout(
         title=dict(
@@ -1266,36 +1440,10 @@ def create_options_volume_chart(calls, puts, S, strike_range=0.02, call_color='#
             x=0.5,
             xanchor='center'
         ),
-        xaxis=dict(
-            title='',
-            title_font=dict(color='#CCCCCC'),
-            tickfont=dict(color='#CCCCCC'),
-            gridcolor='#333333',
-            linecolor='#333333',
-            showgrid=False,
-            zeroline=True,
-            zerolinecolor='#333333',
-            tickangle=45,
-            tickformat='.0f',
-            showticklabels=True,
-            ticks='outside',
-            ticklen=5,
-            tickwidth=1,
-            tickcolor='#CCCCCC',
-            automargin=True
-        ),
-        yaxis=dict(
-            title='',
-            title_font=dict(color='#CCCCCC'),
-            tickfont=dict(color='#CCCCCC'),
-            gridcolor='#333333',
-            linecolor='#333333',
-            showgrid=False,
-            zeroline=True,
-            zerolinecolor='#333333'
-        ),
+        xaxis=xaxis_config,
+        yaxis=yaxis_config,
         barmode='relative',
-        hovermode='x unified',
+        hovermode='y unified' if horizontal else 'x unified',
         plot_bgcolor='#1E1E1E',
         paper_bgcolor='#1E1E1E',
         font=dict(color='#CCCCCC'),
@@ -2203,7 +2351,7 @@ def create_historical_bubble_levels_chart(ticker, strike_range, call_color='#00F
 
 
 
-def create_premium_chart(calls, puts, S, strike_range=0.02, call_color='#00FF00', put_color='#FF0000', color_intensity=True, show_calls=True, show_puts=True, show_net=True, selected_expiries=None, perspective='Customer'):
+def create_premium_chart(calls, puts, S, strike_range=0.02, call_color='#00FF00', put_color='#FF0000', color_intensity=True, show_calls=True, show_puts=True, show_net=True, selected_expiries=None, perspective='Customer', horizontal=False):
     # Filter strikes within range
     min_strike = S * (1 - strike_range)
     max_strike = S * (1 + strike_range)
@@ -2223,16 +2371,29 @@ def create_premium_chart(calls, puts, S, strike_range=0.02, call_color='#00FF00'
         else:
             call_colors = call_color
             
-        fig.add_trace(go.Bar(
-            x=calls['strike'].tolist(),
-            y=calls['lastPrice'].tolist(),
-            name='Call',
-            marker_color=call_colors,
-            text=[f"${price:.2f}" for price in calls['lastPrice']],
-            textposition='auto',
-            hovertemplate='Strike: %{x}<br>Premium: $%{y:.2f}<extra></extra>',
-            marker_line_width=0
-        ))
+        if horizontal:
+            fig.add_trace(go.Bar(
+                y=calls['strike'].tolist(),
+                x=calls['lastPrice'].tolist(),
+                name='Call',
+                marker_color=call_colors,
+                text=[f"${price:.2f}" for price in calls['lastPrice']],
+                textposition='auto',
+                orientation='h',
+                hovertemplate='Strike: %{y}<br>Premium: $%{x:.2f}<extra></extra>',
+                marker_line_width=0
+            ))
+        else:
+            fig.add_trace(go.Bar(
+                x=calls['strike'].tolist(),
+                y=calls['lastPrice'].tolist(),
+                name='Call',
+                marker_color=call_colors,
+                text=[f"${price:.2f}" for price in calls['lastPrice']],
+                textposition='auto',
+                hovertemplate='Strike: %{x}<br>Premium: $%{y:.2f}<extra></extra>',
+                marker_line_width=0
+            ))
     
     # Add put premium bars
     if show_puts and not puts.empty:
@@ -2243,16 +2404,29 @@ def create_premium_chart(calls, puts, S, strike_range=0.02, call_color='#00FF00'
         else:
             put_colors = put_color
             
-        fig.add_trace(go.Bar(
-            x=puts['strike'].tolist(),
-            y=puts['lastPrice'].tolist(),
-            name='Put',
-            marker_color=put_colors,
-            text=[f"${price:.2f}" for price in puts['lastPrice']],
-            textposition='auto',
-            hovertemplate='Strike: %{x}<br>Premium: $%{y:.2f}<extra></extra>',
-            marker_line_width=0
-        ))
+        if horizontal:
+            fig.add_trace(go.Bar(
+                y=puts['strike'].tolist(),
+                x=puts['lastPrice'].tolist(),
+                name='Put',
+                marker_color=put_colors,
+                text=[f"${price:.2f}" for price in puts['lastPrice']],
+                textposition='auto',
+                orientation='h',
+                hovertemplate='Strike: %{y}<br>Premium: $%{x:.2f}<extra></extra>',
+                marker_line_width=0
+            ))
+        else:
+            fig.add_trace(go.Bar(
+                x=puts['strike'].tolist(),
+                y=puts['lastPrice'].tolist(),
+                name='Put',
+                marker_color=put_colors,
+                text=[f"${price:.2f}" for price in puts['lastPrice']],
+                textposition='auto',
+                hovertemplate='Strike: %{x}<br>Premium: $%{y:.2f}<extra></extra>',
+                marker_line_width=0
+            ))
     
     # Add net premium bars if enabled
     if show_net and not (calls.empty and puts.empty):
@@ -2283,34 +2457,98 @@ def create_premium_chart(calls, puts, S, strike_range=0.02, call_color='#00FF00'
         else:
             net_colors = [call_color if premium >= 0 else put_color for premium in net_premium]
         
-        fig.add_trace(go.Bar(
-            x=all_strikes,
-            y=net_premium,
-            name='Net',
-            marker_color=net_colors,
-            text=[f"${prem:.2f}" for prem in net_premium],
-            textposition='auto',
-            hovertemplate='Strike: %{x}<br>Net Premium: $%{y:.2f}<extra></extra>',
-            marker_line_width=0
-        ))
+        if horizontal:
+            fig.add_trace(go.Bar(
+                y=all_strikes,
+                x=net_premium,
+                name='Net',
+                marker_color=net_colors,
+                text=[f"${prem:.2f}" for prem in net_premium],
+                textposition='auto',
+                orientation='h',
+                hovertemplate='Strike: %{y}<br>Net Premium: $%{x:.2f}<extra></extra>',
+                marker_line_width=0
+            ))
+        else:
+            fig.add_trace(go.Bar(
+                x=all_strikes,
+                y=net_premium,
+                name='Net',
+                marker_color=net_colors,
+                text=[f"${prem:.2f}" for prem in net_premium],
+                textposition='auto',
+                hovertemplate='Strike: %{x}<br>Net Premium: $%{y:.2f}<extra></extra>',
+                marker_line_width=0
+            ))
     
-    # Add current price line
-    fig.add_vline(
-        x=S,
-        line_dash="dash",
-        line_color="white",
-        opacity=0.5,
-        annotation_text=f"{S:.2f}",
-        annotation_position="top",
-        annotation_font_color="white",
-        line_width=1
-    )
+    if horizontal:
+        # Add current price line
+        fig.add_hline(
+            y=S,
+            line_dash="dash",
+            line_color="white",
+            opacity=0.5,
+            annotation_text=f"{S:.2f}",
+            annotation_position="right",
+            annotation_font_color="white",
+            line_width=1
+        )
+    else:
+        # Add current price line
+        fig.add_vline(
+            x=S,
+            line_dash="dash",
+            line_color="white",
+            opacity=0.5,
+            annotation_text=f"{S:.2f}",
+            annotation_position="top",
+            annotation_font_color="white",
+            line_width=1
+        )
     
     # Add expiry info to title if multiple expiries are selected
     chart_title = 'Option Premium by Strike'
     if selected_expiries and len(selected_expiries) > 1:
         chart_title = f"Option Premium by Strike ({len(selected_expiries)} expiries)"
     
+    xaxis_config = dict(
+        title='',
+        title_font=dict(color='#CCCCCC'),
+        tickfont=dict(color='#CCCCCC'),
+        gridcolor='#333333',
+        linecolor='#333333',
+        showgrid=False,
+        zeroline=True,
+        zerolinecolor='#333333',
+        automargin=True
+    )
+    
+    yaxis_config = dict(
+        title='',
+        title_font=dict(color='#CCCCCC'),
+        tickfont=dict(color='#CCCCCC'),
+        gridcolor='#333333',
+        linecolor='#333333',
+        showgrid=False,
+        zeroline=True,
+        zerolinecolor='#333333'
+    )
+    
+    if horizontal:
+         yaxis_config.update(dict(
+            range=[min_strike - (max_strike - min_strike) * 0.1, max_strike + (max_strike - min_strike) * 0.1]
+         ))
+    else:
+        xaxis_config.update(dict(
+            tickangle=45,
+            tickformat='.0f',
+            showticklabels=True,
+            ticks='outside',
+            ticklen=5,
+            tickwidth=1,
+            tickcolor='#CCCCCC'
+        ))
+
     # Update layout
     fig.update_layout(
         title=dict(
@@ -2319,36 +2557,10 @@ def create_premium_chart(calls, puts, S, strike_range=0.02, call_color='#00FF00'
             x=0.5,
             xanchor='center'
         ),
-        xaxis=dict(
-            title='',
-            title_font=dict(color='#CCCCCC'),
-            tickfont=dict(color='#CCCCCC'),
-            gridcolor='#333333',
-            linecolor='#333333',
-            showgrid=False,
-            zeroline=True,
-            zerolinecolor='#333333',
-            tickangle=45,
-            tickformat='.0f',
-            showticklabels=True,
-            ticks='outside',
-            ticklen=5,
-            tickwidth=1,
-            tickcolor='#CCCCCC',
-            automargin=True
-        ),
-        yaxis=dict(
-            title='',
-            title_font=dict(color='#CCCCCC'),
-            tickfont=dict(color='#CCCCCC'),
-            gridcolor='#333333',
-            linecolor='#333333',
-            showgrid=False,
-            zeroline=True,
-            zerolinecolor='#333333'
-        ),
+        xaxis=xaxis_config,
+        yaxis=yaxis_config,
         barmode='relative',
-        hovermode='x unified',
+        hovermode='y unified' if horizontal else 'x unified',
         plot_bgcolor='#1E1E1E',
         paper_bgcolor='#1E1E1E',
         font=dict(color='#CCCCCC'),
@@ -3126,6 +3338,10 @@ def index():
                         <label for="use_heikin_ashi">Heikin-Ashi</label>
                     </div>
                     <div class="control-group">
+                        <input type="checkbox" id="horizontal_bars">
+                        <label for="horizontal_bars">Horizontal Bars</label>
+                    </div>
+                    <div class="control-group">
                         <input type="checkbox" id="use_range">
                         <label for="use_range">% Range Volume</label>
                     </div>
@@ -3320,6 +3536,7 @@ def index():
             const levelsTypes = Array.from(document.querySelectorAll('.levels-option input:checked')).map(cb => cb.value);
             const levelsCount = parseInt(document.getElementById('levels_count').value);
             const useHeikinAshi = document.getElementById('use_heikin_ashi').checked;
+            const horizontalBars = document.getElementById('horizontal_bars').checked;
             const useRange = document.getElementById('use_range').checked;
             const exposureMetric = document.getElementById('exposure_metric').value;
             const deltaAdjusted = document.getElementById('delta_adjusted_exposures').checked;
@@ -3363,6 +3580,7 @@ def index():
                     levels_types: levelsTypes,
                     levels_count: levelsCount,
                     use_heikin_ashi: useHeikinAshi,
+                    horizontal_bars: horizontalBars,
                     use_range: useRange,
                     exposure_metric: exposureMetric,
                     delta_adjusted: deltaAdjusted,
@@ -4000,6 +4218,7 @@ def update():
         exposure_levels_count = int(data.get('levels_count', 3))
         use_heikin_ashi = data.get('use_heikin_ashi', False)
         perspective = data.get('perspective', 'Customer')
+        horizontal = data.get('horizontal_bars', False)
  
         
         response = {}
@@ -4039,34 +4258,34 @@ def update():
                 response['charm_historical_bubble'] = f"data:image/png;base64,{base64.b64encode(img_bytes).decode('utf-8')}"
         
         if data.get('show_gamma', True):
-            response['gamma'] = create_exposure_chart(calls, puts, "GEX", "Gamma Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, color_intensity, call_color, put_color, expiry_dates, perspective)
+            response['gamma'] = create_exposure_chart(calls, puts, "GEX", "Gamma Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, color_intensity, call_color, put_color, expiry_dates, perspective, horizontal)
         
         if data.get('show_delta', True):
-            response['delta'] = create_exposure_chart(calls, puts, "DEX", "Delta Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, color_intensity, call_color, put_color, expiry_dates, perspective)
+            response['delta'] = create_exposure_chart(calls, puts, "DEX", "Delta Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, color_intensity, call_color, put_color, expiry_dates, perspective, horizontal)
         
         if data.get('show_vanna', True):
-            response['vanna'] = create_exposure_chart(calls, puts, "VEX", "Vanna Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, color_intensity, call_color, put_color, expiry_dates, perspective)
+            response['vanna'] = create_exposure_chart(calls, puts, "VEX", "Vanna Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, color_intensity, call_color, put_color, expiry_dates, perspective, horizontal)
         
         if data.get('show_charm', True):
-            response['charm'] = create_exposure_chart(calls, puts, "Charm", "Charm Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, color_intensity, call_color, put_color, expiry_dates, perspective)
+            response['charm'] = create_exposure_chart(calls, puts, "Charm", "Charm Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, color_intensity, call_color, put_color, expiry_dates, perspective, horizontal)
         
         if data.get('show_speed', True):
-            response['speed'] = create_exposure_chart(calls, puts, "Speed", "Speed Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, color_intensity, call_color, put_color, expiry_dates, perspective)
+            response['speed'] = create_exposure_chart(calls, puts, "Speed", "Speed Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, color_intensity, call_color, put_color, expiry_dates, perspective, horizontal)
         
         if data.get('show_vomma', True):
-            response['vomma'] = create_exposure_chart(calls, puts, "Vomma", "Vomma Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, color_intensity, call_color, put_color, expiry_dates, perspective)
+            response['vomma'] = create_exposure_chart(calls, puts, "Vomma", "Vomma Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, color_intensity, call_color, put_color, expiry_dates, perspective, horizontal)
 
         if data.get('show_color', True):
-            response['color'] = create_exposure_chart(calls, puts, "Color", "Color Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, color_intensity, call_color, put_color, expiry_dates, perspective)
+            response['color'] = create_exposure_chart(calls, puts, "Color", "Color Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, color_intensity, call_color, put_color, expiry_dates, perspective, horizontal)
         
         if data.get('show_volume', True):
             response['volume'] = create_volume_chart(call_volume, put_volume, use_range, call_color, put_color, expiry_dates)
         
         if data.get('show_options_volume', True):
-            response['options_volume'] = create_options_volume_chart(calls, puts, S, strike_range, call_color, put_color, color_intensity, show_calls, show_puts, show_net, expiry_dates, perspective)
+            response['options_volume'] = create_options_volume_chart(calls, puts, S, strike_range, call_color, put_color, color_intensity, show_calls, show_puts, show_net, expiry_dates, perspective, horizontal)
         
         if data.get('show_premium', True):
-            response['premium'] = create_premium_chart(calls, puts, S, strike_range, call_color, put_color, color_intensity, show_calls, show_puts, show_net, expiry_dates, perspective)
+            response['premium'] = create_premium_chart(calls, puts, S, strike_range, call_color, put_color, color_intensity, show_calls, show_puts, show_net, expiry_dates, perspective, horizontal)
         
         if data.get('show_large_trades', True):
             response['large_trades'] = create_large_trades_table(calls, puts, S, strike_range, call_color, put_color, expiry_dates)
