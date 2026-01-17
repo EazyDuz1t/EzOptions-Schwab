@@ -1794,7 +1794,7 @@ def create_price_chart(price_data, calls=None, puts=None, exposure_levels_types=
                         y=strike,
                         xref="paper",
                         yref="y",
-                        text=f"{exposure_levels_type}: {val:,.0f}",
+                        text=f"{exposure_levels_type}: {format_large_number(val)}",
                         showarrow=False,
                         font=dict(
                             size=10,
