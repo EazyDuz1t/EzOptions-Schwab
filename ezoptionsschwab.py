@@ -15,6 +15,7 @@ from scipy.stats import norm
 from scipy.optimize import brentq
 import base64
 import warnings
+import json
 
 
 # Load environment variables
@@ -349,6 +350,53 @@ def format_large_number(num):
     else:
         return f"{num:,.0f}"
 
+def get_strike_interval(strikes):
+    """Determine the most common strike interval from a list of strikes"""
+    if len(strikes) < 2:
+        return 1.0
+    
+    sorted_strikes = sorted(set(strikes))
+    intervals = []
+    for i in range(1, len(sorted_strikes)):
+        diff = sorted_strikes[i] - sorted_strikes[i-1]
+        if diff > 0:
+            intervals.append(diff)
+    
+    if not intervals:
+        return 1.0
+    
+    # Return the most common interval
+    from collections import Counter
+    interval_counts = Counter([round(i, 2) for i in intervals])
+    return interval_counts.most_common(1)[0][0]
+
+def round_to_strike(value, strike_interval):
+    """Round a value to the nearest strike interval"""
+    return round(value / strike_interval) * strike_interval
+
+def aggregate_by_strike(df, value_columns, strike_interval):
+    """Aggregate dataframe by rounded strike prices"""
+    if df.empty:
+        return df
+    
+    df = df.copy()
+    df['rounded_strike'] = df['strike'].apply(lambda x: round_to_strike(x, strike_interval))
+    
+    # Build aggregation dict for value columns
+    agg_dict = {}
+    for col in value_columns:
+        if col in df.columns:
+            agg_dict[col] = 'sum'
+    
+    if not agg_dict:
+        return df
+    
+    # Group by rounded strike and aggregate
+    aggregated = df.groupby('rounded_strike', as_index=False).agg(agg_dict)
+    aggregated = aggregated.rename(columns={'rounded_strike': 'strike'})
+    
+    return aggregated
+
 def calculate_time_to_expiration(expiry_date):
     """
     Calculate time to expiration in years using Eastern Time.
@@ -392,51 +440,54 @@ def fetch_options_for_date(ticker, date, exposure_metric="Open Interest", delta_
         calls_list = []
         puts_list = []
         
-        # Helper to fetch and scale by moneyness
+        # Helper to fetch and scale by log-moneyness
         def add_scaled_data(tick, etf_price):
             try:
                 # Fetch ETF options
                 # Note: We pass exposure_metric and delta_adjusted to recursive calls
                 c, p = fetch_options_for_date(tick, date, exposure_metric, delta_adjusted, calculate_in_notional)
                 
+                # Calculate scaling factor to bring ETF values up to SPX-equivalent notional
+                # e.g., SPY ~500 vs SPX ~5000, so scale_factor ~10
+                scale_factor = spx_price / etf_price
+                
                 if not c.empty:
                     c = c.copy()
-                    # Calculate moneyness (strike / spot) for each ETF option
-                    c['moneyness'] = c['strike'] / etf_price
-                    # Map to SPX strikes by moneyness: SPX_strike = moneyness * SPX_price
-                    c['strike'] = (c['moneyness'] * spx_price / 10).round() * 10
-                    c.drop(columns=['moneyness'], inplace=True)
+                    # Use log-moneyness for accurate strike mapping: ln(K/S)
+                    c['log_moneyness'] = np.log(c['strike'] / etf_price)
+                    # Map to SPX strikes and round to nearest $10 for better aggregation
+                    c['strike'] = (spx_price * np.exp(c['log_moneyness']) / 10).round() * 10
+                    c.drop(columns=['log_moneyness'], inplace=True)
                     
-                    # Scale prices by price ratio (options are more expensive on higher priced underlyings)
-                    price_ratio = spx_price / etf_price
+                    # Scale OI and volume UP to SPX-equivalent notional
+                    # 1 SPY contract = 1/10th of SPX notional, so we DON'T scale down
+                    # Keep OI/volume as-is since we want contract counts to aggregate
+                    # (Greeks already capture the notional exposure differences)
+                    
+                    # Scale option prices by scale_factor (approximate, for display)
                     for col in ['lastPrice', 'bid', 'ask', 'change']:
                         if col in c.columns:
-                            c[col] = c[col] * price_ratio
+                            c[col] = c[col] * scale_factor
                     
-                    # Scale Greeks (Exposure scales with Spot Price)
-                    greek_cols = ['GEX', 'DEX', 'VEX', 'Charm', 'Speed', 'Vomma', 'Color']
-                    for col in greek_cols:
-                        if col in c.columns:
-                            c[col] = c[col] * price_ratio
+                    # Greeks are already in notional terms from calculate_greek_exposures
+                    # No additional scaling needed - they properly reflect dollar exposure
                     
                     calls_list.append(c)
                 
                 if not p.empty:
                     p = p.copy()
-                    p['moneyness'] = p['strike'] / etf_price
-                    p['strike'] = (p['moneyness'] * spx_price / 10).round() * 10
-                    p.drop(columns=['moneyness'], inplace=True)
+                    # Use log-moneyness for accurate strike mapping: ln(K/S)
+                    p['log_moneyness'] = np.log(p['strike'] / etf_price)
+                    # Map to SPX strikes and round to nearest $10 for better aggregation
+                    p['strike'] = (spx_price * np.exp(p['log_moneyness']) / 10).round() * 10
+                    p.drop(columns=['log_moneyness'], inplace=True)
                     
-                    price_ratio = spx_price / etf_price
+                    # Scale option prices by scale_factor (approximate, for display)
                     for col in ['lastPrice', 'bid', 'ask', 'change']:
                         if col in p.columns:
-                            p[col] = p[col] * price_ratio
-
-                    # Scale Greeks (Exposure scales with Spot Price)
-                    greek_cols = ['GEX', 'DEX', 'VEX', 'Charm', 'Speed', 'Vomma', 'Color']
-                    for col in greek_cols:
-                        if col in p.columns:
-                            p[col] = p[col] * price_ratio
+                            p[col] = p[col] * scale_factor
+                    
+                    # Greeks are already in notional terms - no additional scaling
                     
                     puts_list.append(p)
             except Exception:
@@ -449,6 +500,40 @@ def fetch_options_for_date(ticker, date, exposure_metric="Open Interest", delta_
         
         combined_calls = pd.concat(calls_list, ignore_index=True) if calls_list else pd.DataFrame()
         combined_puts = pd.concat(puts_list, ignore_index=True) if puts_list else pd.DataFrame()
+        
+        # Aggregate by strike - sum up exposures from different ETFs at same strike
+        if not combined_calls.empty:
+            # Columns to sum
+            sum_cols = ['openInterest', 'volume', 'GEX', 'DEX', 'VEX', 'Charm', 'Speed', 'Vomma', 'Color']
+            sum_cols = [c for c in sum_cols if c in combined_calls.columns]
+            # Columns to average (prices)
+            avg_cols = ['lastPrice', 'bid', 'ask', 'impliedVolatility']
+            avg_cols = [c for c in avg_cols if c in combined_calls.columns]
+            
+            agg_dict = {col: 'sum' for col in sum_cols}
+            agg_dict.update({col: 'mean' for col in avg_cols})
+            
+            # Keep first value for non-numeric columns
+            for col in combined_calls.columns:
+                if col not in agg_dict and col != 'strike':
+                    agg_dict[col] = 'first'
+            
+            combined_calls = combined_calls.groupby('strike', as_index=False).agg(agg_dict)
+        
+        if not combined_puts.empty:
+            sum_cols = ['openInterest', 'volume', 'GEX', 'DEX', 'VEX', 'Charm', 'Speed', 'Vomma', 'Color']
+            sum_cols = [c for c in sum_cols if c in combined_puts.columns]
+            avg_cols = ['lastPrice', 'bid', 'ask', 'impliedVolatility']
+            avg_cols = [c for c in avg_cols if c in combined_puts.columns]
+            
+            agg_dict = {col: 'sum' for col in sum_cols}
+            agg_dict.update({col: 'mean' for col in avg_cols})
+            
+            for col in combined_puts.columns:
+                if col not in agg_dict and col != 'strike':
+                    agg_dict[col] = 'first'
+            
+            combined_puts = combined_puts.groupby('strike', as_index=False).agg(agg_dict)
         
         return combined_calls, combined_puts
 
@@ -907,6 +992,13 @@ def create_exposure_chart(calls, puts, exposure_type, title, S, strike_range=0.0
     calls_df = calls_df[(calls_df['strike'] >= min_strike) & (calls_df['strike'] <= max_strike)]
     puts_df = puts_df[(puts_df['strike'] >= min_strike) & (puts_df['strike'] <= max_strike)]
     
+    # Determine strike interval and aggregate by rounded strikes
+    all_strikes = list(calls_df['strike']) + list(puts_df['strike'])
+    if all_strikes:
+        strike_interval = get_strike_interval(all_strikes)
+        calls_df = aggregate_by_strike(calls_df, [exposure_type], strike_interval)
+        puts_df = aggregate_by_strike(puts_df, [exposure_type], strike_interval)
+    
     # Calculate total net exposure
     total_call_exposure = calls_df[exposure_type].sum() if not calls_df.empty else 0
     total_put_exposure = puts_df[exposure_type].sum() if not puts_df.empty else 0
@@ -1237,7 +1329,8 @@ def create_exposure_chart(calls, puts, exposure_type, title, S, strike_range=0.0
             font_family="Arial"
         ),
         spikedistance=1000,
-        hoverdistance=100
+        hoverdistance=100,
+        height=500
     )
     
     # Add hover spikes
@@ -1263,7 +1356,8 @@ def create_volume_chart(call_volume, put_volume, use_itm=True, call_color='#00FF
         showlegend=True,
         plot_bgcolor='#1E1E1E',
         paper_bgcolor='#1E1E1E',
-        font=dict(color='white')
+        font=dict(color='white'),
+        height=500
     )
     
     return fig.to_json()
@@ -1273,8 +1367,15 @@ def create_options_volume_chart(calls, puts, S, strike_range=0.02, call_color='#
     min_strike = S * (1 - strike_range)
     max_strike = S * (1 + strike_range)
     
-    calls = calls[(calls['strike'] >= min_strike) & (calls['strike'] <= max_strike)]
-    puts = puts[(puts['strike'] >= min_strike) & (puts['strike'] <= max_strike)]
+    calls = calls[(calls['strike'] >= min_strike) & (calls['strike'] <= max_strike)].copy()
+    puts = puts[(puts['strike'] >= min_strike) & (puts['strike'] <= max_strike)].copy()
+    
+    # Determine strike interval and aggregate by rounded strikes
+    all_strikes = list(calls['strike']) + list(puts['strike'])
+    if all_strikes:
+        strike_interval = get_strike_interval(all_strikes)
+        calls = aggregate_by_strike(calls, ['volume'], strike_interval)
+        puts = aggregate_by_strike(puts, ['volume'], strike_interval)
     
     # Create figure
     fig = go.Figure()
@@ -1509,7 +1610,7 @@ def create_options_volume_chart(calls, puts, S, strike_range=0.02, call_color='#
         spikedistance=1000,
         hoverdistance=100,
         showlegend=True,
-        height=400
+        height=500
     )
     
     # Add hover spikes
@@ -1837,7 +1938,7 @@ def create_price_chart(price_data, calls=None, puts=None, exposure_levels_types=
             showline=True,
             linewidth=1,
             mirror=True,
-            range=[price_min - padding, price_max + padding],
+            autorange=True,  # Enable auto-scaling
             domain=[0.25, 1],  # Price takes up 75% of the space
             side='right',  # Move axis to right side
             title_standoff=0,  # Reduce space between title and axis
@@ -1878,7 +1979,7 @@ def create_price_chart(price_data, calls=None, puts=None, exposure_levels_types=
         margin=dict(l=50, r=120, t=30, b=20),  # Increased right margin further
         hovermode='x unified',
         showlegend=True,
-        height=500,  # Reduced height after removing momentum subplot
+        height=550,  # Increased height for better visibility
         dragmode='pan',  # Set default tool to pan
         # Add current price annotation
         annotations=[
@@ -2189,6 +2290,12 @@ def create_historical_bubble_levels_chart(ticker, strike_range, call_color='#00F
         else:
             net_charm = 0
         
+        # Filter strikes based on strike_range relative to current price
+        min_strike = price * (1 - strike_range)
+        max_strike = price * (1 + strike_range)
+        if strike < min_strike or strike > max_strike:
+            continue  # Skip strikes outside the range
+        
         if timestamp not in data_by_time:
             data_by_time[timestamp] = {
                 'price': price,
@@ -2402,8 +2509,15 @@ def create_premium_chart(calls, puts, S, strike_range=0.02, call_color='#00FF00'
     min_strike = S * (1 - strike_range)
     max_strike = S * (1 + strike_range)
     
-    calls = calls[(calls['strike'] >= min_strike) & (calls['strike'] <= max_strike)]
-    puts = puts[(puts['strike'] >= min_strike) & (puts['strike'] <= max_strike)]
+    calls = calls[(calls['strike'] >= min_strike) & (calls['strike'] <= max_strike)].copy()
+    puts = puts[(puts['strike'] >= min_strike) & (puts['strike'] <= max_strike)].copy()
+    
+    # Determine strike interval and aggregate by rounded strikes
+    all_strikes = list(calls['strike']) + list(puts['strike'])
+    if all_strikes:
+        strike_interval = get_strike_interval(all_strikes)
+        calls = aggregate_by_strike(calls, ['lastPrice'], strike_interval)
+        puts = aggregate_by_strike(puts, ['lastPrice'], strike_interval)
     
     # Create figure
     fig = go.Figure()
@@ -2630,7 +2744,7 @@ def create_premium_chart(calls, puts, S, strike_range=0.02, call_color='#00FF00'
         spikedistance=1000,
         hoverdistance=100,
         showlegend=True,
-        height=400
+        height=500
     )
     
     # Add hover spikes
@@ -3128,7 +3242,7 @@ def index():
         
         .historical-bubble-container {
             width: 100%;
-            height: 400px;
+            height: 500px;
             background-color: #1E1E1E;
             border-radius: 4px;
             overflow: hidden;
@@ -3152,7 +3266,7 @@ def index():
         
         .chart-container {
             padding: 5px;
-            height: 400px;
+            height: 500px;
             width: 100%;
             min-width: 0;
             position: relative;
@@ -3247,6 +3361,40 @@ def index():
             transform: translateY(0);
             box-shadow: 0 1px 2px rgba(0,0,0,0.2);
         }
+        .settings-control {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            margin-left: 10px;
+        }
+        .settings-control button {
+            padding: 8px 16px;
+            border-radius: 4px;
+            border: 1px solid #404040;
+            background-color: #2d2d2d;
+            color: #ffffff;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 500;
+            transition: all 0.2s ease;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.2);
+            height: 36px;
+        }
+        .settings-control button:hover {
+            background-color: #3d3d3d;
+            transform: translateY(-1px);
+        }
+        .settings-control button:active {
+            transform: translateY(0);
+            box-shadow: 0 1px 2px rgba(0,0,0,0.2);
+        }
+        .settings-control button.success {
+            background-color: #2e7d32;
+            border-color: #4caf50;
+        }
         .chart-grid {
             display: grid;
             grid-template-columns: 1fr;
@@ -3309,6 +3457,9 @@ def index():
                     </div>
                     <div class="stream-control">
                         <button id="streamToggle">Auto-Update</button>
+                    </div>
+                    <div class="settings-control">
+                        <button id="saveSettings" title="Save current settings to file">💾 Save</button>
                     </div>
                 </div>
             </div>
@@ -4126,6 +4277,122 @@ def index():
         
         document.getElementById('streamToggle').addEventListener('click', toggleStreaming);
 
+        // Settings save/load functions
+        function gatherSettings() {
+            return {
+                ticker: document.getElementById('ticker').value,
+                strike_range: document.getElementById('strike_range').value,
+                exposure_metric: document.getElementById('exposure_metric').value,
+                delta_adjusted_exposures: document.getElementById('delta_adjusted_exposures').checked,
+                calculate_in_notional: document.getElementById('calculate_in_notional').checked,
+                show_calls: document.getElementById('show_calls').checked,
+                show_puts: document.getElementById('show_puts').checked,
+                show_net: document.getElementById('show_net').checked,
+                perspective: document.getElementById('perspective').value,
+                color_intensity: document.getElementById('color_intensity').checked,
+                levels_types: Array.from(document.querySelectorAll('.levels-option input:checked')).map(cb => cb.value),
+                levels_count: document.getElementById('levels_count').value,
+                use_heikin_ashi: document.getElementById('use_heikin_ashi').checked,
+                horizontal_bars: document.getElementById('horizontal_bars').checked,
+                show_abs_gex: document.getElementById('show_abs_gex').checked,
+                abs_gex_opacity: document.getElementById('abs_gex_opacity').value,
+                use_range: document.getElementById('use_range').checked,
+                call_color: document.getElementById('call_color').value,
+                put_color: document.getElementById('put_color').value,
+                // Chart visibility
+                charts: {
+                    price: document.getElementById('price').checked,
+                    gex_historical_bubble: document.getElementById('gex_historical_bubble').checked,
+                    dex_historical_bubble: document.getElementById('dex_historical_bubble').checked,
+                    vanna_historical_bubble: document.getElementById('vanna_historical_bubble').checked,
+                    charm_historical_bubble: document.getElementById('charm_historical_bubble').checked,
+                    gamma: document.getElementById('gamma').checked,
+                    delta: document.getElementById('delta').checked,
+                    vanna: document.getElementById('vanna').checked,
+                    charm: document.getElementById('charm').checked,
+                    speed: document.getElementById('speed').checked,
+                    vomma: document.getElementById('vomma').checked,
+                    color: document.getElementById('color').checked,
+                    options_volume: document.getElementById('options_volume').checked,
+                    volume: document.getElementById('volume').checked,
+                    large_trades: document.getElementById('large_trades').checked,
+                    premium: document.getElementById('premium').checked,
+                    centroid: document.getElementById('centroid').checked
+                }
+            };
+        }
+        
+        function applySettings(settings) {
+            if (settings.ticker) document.getElementById('ticker').value = settings.ticker;
+            if (settings.strike_range) {
+                document.getElementById('strike_range').value = settings.strike_range;
+                document.getElementById('strike_range_value').textContent = settings.strike_range + '%';
+            }
+            if (settings.exposure_metric) document.getElementById('exposure_metric').value = settings.exposure_metric;
+            if (settings.delta_adjusted_exposures !== undefined) document.getElementById('delta_adjusted_exposures').checked = settings.delta_adjusted_exposures;
+            if (settings.calculate_in_notional !== undefined) document.getElementById('calculate_in_notional').checked = settings.calculate_in_notional;
+            if (settings.show_calls !== undefined) document.getElementById('show_calls').checked = settings.show_calls;
+            if (settings.show_puts !== undefined) document.getElementById('show_puts').checked = settings.show_puts;
+            if (settings.show_net !== undefined) document.getElementById('show_net').checked = settings.show_net;
+            if (settings.perspective) document.getElementById('perspective').value = settings.perspective;
+            if (settings.color_intensity !== undefined) document.getElementById('color_intensity').checked = settings.color_intensity;
+            if (settings.levels_types) {
+                document.querySelectorAll('.levels-option input').forEach(cb => cb.checked = false);
+                settings.levels_types.forEach(type => {
+                    const cb = document.getElementById('lvl-' + type);
+                    if (cb) cb.checked = true;
+                });
+                updateLevelsDisplay();
+            }
+            if (settings.levels_count) document.getElementById('levels_count').value = settings.levels_count;
+            if (settings.use_heikin_ashi !== undefined) document.getElementById('use_heikin_ashi').checked = settings.use_heikin_ashi;
+            if (settings.horizontal_bars !== undefined) document.getElementById('horizontal_bars').checked = settings.horizontal_bars;
+            if (settings.show_abs_gex !== undefined) document.getElementById('show_abs_gex').checked = settings.show_abs_gex;
+            if (settings.abs_gex_opacity) document.getElementById('abs_gex_opacity').value = settings.abs_gex_opacity;
+            if (settings.use_range !== undefined) document.getElementById('use_range').checked = settings.use_range;
+            if (settings.call_color) {
+                document.getElementById('call_color').value = settings.call_color;
+                callColor = settings.call_color;
+            }
+            if (settings.put_color) {
+                document.getElementById('put_color').value = settings.put_color;
+                putColor = settings.put_color;
+            }
+            // Chart visibility
+            if (settings.charts) {
+                Object.keys(settings.charts).forEach(chartId => {
+                    const checkbox = document.getElementById(chartId);
+                    if (checkbox) checkbox.checked = settings.charts[chartId];
+                });
+            }
+        }
+        
+        function saveSettings() {
+            const settings = gatherSettings();
+            fetch('/save_settings', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(settings)
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    const btn = document.getElementById('saveSettings');
+                    btn.classList.add('success');
+                    btn.textContent = '✓ Saved';
+                    setTimeout(() => {
+                        btn.classList.remove('success');
+                        btn.textContent = '💾 Save';
+                    }, 2000);
+                } else {
+                    alert('Error saving settings: ' + data.error);
+                }
+            })
+            .catch(error => alert('Error saving settings: ' + error));
+        }
+        
+        document.getElementById('saveSettings').addEventListener('click', saveSettings);
+
         // Add event listener for ticker input
         document.getElementById('ticker').addEventListener('input', function(e) {
             // Stop auto-update when user starts typing
@@ -4407,6 +4674,16 @@ def update():
         
     except Exception as e:
         return jsonify({'error': str(e)})
+
+@app.route('/save_settings', methods=['POST'])
+def save_settings():
+    try:
+        settings = request.get_json()
+        with open('settings.json', 'w') as f:
+            json.dump(settings, f, indent=2)
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
 
 if __name__ == '__main__':
     app.run(debug=True, port=5001)
