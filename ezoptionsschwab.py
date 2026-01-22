@@ -1252,9 +1252,7 @@ def create_exposure_chart(calls, puts, exposure_type, title, S, strike_range=0.0
     if horizontal:
         # Strike axis is Y
         yaxis_config.update(dict(
-            range=[min_strike - padding, max_strike + padding],
-            tickmode='linear',
-            dtick=math.ceil((max_strike - min_strike) / 10),
+            autorange=True,
             tickformat='.0f',
             showticklabels=True,
             ticks='outside',
@@ -1270,9 +1268,7 @@ def create_exposure_chart(calls, puts, exposure_type, title, S, strike_range=0.0
     else:
         # Strike axis is X
         xaxis_config.update(dict(
-            range=[min_strike - padding, max_strike + padding],
-            tickmode='linear',
-            dtick=math.ceil((max_strike - min_strike) / 10),
+            autorange=True,
             tickangle=45,
             tickformat='.0f',
             showticklabels=True,
@@ -1562,10 +1558,11 @@ def create_options_volume_chart(calls, puts, S, strike_range=0.02, call_color='#
     
     if horizontal:
          yaxis_config.update(dict(
-            range=[min_strike - (max_strike - min_strike) * 0.1, max_strike + (max_strike - min_strike) * 0.1]
+            autorange=True
          ))
     else:
         xaxis_config.update(dict(
+            autorange=True,
             tickangle=45,
             tickformat='.0f',
             showticklabels=True,
@@ -2696,10 +2693,11 @@ def create_premium_chart(calls, puts, S, strike_range=0.02, call_color='#00FF00'
     
     if horizontal:
          yaxis_config.update(dict(
-            range=[min_strike - (max_strike - min_strike) * 0.1, max_strike + (max_strike - min_strike) * 0.1]
+            autorange=True
          ))
     else:
         xaxis_config.update(dict(
+            autorange=True,
             tickangle=45,
             tickformat='.0f',
             showticklabels=True,
@@ -3460,6 +3458,7 @@ def index():
                     </div>
                     <div class="settings-control">
                         <button id="saveSettings" title="Save current settings to file">💾 Save</button>
+                        <button id="loadSettings" title="Load settings from file">📂 Load</button>
                     </div>
                 </div>
             </div>
@@ -4391,7 +4390,30 @@ def index():
             .catch(error => alert('Error saving settings: ' + error));
         }
         
+        function loadSettings() {
+            fetch('/load_settings')
+            .then(response => response.json())
+            .then(data => {
+                if (data.error) {
+                    alert('Error loading settings: ' + data.error);
+                } else {
+                    applySettings(data);
+                    const btn = document.getElementById('loadSettings');
+                    btn.classList.add('success');
+                    btn.textContent = '✓ Loaded';
+                    setTimeout(() => {
+                        btn.classList.remove('success');
+                        btn.textContent = '📂 Load';
+                    }, 2000);
+                    // Reload expirations for the new ticker and update
+                    loadExpirations();
+                }
+            })
+            .catch(error => alert('Error loading settings: ' + error));
+        }
+        
         document.getElementById('saveSettings').addEventListener('click', saveSettings);
+        document.getElementById('loadSettings').addEventListener('click', loadSettings);
 
         // Add event listener for ticker input
         document.getElementById('ticker').addEventListener('input', function(e) {
@@ -4637,10 +4659,12 @@ def update():
         
         # Get fresh quote data
         try:
-            quote_response = client.quote(ticker)
+            # Use $SPX for MARKET ticker quote data
+            quote_ticker = "$SPX" if ticker == "MARKET" else ticker
+            quote_response = client.quote(quote_ticker)
             if quote_response.ok:
                 quote_data = quote_response.json()
-                ticker_data = quote_data.get(ticker, {})
+                ticker_data = quote_data.get(quote_ticker, {})
                 quote = ticker_data.get('quote', {})
                 
                 response['price_info'] = {
@@ -4684,6 +4708,18 @@ def save_settings():
         return jsonify({'success': True})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)})
+
+@app.route('/load_settings')
+def load_settings():
+    try:
+        if os.path.exists('settings.json'):
+            with open('settings.json', 'r') as f:
+                settings = json.load(f)
+            return jsonify(settings)
+        else:
+            return jsonify({'error': 'No settings file found'})
+    except Exception as e:
+        return jsonify({'error': str(e)})
 
 if __name__ == '__main__':
     app.run(debug=True, port=5001)
