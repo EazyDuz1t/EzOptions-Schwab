@@ -24,6 +24,19 @@ load_dotenv()
 # Initialize Flask app
 app = Flask(__name__)
 
+# Global error handlers for Flask
+@app.errorhandler(404)
+def not_found_error(error):
+    if request.path.startswith('/api/') or request.path.startswith('/update') or request.path.startswith('/expirations'):
+        return jsonify({'error': 'API endpoint not found'}), 404
+    return "404 - Not Found", 404
+
+@app.errorhandler(500)
+def internal_error(error):
+    if request.path.startswith('/api/') or request.path.startswith('/update') or request.path.startswith('/expirations'):
+        return jsonify({'error': 'Internal server error'}), 500
+    return "500 - Internal Server Error", 500
+
 # Initialize SQLite database
 def init_db():
     with closing(sqlite3.connect('options_data.db')) as conn:
@@ -427,15 +440,33 @@ def calculate_time_to_expiration(expiry_date):
         return 0
 
 def fetch_options_for_date(ticker, date, exposure_metric="Open Interest", delta_adjusted: bool = False, calculate_in_notional: bool = True, S=None):
-    if ticker == "MARKET":
-        # Get prices for scaling (Base price is $SPX)
-        spx_price = S if S else get_current_price("$SPX")
+    if client is None:
+        raise Exception("Schwab API client not initialized. Check your environment variables.")
+    
+    if ticker == "MARKET" or ticker == "MARKET2":
+        # Get prices for scaling
+        base_ticker = "$SPX" if ticker == "MARKET" else "SPY"
+        base_price = S if S else get_current_price(base_ticker)
+        
         spy_price = get_current_price("SPY")
         qqq_price = get_current_price("QQQ")
         iwm_price = get_current_price("IWM")
         
-        if not spx_price:
+        if not base_price:
              return pd.DataFrame(), pd.DataFrame()
+        
+        # Determine strike rounding
+        spy_c, spy_p = pd.DataFrame(), pd.DataFrame()
+        if ticker == "MARKET":
+            strike_round = 10  # Standard $10 rounding for SPX base
+        else:
+            # For MARKET2 (SPY base), determine rounding from actual SPY strikes
+            try:
+                spy_c, spy_p = fetch_options_for_date("SPY", date, exposure_metric, delta_adjusted, calculate_in_notional)
+                all_spy_strikes = list(spy_c['strike']) + list(spy_p['strike'])
+                strike_round = get_strike_interval(all_spy_strikes) if all_spy_strikes else 1.0
+            except:
+                strike_round = 1.0
         
         calls_list = []
         puts_list = []
@@ -444,33 +475,39 @@ def fetch_options_for_date(ticker, date, exposure_metric="Open Interest", delta_
         def add_scaled_data(tick, etf_price):
             try:
                 # Fetch ETF options
-                # Note: We pass exposure_metric and delta_adjusted to recursive calls
-                c, p = fetch_options_for_date(tick, date, exposure_metric, delta_adjusted, calculate_in_notional)
+                if tick == "SPY" and not spy_c.empty:
+                    c, p = spy_c, spy_p
+                else:
+                    c, p = fetch_options_for_date(tick, date, exposure_metric, delta_adjusted, calculate_in_notional)
                 
-                # Calculate scaling factor to bring ETF values up to SPX-equivalent notional
-                # e.g., SPY ~500 vs SPX ~5000, so scale_factor ~10
-                scale_factor = spx_price / etf_price
+                # Calculate scaling factor to bring ETF values up to base-equivalent notional
+                scale_factor = base_price / etf_price
                 
                 if not c.empty:
                     c = c.copy()
                     # Use log-moneyness for accurate strike mapping: ln(K/S)
                     c['log_moneyness'] = np.log(c['strike'] / etf_price)
-                    # Map to SPX strikes and round to nearest $10 for better aggregation
-                    c['strike'] = (spx_price * np.exp(c['log_moneyness']) / 10).round() * 10
+                    # Map to base strikes and round for better aggregation
+                    c['strike'] = (base_price * np.exp(c['log_moneyness']) / strike_round).round() * strike_round
                     c.drop(columns=['log_moneyness'], inplace=True)
-                    
-                    # Scale OI and volume UP to SPX-equivalent notional
-                    # 1 SPY contract = 1/10th of SPX notional, so we DON'T scale down
-                    # Keep OI/volume as-is since we want contract counts to aggregate
-                    # (Greeks already capture the notional exposure differences)
                     
                     # Scale option prices by scale_factor (approximate, for display)
                     for col in ['lastPrice', 'bid', 'ask', 'change']:
                         if col in c.columns:
                             c[col] = c[col] * scale_factor
                     
-                    # Greeks are already in notional terms from calculate_greek_exposures
-                    # No additional scaling needed - they properly reflect dollar exposure
+                    # Scale contracts to base-equivalent (e.g. 10 SPY contracts = 1 SPX contract)
+                    for col in ['openInterest', 'volume']:
+                        if col in c.columns:
+                            c[col] = c[col] / scale_factor
+                    
+                    # If not in notional mode, exposures are in 'shares' 
+                    # 100 shares of SPY != 100 shares of SPX, so must scale these too
+                    if not calculate_in_notional:
+                        exp_cols = ['GEX', 'DEX', 'VEX', 'Charm', 'Speed', 'Vomma', 'Color']
+                        for col in exp_cols:
+                            if col in c.columns:
+                                c[col] = c[col] / scale_factor
                     
                     calls_list.append(c)
                 
@@ -478,8 +515,8 @@ def fetch_options_for_date(ticker, date, exposure_metric="Open Interest", delta_
                     p = p.copy()
                     # Use log-moneyness for accurate strike mapping: ln(K/S)
                     p['log_moneyness'] = np.log(p['strike'] / etf_price)
-                    # Map to SPX strikes and round to nearest $10 for better aggregation
-                    p['strike'] = (spx_price * np.exp(p['log_moneyness']) / 10).round() * 10
+                    # Map to base strikes and round
+                    p['strike'] = (base_price * np.exp(p['log_moneyness']) / strike_round).round() * strike_round
                     p.drop(columns=['log_moneyness'], inplace=True)
                     
                     # Scale option prices by scale_factor (approximate, for display)
@@ -487,13 +524,26 @@ def fetch_options_for_date(ticker, date, exposure_metric="Open Interest", delta_
                         if col in p.columns:
                             p[col] = p[col] * scale_factor
                     
-                    # Greeks are already in notional terms - no additional scaling
+                    # Scale contracts to base-equivalent
+                    for col in ['openInterest', 'volume']:
+                        if col in p.columns:
+                            p[col] = p[col] / scale_factor
+                            
+                    # Scale exposures if not in notional mode
+                    if not calculate_in_notional:
+                        exp_cols = ['GEX', 'DEX', 'VEX', 'Charm', 'Speed', 'Vomma', 'Color']
+                        for col in exp_cols:
+                            if col in p.columns:
+                                p[col] = p[col] / scale_factor
                     
                     puts_list.append(p)
             except Exception:
                 pass 
 
-        # Add scaled data from ETFs
+        # Add scaled data from ETFs and Index
+        if ticker == "MARKET" and base_price:
+            add_scaled_data("$SPX", base_price)
+            
         if spy_price: add_scaled_data("SPY", spy_price)
         if qqq_price: add_scaled_data("QQQ", qqq_price)
         if iwm_price: add_scaled_data("IWM", iwm_price)
@@ -547,7 +597,14 @@ def fetch_options_for_date(ticker, date, exposure_metric="Open Interest", delta_
         )
         
         if not chain_response.ok:
-            return pd.DataFrame(), pd.DataFrame()
+            try:
+                error_data = chain_response.json()
+                error_msg = error_data.get('error', 'Unknown API error')
+                if 'error_description' in error_data:
+                    error_msg += f": {error_data['error_description']}"
+                raise Exception(f"Schwab API Error: {error_msg}")
+            except:
+                raise Exception(f"Schwab API Error: {chain_response.status_code} {chain_response.reason}")
         
         chain = chain_response.json()
         S = float(chain.get('underlyingPrice', 0))
@@ -652,18 +709,18 @@ def fetch_options_for_date(ticker, date, exposure_metric="Open Interest", delta_
                         puts_data.append(option_data)
         
         # Calculate exposures with selected metric
-        max_vol = 1
-        if exposure_metric == 'OI Weighted by Volume':
-            max_vol_calls = max((o['volume'] for o in calls_data), default=0)
-            max_vol_puts = max((o['volume'] for o in puts_data), default=0)
-            max_vol = max(max_vol_calls, max_vol_puts, 1)
-
         for option_data in calls_data:
             weight = 0
             if exposure_metric == 'Volume':
                 weight = option_data['volume']
             elif exposure_metric == 'OI Weighted by Volume':
-                weight = option_data['openInterest'] * (1 + option_data['volume'] / max_vol)
+                # Geometric Mean: sqrt(OI * volume)
+                oi = option_data['openInterest']
+                vol = option_data['volume']
+                if vol > 0 and oi > 0:
+                    weight = math.sqrt(oi * vol)
+                else:
+                    weight = oi * 0.1
             else: # Open Interest
                 weight = option_data['openInterest']
                 
@@ -675,7 +732,13 @@ def fetch_options_for_date(ticker, date, exposure_metric="Open Interest", delta_
             if exposure_metric == 'Volume':
                 weight = option_data['volume']
             elif exposure_metric == 'OI Weighted by Volume':
-                weight = option_data['openInterest'] * (1 + option_data['volume'] / max_vol)
+                # Geometric Mean: sqrt(OI * volume)
+                oi = option_data['openInterest']
+                vol = option_data['volume']
+                if vol > 0 and oi > 0:
+                    weight = math.sqrt(oi * vol)
+                else:
+                    weight = oi * 0.1
             else: # Open Interest
                 weight = option_data['openInterest']
                 
@@ -924,12 +987,17 @@ def calculate_greek_exposures(option, S, weight, delta_adjusted: bool = False, c
     }
 
 def get_current_price(ticker):
+    if client is None:
+        return None
+        
     if ticker == "MARKET":
         ticker = "$SPX"
+    elif ticker == "MARKET2":
+        ticker = "SPY"
     try:
         quote_response = client.quotes(ticker)
         if not quote_response.ok:
-            return None
+            raise Exception(f"Failed to fetch quote: {quote_response.status_code} {quote_response.reason}")
         quote = quote_response.json()
         if quote and ticker in quote:
             return quote[ticker]['quote']['lastPrice']
@@ -939,12 +1007,17 @@ def get_current_price(ticker):
         return None
 
 def get_option_expirations(ticker):
+    if client is None:
+        raise Exception("Schwab API client not initialized. Check your environment variables.")
+    
     if ticker == "MARKET":
         ticker = "$SPX"
+    elif ticker == "MARKET2":
+        ticker = "SPY"
     try:
         response = client.option_expiration_chain(ticker)
         if not response.ok:
-            return []
+            raise Exception(f"Failed to fetch expirations: {response.status_code} {response.reason}")
         response_json = response.json()
         if response_json and 'expirationList' in response_json:
             expiration_dates = [item['expirationDate'] for item in response_json['expirationList']]
@@ -970,10 +1043,10 @@ def get_color_with_opacity(value, max_value, base_color, color_intensity=True):
         return f'rgba({r}, {g}, {b}, {opacity})'
     return base_color
 
-def create_exposure_chart(calls, puts, exposure_type, title, S, strike_range=0.02, show_calls=True, show_puts=True, show_net=True, color_intensity=True, call_color='#00FF00', put_color='#FF0000', selected_expiries=None, perspective='Customer', horizontal=False, show_abs_gex_area=False, abs_gex_opacity=0.2):
+def create_exposure_chart(calls, puts, exposure_type, title, S, strike_range=0.02, show_calls=True, show_puts=True, show_net=True, color_intensity=True, call_color='#00FF00', put_color='#FF0000', selected_expiries=None, perspective='Customer', horizontal=False, show_abs_gex_area=False, abs_gex_opacity=0.2, highlight_max_level=False, max_level_color='#800080'):
     # Ensure the exposure_type column exists
     if exposure_type not in calls.columns or exposure_type not in puts.columns:
-        print(f"Warning: {exposure_type} not found in data")  # Fixed f-string syntax
+        print(f"Warning: {exposure_type} not found in data")
         return go.Figure().to_json()
     
     # Filter out zero values and create dataframes
@@ -1295,7 +1368,7 @@ def create_exposure_chart(calls, puts, exposure_type, title, S, strike_range=0.0
         annotations=list(fig.layout.annotations) + [
             dict(
                 text=f"Net: {format_large_number(abs(total_net_exposure))}",
-                x=1.05,
+                x=0.95,
                 y=1.05,  # Adjusted from 1.1 to 1.05 to move it slightly down
                 xref='paper',
                 yref='paper',
@@ -1333,6 +1406,43 @@ def create_exposure_chart(calls, puts, exposure_type, title, S, strike_range=0.0
     fig.update_xaxes(showspikes=True, spikecolor=text_color, spikethickness=1)
     fig.update_yaxes(showspikes=True, spikecolor=text_color, spikethickness=1)
     
+    # Logic for Highlighting Max Level
+    if highlight_max_level:
+        try:
+            max_abs_val = 0
+            max_trace_idx = -1
+            max_bar_idx = -1
+            
+            for i, trace in enumerate(fig.data):
+                if trace.type == 'bar':
+                    # Get values based on orientation
+                    vals = trace.x if horizontal else trace.y
+                    if vals:
+                        abs_vals = [abs(v) for v in vals]
+                        if abs_vals:
+                            local_max = max(abs_vals)
+                            if local_max > max_abs_val:
+                                max_abs_val = local_max
+                                max_trace_idx = i
+                                max_bar_idx = abs_vals.index(local_max)
+            
+            if max_trace_idx != -1:
+                # Set marker line for the specific bar
+                # marker.line.width can be an array to highlight specific bars
+                vals = fig.data[max_trace_idx].x if horizontal else fig.data[max_trace_idx].y
+                line_widths = [0] * len(vals)
+                line_widths[max_bar_idx] = 5
+                
+                # Use update instead of direct assignment to ensure Plotly handles it correctly
+                fig.data[max_trace_idx].update(marker=dict(
+                    line=dict(
+                        width=line_widths,
+                        color=max_level_color
+                    )
+                ))
+        except Exception as e:
+            print(f"Error highlighting max level: {e}")
+
     return fig.to_json()
 
 def create_volume_chart(call_volume, put_volume, use_itm=True, call_color='#00FF00', put_color='#FF0000', selected_expiries=None):
@@ -1358,7 +1468,7 @@ def create_volume_chart(call_volume, put_volume, use_itm=True, call_color='#00FF
     
     return fig.to_json()
 
-def create_options_volume_chart(calls, puts, S, strike_range=0.02, call_color='#00FF00', put_color='#FF0000', color_intensity=True, show_calls=True, show_puts=True, show_net=True, selected_expiries=None, perspective='Customer', horizontal=False):
+def create_options_volume_chart(calls, puts, S, strike_range=0.02, call_color='#00FF00', put_color='#FF0000', color_intensity=True, show_calls=True, show_puts=True, show_net=True, selected_expiries=None, perspective='Customer', horizontal=False, highlight_max_level=False, max_level_color='#800080'):
     # Filter strikes within range
     min_strike = S * (1 - strike_range)
     max_strike = S * (1 + strike_range)
@@ -1614,6 +1724,38 @@ def create_options_volume_chart(calls, puts, S, strike_range=0.02, call_color='#
     fig.update_xaxes(showspikes=True, spikecolor='#CCCCCC', spikethickness=1)
     fig.update_yaxes(showspikes=True, spikecolor='#CCCCCC', spikethickness=1)
     
+    # Logic for Highlighting Max Level
+    if highlight_max_level:
+        try:
+            max_abs_val = 0
+            max_trace_idx = -1
+            max_bar_idx = -1
+            
+            for i, trace in enumerate(fig.data):
+                if trace.type == 'bar':
+                    vals = trace.x if horizontal else trace.y
+                    if vals:
+                        abs_vals = [abs(v) for v in vals]
+                        if abs_vals:
+                            local_max = max(abs_vals)
+                            if local_max > max_abs_val:
+                                max_abs_val = local_max
+                                max_trace_idx = i
+                                max_bar_idx = abs_vals.index(local_max)
+            
+            if max_trace_idx != -1:
+                vals = fig.data[max_trace_idx].x if horizontal else fig.data[max_trace_idx].y
+                line_widths = [0] * len(vals)
+                line_widths[max_bar_idx] = 5
+                fig.data[max_trace_idx].update(marker=dict(
+                    line=dict(
+                        width=line_widths,
+                        color=max_level_color
+                    )
+                ))
+        except Exception as e:
+            print(f"Error highlighting max level in options volume: {e}")
+
     return fig.to_json()
 
 def update_options_chain(ticker, expiration_date=None):
@@ -1641,6 +1783,8 @@ def update_options_chain(ticker, expiration_date=None):
 def get_price_history(ticker):
     if ticker == "MARKET":
         ticker = "$SPX"
+    elif ticker == "MARKET2":
+        ticker = "SPY"
     try:
         # Get current time in EST
         est = datetime.now(pytz.timezone('US/Eastern'))
@@ -1754,7 +1898,7 @@ def convert_to_heikin_ashi(candles):
     
     return ha_candles
 
-def create_price_chart(price_data, calls=None, puts=None, exposure_levels_types=[], exposure_levels_count=3, call_color='#00FF00', put_color='#FF0000', strike_range=0.02, use_heikin_ashi=False):
+def create_price_chart(price_data, calls=None, puts=None, exposure_levels_types=[], exposure_levels_count=3, call_color='#00FF00', put_color='#FF0000', strike_range=0.02, use_heikin_ashi=False, highlight_max_level=False, max_level_color='#800080'):
     # Handle backward compatibility or empty default
     if isinstance(exposure_levels_types, str):
         if exposure_levels_types == 'None':
@@ -2011,10 +2155,14 @@ def create_price_chart(price_data, calls=None, puts=None, exposure_levels_types=
         # Define dash styles to differentiate if multiple types are selected
         dash_styles = ['dot', 'dash', 'longdash', 'dashdot', 'longdashdot']
         
+        # Pre-calculate all top levels to find the overall absolute maximum for highlighting
+        all_top_levels = [] # List of (strike, value, type_name, type_index)
+        
         for i, exposure_levels_type in enumerate(exposure_levels_types):
             # Determine column name based on type
             col_name = exposure_levels_type
-            if exposure_levels_type == 'Vanna': col_name = 'VEX'
+            if exposure_levels_type == 'Vanna' or exposure_levels_type == 'VEX': col_name = 'VEX'
+            if exposure_levels_type == 'AbsGEX': col_name = 'GEX'
             
             # Check if column exists
             if col_name in range_calls.columns and col_name in range_puts.columns:
@@ -2033,6 +2181,9 @@ def create_price_chart(price_data, calls=None, puts=None, exposure_levels_types=
                     if exposure_levels_type == 'GEX':
                         # GEX is Call - Put (puts are positive in calculation)
                         net_val = c_val - p_val
+                    elif exposure_levels_type == 'AbsGEX':
+                        # Absolute GEX = |Call GEX| + |Put GEX|
+                        net_val = abs(c_val) + abs(p_val)
                     elif exposure_levels_type == 'DEX':
                          # DEX: Call + Put. (Puts have negative delta).
                          net_val = c_val + p_val
@@ -2046,53 +2197,74 @@ def create_price_chart(price_data, calls=None, puts=None, exposure_levels_types=
                 sorted_levels = sorted(levels.items(), key=lambda x: abs(x[1]), reverse=True)
                 top_levels = sorted_levels[:exposure_levels_count]
                 
-                # Pick dash style
-                dash_style = dash_styles[i % len(dash_styles)]
-                
-                # Add horizontal lines for each level
                 for strike, val in top_levels:
-                     # Calculate color intensity based on value
-                    max_val = max(abs(v) for _, v in top_levels)
-                    if max_val == 0: max_val = 1
-                    intensity = max(0.1, min(1.0, abs(val) / max_val))
-                    
-                    # Determine color: Green for positive, Red for negative
-                    is_positive = val >= 0
-                    color = call_color if is_positive else put_color
-                    
-                    r = int(color[1:3], 16)
-                    g = int(color[3:5], 16)
-                    b = int(color[5:7], 16)
-                    rgba_color = f'rgba({r}, {g}, {b}, {intensity:.2f})'
-                    
-                    # Add the horizontal line
-                    fig.add_hline(
-                        y=strike,
-                        line_dash=dash_style,
-                        line_color=rgba_color,
-                        line_width=1
-                    )
-                    
-                    # Add separate annotation for the text
-                    # Offset vertically by index to prevent stacking perfectly
-                    y_offset_pixels = 5 + (i * 15)
-                    
-                    fig.add_annotation(
-                        x=1,
-                        y=strike,
-                        xref="paper",
-                        yref="y",
-                        text=f"{exposure_levels_type}: {format_large_number(val)}",
-                        showarrow=False,
-                        font=dict(
-                            size=10,
-                            color=rgba_color
-                        ),
-                        xanchor='left',
-                        yanchor='top',
-                        xshift=-105, # Moved further left to accommodate type name
-                        yshift=-y_offset_pixels
-                    )
+                    all_top_levels.append((strike, val, exposure_levels_type, i))
+
+        # Find absolute max across ALL displayed levels for highlighting
+        overall_max_abs_val = 0
+        if highlight_max_level and all_top_levels:
+            overall_max_abs_val = max(abs(l[1]) for l in all_top_levels)
+
+        # Draw all collected levels
+        for strike, val, exposure_levels_type, type_index in all_top_levels:
+            # Pick dash style
+            dash_style = dash_styles[type_index % len(dash_styles)]
+            
+            # Check if this is the absolute maximum level to highlight
+            is_max_level = highlight_max_level and abs(val) == overall_max_abs_val and overall_max_abs_val > 0
+            
+            if is_max_level:
+                color = max_level_color
+                intensity = 1.0
+            else:
+                # Determine color: Green for positive, Red for negative
+                color = call_color if val >= 0 else put_color
+                
+                # Calculate color intensity based on value within its OWN type
+                type_max_val = max(abs(l[1]) for l in all_top_levels if l[2] == exposure_levels_type)
+                if type_max_val == 0: type_max_val = 1
+                intensity = max(0.1, min(1.0, abs(val) / type_max_val))
+            
+            r = int(color[1:3], 16)
+            g = int(color[3:5], 16)
+            b = int(color[5:7], 16)
+            rgba_color = f'rgba({r}, {g}, {b}, {intensity:.2f})'
+            
+            # Add the horizontal line
+            fig.add_hline(
+                y=strike,
+                line_dash=dash_style,
+                line_color=rgba_color,
+                line_width=2 if is_max_level else 1
+            )
+            
+            # Add separate annotation for the text
+            y_offset_pixels = 5 + (type_index * 15)
+            
+            # Map type to display name
+            display_name = exposure_levels_type
+            if exposure_levels_type == 'VEX': display_name = 'Vanna'
+            if exposure_levels_type == 'AbsGEX': display_name = 'Abs GEX'
+            
+            display_text = f"<b>{display_name}: {format_large_number(val)}</b>" if is_max_level else f"{display_name}: {format_large_number(val)}"
+            
+            fig.add_annotation(
+                x=1,
+                y=strike,
+                xref="paper",
+                yref="y",
+                text=display_text,
+                showarrow=False,
+                font=dict(
+                    size=10,
+                    color=rgba_color,
+                ),
+                textangle=0,
+                xanchor='left',
+                yanchor='top',
+                xshift=-105,
+                yshift=-y_offset_pixels
+            )
 
     return fig.to_json()
 
@@ -2501,7 +2673,7 @@ def create_historical_bubble_levels_chart(ticker, strike_range, call_color='#00F
 
 
 
-def create_premium_chart(calls, puts, S, strike_range=0.02, call_color='#00FF00', put_color='#FF0000', color_intensity=True, show_calls=True, show_puts=True, show_net=True, selected_expiries=None, perspective='Customer', horizontal=False):
+def create_premium_chart(calls, puts, S, strike_range=0.02, call_color='#00FF00', put_color='#FF0000', color_intensity=True, show_calls=True, show_puts=True, show_net=True, selected_expiries=None, perspective='Customer', horizontal=False, highlight_max_level=False, max_level_color='#800080'):
     # Filter strikes within range
     min_strike = S * (1 - strike_range)
     max_strike = S * (1 + strike_range)
@@ -2749,6 +2921,38 @@ def create_premium_chart(calls, puts, S, strike_range=0.02, call_color='#00FF00'
     fig.update_xaxes(showspikes=True, spikecolor='#CCCCCC', spikethickness=1)
     fig.update_yaxes(showspikes=True, spikecolor='#CCCCCC', spikethickness=1)
     
+    # Logic for Highlighting Max Level
+    if highlight_max_level:
+        try:
+            max_abs_val = 0
+            max_trace_idx = -1
+            max_bar_idx = -1
+            
+            for i, trace in enumerate(fig.data):
+                if trace.type == 'bar':
+                    vals = trace.x if horizontal else trace.y
+                    if vals:
+                        abs_vals = [abs(v) for v in vals]
+                        if abs_vals:
+                            local_max = max(abs_vals)
+                            if local_max > max_abs_val:
+                                max_abs_val = local_max
+                                max_trace_idx = i
+                                max_bar_idx = abs_vals.index(local_max)
+            
+            if max_trace_idx != -1:
+                vals = fig.data[max_trace_idx].x if horizontal else fig.data[max_trace_idx].y
+                line_widths = [0] * len(vals)
+                line_widths[max_bar_idx] = 5
+                fig.data[max_trace_idx].update(marker=dict(
+                    line=dict(
+                        width=line_widths,
+                        color=max_level_color
+                    )
+                ))
+        except Exception as e:
+            print(f"Error highlighting max level in premium chart: {e}")
+
     return fig.to_json()
 
 def create_centroid_chart(ticker, call_color='#00FF00', put_color='#FF0000', selected_expiries=None):
@@ -3426,9 +3630,39 @@ def index():
         .charts-grid.many-charts {
             grid-template-columns: repeat(2, 1fr);
         }
+        #error-notification {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            background-color: #ff4444;
+            color: white;
+            padding: 15px 25px;
+            border-radius: 8px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+            z-index: 10000;
+            display: none;
+            animation: slideIn 0.3s ease-out;
+            max-width: 400px;
+        }
+        @keyframes slideIn {
+            from { transform: translateX(100%); opacity: 0; }
+            to { transform: translateX(0); opacity: 1; }
+        }
+        .error-close {
+            position: absolute;
+            top: 5px;
+            right: 5px;
+            cursor: pointer;
+            font-weight: bold;
+            font-size: 18px;
+        }
     </style>
 </head>
 <body>
+    <div id="error-notification">
+        <span class="error-close" onclick="hideError()">&times;</span>
+        <div id="error-message"></div>
+    </div>
     <div class="container">
         <div class="header">
             <div class="header-top">
@@ -3436,7 +3670,7 @@ def index():
                 <div class="controls">
                     <div class="control-group">
                         <label for="ticker">Ticker:</label>
-                        <input type="text" id="ticker" placeholder="Enter Ticker" value="SPY">
+                        <input type="text" id="ticker" placeholder="Enter Ticker" value="SPY" title="Enter a ticker symbol (e.g., SPY, AAPL) or special aggregate tickers: 'MARKET' (SPX base) or 'MARKET2' (SPY base)">
                     </div>
                     <div class="control-group">
                         <label>Expiry:</label>
@@ -3516,6 +3750,7 @@ def index():
                             </div>
                             <div class="levels-options" id="levels-options">
                                 <div class="levels-option"><input type="checkbox" value="GEX" id="lvl-GEX"><label for="lvl-GEX">GEX</label></div>
+                                <div class="levels-option"><input type="checkbox" value="AbsGEX" id="lvl-AbsGEX"><label for="lvl-AbsGEX">Abs GEX</label></div>
                                 <div class="levels-option"><input type="checkbox" value="DEX" id="lvl-DEX"><label for="lvl-DEX">DEX</label></div>
                                 <div class="levels-option"><input type="checkbox" value="VEX" id="lvl-VEX"><label for="lvl-VEX">Vanna</label></div>
                                 <div class="levels-option"><input type="checkbox" value="Charm" id="lvl-Charm"><label for="lvl-Charm">Charm</label></div>
@@ -3557,6 +3792,14 @@ def index():
                     <div class="control-group">
                         <label for="put_color">Put Color:</label>
                         <input type="color" id="put_color" value="#FF0000">
+                    </div>
+                    <div class="control-group">
+                        <input type="checkbox" id="highlight_max_level">
+                        <label for="highlight_max_level">Highlight Max Level</label>
+                    </div>
+                    <div class="control-group">
+                        <label for="max_level_color">Max Level Color:</label>
+                        <input type="color" id="max_level_color" value="#800080">
                     </div>
                 </div>
             </div>
@@ -3653,11 +3896,24 @@ def index():
         let chartRevisions = {}; // Store chart revisions
         let callColor = '#00FF00';
         let putColor = '#FF0000';
+        let maxLevelColor = '#800080';
         let lastData = {}; // Store last received data
         let updateInProgress = false;
         let isStreaming = true;
         
+        function showError(message) {
+            const notification = document.getElementById('error-notification');
+            const messageElement = document.getElementById('error-message');
+            messageElement.textContent = message;
+            notification.style.display = 'block';
+            
+            // Auto-hide after 10 seconds unless it's a persistent error
+            setTimeout(hideError, 10000);
+        }
 
+        function hideError() {
+            document.getElementById('error-notification').style.display = 'none';
+        }
         
         // Update colors when color pickers change
         document.getElementById('call_color').addEventListener('change', function(e) {
@@ -3669,6 +3925,13 @@ def index():
             putColor = e.target.value;
             updateData();
         });
+
+        document.getElementById('max_level_color').addEventListener('change', function(e) {
+            maxLevelColor = e.target.value;
+            updateData();
+        });
+
+        document.getElementById('highlight_max_level').addEventListener('change', updateData);
         
         // Helper function to create rgba color with opacity
         function createRgbaColor(hexColor, opacity) {
@@ -3751,6 +4014,7 @@ def index():
             const calculateInNotional = document.getElementById('calculate_in_notional').checked;
             const strikeRange = parseFloat(document.getElementById('strike_range').value) / 100;
             const perspective = document.getElementById('perspective').value;
+            const highlightMaxLevel = document.getElementById('highlight_max_level').checked;
             
             // Get visible charts
             const visibleCharts = {
@@ -3799,13 +4063,19 @@ def index():
                     perspective: perspective,
                     call_color: callColor,
                     put_color: putColor,
+                    highlight_max_level: highlightMaxLevel,
+                    max_level_color: maxLevelColor,
                     ...visibleCharts
                 })
             })
             .then(response => response.json())
             .then(data => {
                 if (data.error) {
-                    console.error('Error:', data.error);
+                    showError(data.error);
+                    // Pause streaming on persistent error
+                    if (isStreaming) {
+                        toggleStreaming();
+                    }
                     return;
                 }
                 
@@ -3817,6 +4087,10 @@ def index():
                 }
             })
             .catch(error => {
+                showError('Network Error: Could not connect to the server.');
+                if (isStreaming) {
+                    toggleStreaming();
+                }
                 console.error('Error fetching data:', error);
             })
             .finally(() => {
@@ -4108,8 +4382,15 @@ def index():
         function loadExpirations() {
             const ticker = document.getElementById('ticker').value;
             fetch(`/expirations/${ticker}`)
-                .then(response => response.json())
+                .then(response => {
+                    if (!response.ok) throw new Error('Failed to fetch expirations');
+                    return response.json();
+                })
                 .then(data => {
+                    if (data.error) {
+                        showError(data.error);
+                        return;
+                    }
                     const optionsContainer = document.getElementById('expiry-options');
                     const previousSelections = Array.from(document.querySelectorAll('.expiry-option input[type="checkbox"]:checked')).map(cb => cb.value);
                     
@@ -4162,6 +4443,9 @@ def index():
                     
                     updateExpiryDisplay();
                     updateData();
+                })
+                .catch(error => {
+                    showError('Error loading expirations: ' + error.message);
                 });
         }
         
@@ -4298,6 +4582,8 @@ def index():
                 use_range: document.getElementById('use_range').checked,
                 call_color: document.getElementById('call_color').value,
                 put_color: document.getElementById('put_color').value,
+                highlight_max_level: document.getElementById('highlight_max_level').checked,
+                max_level_color: document.getElementById('max_level_color').value,
                 // Chart visibility
                 charts: {
                     price: document.getElementById('price').checked,
@@ -4357,6 +4643,13 @@ def index():
                 document.getElementById('put_color').value = settings.put_color;
                 putColor = settings.put_color;
             }
+            if (settings.highlight_max_level !== undefined) {
+                document.getElementById('highlight_max_level').checked = settings.highlight_max_level;
+            }
+            if (settings.max_level_color) {
+                document.getElementById('max_level_color').value = settings.max_level_color;
+                maxLevelColor = settings.max_level_color;
+            }
             // Chart visibility
             if (settings.charts) {
                 Object.keys(settings.charts).forEach(chartId => {
@@ -4384,10 +4677,10 @@ def index():
                         btn.textContent = '💾 Save';
                     }, 2000);
                 } else {
-                    alert('Error saving settings: ' + data.error);
+                    showError('Error saving settings: ' + data.error);
                 }
             })
-            .catch(error => alert('Error saving settings: ' + error));
+            .catch(error => showError('Error saving settings: ' + error));
         }
         
         function loadSettings() {
@@ -4395,7 +4688,7 @@ def index():
             .then(response => response.json())
             .then(data => {
                 if (data.error) {
-                    alert('Error loading settings: ' + data.error);
+                    showError('Error loading settings: ' + data.error);
                 } else {
                     applySettings(data);
                     const btn = document.getElementById('loadSettings');
@@ -4409,7 +4702,7 @@ def index():
                     loadExpirations();
                 }
             })
-            .catch(error => alert('Error loading settings: ' + error));
+            .catch(error => showError('Error loading settings: ' + error));
         }
         
         document.getElementById('saveSettings').addEventListener('click', saveSettings);
@@ -4441,9 +4734,12 @@ def index():
 
 @app.route('/expirations/<ticker>')
 def get_expirations(ticker):
-    ticker = format_ticker(ticker)
-    expirations = get_option_expirations(ticker)
-    return jsonify(expirations)
+    try:
+        ticker = format_ticker(ticker)
+        expirations = get_option_expirations(ticker)
+        return jsonify(expirations)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 400
 
 @app.route('/update', methods=['POST'])
 def update():
@@ -4453,7 +4749,7 @@ def update():
     
     ticker = format_ticker(ticker) 
     if not ticker or not expiry:
-        return jsonify({'error': 'Missing ticker or expiry'})
+        return jsonify({'error': 'Missing ticker or expiry'}), 400
     
     # Handle both single expiry and multiple expiries
     if isinstance(expiry, list):
@@ -4570,6 +4866,8 @@ def update():
         horizontal = data.get('horizontal_bars', False)
         show_abs_gex = data.get('show_abs_gex', False)
         abs_gex_opacity = float(data.get('abs_gex_opacity', 0.2))
+        highlight_max_level = data.get('highlight_max_level', False)
+        max_level_color = data.get('max_level_color', '#800080')
  
         
         response = {}
@@ -4585,7 +4883,9 @@ def update():
                 call_color=call_color,
                 put_color=put_color,
                 strike_range=strike_range,
-                use_heikin_ashi=use_heikin_ashi
+                use_heikin_ashi=use_heikin_ashi,
+                highlight_max_level=highlight_max_level,
+                max_level_color=max_level_color
             )
         
         if data.get('show_gex_historical_bubble', True):
@@ -4609,34 +4909,34 @@ def update():
                 response['charm_historical_bubble'] = f"data:image/png;base64,{base64.b64encode(img_bytes).decode('utf-8')}"
         
         if data.get('show_gamma', True):
-            response['gamma'] = create_exposure_chart(calls, puts, "GEX", "Gamma Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, color_intensity, call_color, put_color, expiry_dates, perspective, horizontal, show_abs_gex_area=show_abs_gex, abs_gex_opacity=abs_gex_opacity)
+            response['gamma'] = create_exposure_chart(calls, puts, "GEX", "Gamma Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, color_intensity, call_color, put_color, expiry_dates, perspective, horizontal, show_abs_gex_area=show_abs_gex, abs_gex_opacity=abs_gex_opacity, highlight_max_level=highlight_max_level, max_level_color=max_level_color)
         
         if data.get('show_delta', True):
-            response['delta'] = create_exposure_chart(calls, puts, "DEX", "Delta Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, color_intensity, call_color, put_color, expiry_dates, perspective, horizontal)
+            response['delta'] = create_exposure_chart(calls, puts, "DEX", "Delta Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, color_intensity, call_color, put_color, expiry_dates, perspective, horizontal, highlight_max_level=highlight_max_level, max_level_color=max_level_color)
         
         if data.get('show_vanna', True):
-            response['vanna'] = create_exposure_chart(calls, puts, "VEX", "Vanna Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, color_intensity, call_color, put_color, expiry_dates, perspective, horizontal)
+            response['vanna'] = create_exposure_chart(calls, puts, "VEX", "Vanna Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, color_intensity, call_color, put_color, expiry_dates, perspective, horizontal, highlight_max_level=highlight_max_level, max_level_color=max_level_color)
         
         if data.get('show_charm', True):
-            response['charm'] = create_exposure_chart(calls, puts, "Charm", "Charm Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, color_intensity, call_color, put_color, expiry_dates, perspective, horizontal)
+            response['charm'] = create_exposure_chart(calls, puts, "Charm", "Charm Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, color_intensity, call_color, put_color, expiry_dates, perspective, horizontal, highlight_max_level=highlight_max_level, max_level_color=max_level_color)
         
         if data.get('show_speed', True):
-            response['speed'] = create_exposure_chart(calls, puts, "Speed", "Speed Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, color_intensity, call_color, put_color, expiry_dates, perspective, horizontal)
+            response['speed'] = create_exposure_chart(calls, puts, "Speed", "Speed Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, color_intensity, call_color, put_color, expiry_dates, perspective, horizontal, highlight_max_level=highlight_max_level, max_level_color=max_level_color)
         
         if data.get('show_vomma', True):
-            response['vomma'] = create_exposure_chart(calls, puts, "Vomma", "Vomma Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, color_intensity, call_color, put_color, expiry_dates, perspective, horizontal)
+            response['vomma'] = create_exposure_chart(calls, puts, "Vomma", "Vomma Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, color_intensity, call_color, put_color, expiry_dates, perspective, horizontal, highlight_max_level=highlight_max_level, max_level_color=max_level_color)
 
         if data.get('show_color', True):
-            response['color'] = create_exposure_chart(calls, puts, "Color", "Color Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, color_intensity, call_color, put_color, expiry_dates, perspective, horizontal)
+            response['color'] = create_exposure_chart(calls, puts, "Color", "Color Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, color_intensity, call_color, put_color, expiry_dates, perspective, horizontal, highlight_max_level=highlight_max_level, max_level_color=max_level_color)
         
         if data.get('show_volume', True):
             response['volume'] = create_volume_chart(call_volume, put_volume, use_range, call_color, put_color, expiry_dates)
         
         if data.get('show_options_volume', True):
-            response['options_volume'] = create_options_volume_chart(calls, puts, S, strike_range, call_color, put_color, color_intensity, show_calls, show_puts, show_net, expiry_dates, perspective, horizontal)
+            response['options_volume'] = create_options_volume_chart(calls, puts, S, strike_range, call_color, put_color, color_intensity, show_calls, show_puts, show_net, expiry_dates, perspective, horizontal, highlight_max_level=highlight_max_level, max_level_color=max_level_color)
         
         if data.get('show_premium', True):
-            response['premium'] = create_premium_chart(calls, puts, S, strike_range, call_color, put_color, color_intensity, show_calls, show_puts, show_net, expiry_dates, perspective, horizontal)
+            response['premium'] = create_premium_chart(calls, puts, S, strike_range, call_color, put_color, color_intensity, show_calls, show_puts, show_net, expiry_dates, perspective, horizontal, highlight_max_level=highlight_max_level, max_level_color=max_level_color)
         
         if data.get('show_large_trades', True):
             response['large_trades'] = create_large_trades_table(calls, puts, S, strike_range, call_color, put_color, expiry_dates)
@@ -4659,9 +4959,18 @@ def update():
         
         # Get fresh quote data
         try:
-            # Use $SPX for MARKET ticker quote data
-            quote_ticker = "$SPX" if ticker == "MARKET" else ticker
+            # Use appropriate base ticker for market tickers
+            if ticker == "MARKET":
+                quote_ticker = "$SPX"
+            elif ticker == "MARKET2":
+                quote_ticker = "SPY"
+            else:
+                quote_ticker = ticker
+            
             quote_response = client.quote(quote_ticker)
+            if not quote_response.ok:
+                raise Exception(f"Failed to fetch quote for display: {quote_response.status_code} {quote_response.reason}")
+            
             if quote_response.ok:
                 quote_data = quote_response.json()
                 ticker_data = quote_data.get(quote_ticker, {})
@@ -4697,7 +5006,9 @@ def update():
         return jsonify(response)
         
     except Exception as e:
-        return jsonify({'error': str(e)})
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/save_settings', methods=['POST'])
 def save_settings():
