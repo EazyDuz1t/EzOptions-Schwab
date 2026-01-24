@@ -439,6 +439,51 @@ def calculate_time_to_expiration(expiry_date):
         print(f"Error calculating time to expiration: {e}")
         return 0
 
+def map_to_base_strikes(df, etf_price, base_price, moneyness_precision=0.001):
+    """
+    Maps ETF strikes to base-equivalent strikes using moneyness.
+    
+    Instead of interpolating between base strikes (which creates synthetic data),
+    we calculate the exact moneyness of each ETF strike and convert it to what
+    that same moneyness would be at the base price level.
+    
+    Example: SPY $601 at spot $600 = 100.17% moneyness
+             At SPX spot $6000, this becomes strike $6010
+    
+    This preserves the exact economic relationship of each contract to its spot.
+    
+    Args:
+        df: DataFrame with 'strike' column
+        etf_price: Current ETF spot price
+        base_price: Current base (SPX/SPY) spot price  
+        moneyness_precision: Precision for moneyness rounding (0.001 = 0.1%)
+    
+    Returns:
+        DataFrame with strikes converted to base-equivalent values
+    """
+    if df.empty:
+        return df
+        
+    df = df.copy()
+    
+    # Store original values for reference
+    df['_original_strike'] = df['strike']
+    df['_original_spot'] = etf_price
+    
+    # Calculate moneyness (strike / spot) and convert to base-equivalent strike
+    # moneyness = strike / etf_price
+    # base_equivalent_strike = moneyness * base_price
+    df['strike'] = (df['strike'] / etf_price) * base_price
+    
+    # Optionally round to moneyness precision to help aggregation
+    # This groups strikes that are within 0.1% moneyness of each other
+    if moneyness_precision > 0:
+        # Round strikes to nearest increment based on precision
+        strike_increment = base_price * moneyness_precision
+        df['strike'] = (df['strike'] / strike_increment).round() * strike_increment
+    
+    return df
+
 def fetch_options_for_date(ticker, date, exposure_metric="Open Interest", delta_adjusted: bool = False, calculate_in_notional: bool = True, S=None):
     if client is None:
         raise Exception("Schwab API client not initialized. Check your environment variables.")
@@ -456,18 +501,8 @@ def fetch_options_for_date(ticker, date, exposure_metric="Open Interest", delta_
         
         if base_calls_raw.empty and base_puts_raw.empty:
             return pd.DataFrame(), pd.DataFrame()
-            
-        # Build strike grid from actual base strikes
-        base_strikes = np.array(sorted(set(list(base_calls_raw['strike'].unique()) + list(base_puts_raw['strike'].unique()))))
 
-        # Step 2: Define Strike Mapping Function
-        def find_nearest_base_strike(etf_strike, etf_price, b_price, b_strikes):
-            etf_moneyness = etf_strike / etf_price
-            target_base_strike = etf_moneyness * b_price
-            idx = np.abs(b_strikes - target_base_strike).argmin()
-            return b_strikes[idx]
-
-        # Step 3: Components to combine
+        # Step 2: Components to combine
         component_tickers = ["$SPX", "SPY", "QQQ", "IWM"]
         calls_list = []
         puts_list = []
@@ -507,7 +542,7 @@ def fetch_options_for_date(ticker, date, exposure_metric="Open Interest", delta_
         # Calculate reference scale: use median absolute GEX so each component contributes equally
         median_gex = np.median([cd['total_abs_gex'] for cd in component_data])
         
-        # Second pass: normalize exposures and map strikes
+        # Second pass: normalize exposures and map strikes using moneyness
         exposure_cols = ['GEX', 'DEX', 'VEX', 'Charm', 'Speed', 'Vomma', 'Color']
         
         for cd in component_data:
@@ -522,15 +557,13 @@ def fetch_options_for_date(ticker, date, exposure_metric="Open Interest", delta_
             # Process Calls
             if not c.empty:
                 c = c.copy()
-                # Map strikes to base strike grid
-                c['strike'] = c['strike'].apply(lambda x: find_nearest_base_strike(x, comp_price, base_price, base_strikes))
                 
-                # Normalize exposures (scale to equal weight)
+                # Normalize exposures (scale to equal weight) before mapping
                 for col in exposure_cols:
                     if col in c.columns:
                         c[col] = c[col] * norm_factor
                 
-                # Normalize OI/Volume for display consistency
+                # Normalize OI/Volume for display consistency before mapping
                 total_oi = c['openInterest'].sum()
                 total_vol = c['volume'].sum()
                 if total_oi > 0:
@@ -538,19 +571,21 @@ def fetch_options_for_date(ticker, date, exposure_metric="Open Interest", delta_
                 if total_vol > 0:
                     c['volume'] = c['volume'] / total_vol * 1_000_000
                 
+                # Map strikes to base-equivalent using moneyness
+                c = map_to_base_strikes(c, comp_price, base_price)
+                
                 calls_list.append(c)
 
             # Process Puts
             if not p.empty:
                 p = p.copy()
-                p['strike'] = p['strike'].apply(lambda x: find_nearest_base_strike(x, comp_price, base_price, base_strikes))
                 
-                # Normalize exposures (scale to equal weight)
+                # Normalize exposures (scale to equal weight) before mapping
                 for col in exposure_cols:
                     if col in p.columns:
                         p[col] = p[col] * norm_factor
                 
-                # Normalize OI/Volume for display consistency
+                # Normalize OI/Volume for display consistency before mapping
                 total_oi = p['openInterest'].sum()
                 total_vol = p['volume'].sum()
                 if total_oi > 0:
@@ -558,9 +593,12 @@ def fetch_options_for_date(ticker, date, exposure_metric="Open Interest", delta_
                 if total_vol > 0:
                     p['volume'] = p['volume'] / total_vol * 1_000_000
                 
+                # Map strikes to base-equivalent using moneyness
+                p = map_to_base_strikes(p, comp_price, base_price)
+                
                 puts_list.append(p)
 
-        # Step 4: Combine and Aggregate by Strike
+        # Step 3: Combine and Aggregate by Strike
         combined_calls = pd.concat(calls_list, ignore_index=True) if calls_list else pd.DataFrame()
         combined_puts = pd.concat(puts_list, ignore_index=True) if puts_list else pd.DataFrame()
 
