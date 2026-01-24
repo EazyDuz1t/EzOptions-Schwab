@@ -444,146 +444,142 @@ def fetch_options_for_date(ticker, date, exposure_metric="Open Interest", delta_
         raise Exception("Schwab API client not initialized. Check your environment variables.")
     
     if ticker == "MARKET" or ticker == "MARKET2":
-        # Get prices for scaling
+        # Step 1: Initialize Base
         base_ticker = "$SPX" if ticker == "MARKET" else "SPY"
         base_price = S if S else get_current_price(base_ticker)
         
-        spy_price = get_current_price("SPY")
-        qqq_price = get_current_price("QQQ")
-        iwm_price = get_current_price("IWM")
-        
         if not base_price:
              return pd.DataFrame(), pd.DataFrame()
+
+        # Fetch Base chain to build strike grid
+        base_calls_raw, base_puts_raw = fetch_options_for_date(base_ticker, date, exposure_metric, delta_adjusted, calculate_in_notional)
         
-        # Determine strike rounding
-        spy_c, spy_p = pd.DataFrame(), pd.DataFrame()
-        if ticker == "MARKET":
-            strike_round = 10  # Standard $10 rounding for SPX base
-        else:
-            # For MARKET2 (SPY base), determine rounding from actual SPY strikes
-            try:
-                spy_c, spy_p = fetch_options_for_date("SPY", date, exposure_metric, delta_adjusted, calculate_in_notional)
-                all_spy_strikes = list(spy_c['strike']) + list(spy_p['strike'])
-                strike_round = get_strike_interval(all_spy_strikes) if all_spy_strikes else 1.0
-            except:
-                strike_round = 1.0
-        
+        if base_calls_raw.empty and base_puts_raw.empty:
+            return pd.DataFrame(), pd.DataFrame()
+            
+        # Build strike grid from actual base strikes
+        base_strikes = np.array(sorted(set(list(base_calls_raw['strike'].unique()) + list(base_puts_raw['strike'].unique()))))
+
+        # Step 2: Define Strike Mapping Function
+        def find_nearest_base_strike(etf_strike, etf_price, b_price, b_strikes):
+            etf_moneyness = etf_strike / etf_price
+            target_base_strike = etf_moneyness * b_price
+            idx = np.abs(b_strikes - target_base_strike).argmin()
+            return b_strikes[idx]
+
+        # Step 3: Components to combine
+        component_tickers = ["$SPX", "SPY", "QQQ", "IWM"]
         calls_list = []
         puts_list = []
-        
-        # Helper to fetch and scale by log-moneyness
-        def add_scaled_data(tick, etf_price):
-            try:
-                # Fetch ETF options
-                if tick == "SPY" and not spy_c.empty:
-                    c, p = spy_c, spy_p
-                else:
-                    c, p = fetch_options_for_date(tick, date, exposure_metric, delta_adjusted, calculate_in_notional)
-                
-                # Calculate scaling factor to bring ETF values up to base-equivalent notional
-                scale_factor = base_price / etf_price
-                
-                if not c.empty:
-                    c = c.copy()
-                    # Use log-moneyness for accurate strike mapping: ln(K/S)
-                    c['log_moneyness'] = np.log(c['strike'] / etf_price)
-                    # Map to base strikes and round for better aggregation
-                    c['strike'] = (base_price * np.exp(c['log_moneyness']) / strike_round).round() * strike_round
-                    c.drop(columns=['log_moneyness'], inplace=True)
-                    
-                    # Scale option prices by scale_factor (approximate, for display)
-                    for col in ['lastPrice', 'bid', 'ask', 'change']:
-                        if col in c.columns:
-                            c[col] = c[col] * scale_factor
-                    
-                    # Scale contracts to base-equivalent (e.g. 10 SPY contracts = 1 SPX contract)
-                    for col in ['openInterest', 'volume']:
-                        if col in c.columns:
-                            c[col] = c[col] / scale_factor
-                    
-                    # If not in notional mode, exposures are in 'shares' 
-                    # 100 shares of SPY != 100 shares of SPX, so must scale these too
-                    if not calculate_in_notional:
-                        exp_cols = ['GEX', 'DEX', 'VEX', 'Charm', 'Speed', 'Vomma', 'Color']
-                        for col in exp_cols:
-                            if col in c.columns:
-                                c[col] = c[col] / scale_factor
-                    
-                    calls_list.append(c)
-                
-                if not p.empty:
-                    p = p.copy()
-                    # Use log-moneyness for accurate strike mapping: ln(K/S)
-                    p['log_moneyness'] = np.log(p['strike'] / etf_price)
-                    # Map to base strikes and round
-                    p['strike'] = (base_price * np.exp(p['log_moneyness']) / strike_round).round() * strike_round
-                    p.drop(columns=['log_moneyness'], inplace=True)
-                    
-                    # Scale option prices by scale_factor (approximate, for display)
-                    for col in ['lastPrice', 'bid', 'ask', 'change']:
-                        if col in p.columns:
-                            p[col] = p[col] * scale_factor
-                    
-                    # Scale contracts to base-equivalent
-                    for col in ['openInterest', 'volume']:
-                        if col in p.columns:
-                            p[col] = p[col] / scale_factor
-                            
-                    # Scale exposures if not in notional mode
-                    if not calculate_in_notional:
-                        exp_cols = ['GEX', 'DEX', 'VEX', 'Charm', 'Speed', 'Vomma', 'Color']
-                        for col in exp_cols:
-                            if col in p.columns:
-                                p[col] = p[col] / scale_factor
-                    
-                    puts_list.append(p)
-            except Exception:
-                pass 
 
-        # Add scaled data from ETFs and Index
-        if ticker == "MARKET" and base_price:
-            add_scaled_data("$SPX", base_price)
+        # First pass: collect total exposure magnitudes for normalization
+        component_data = []
+        for comp_tick in component_tickers:
+            if comp_tick == base_ticker:
+                c, p = base_calls_raw.copy(), base_puts_raw.copy()
+                comp_price = base_price
+            else:
+                comp_price = get_current_price(comp_tick)
+                if not comp_price: continue
+                c, p = fetch_options_for_date(comp_tick, date, exposure_metric, delta_adjusted, calculate_in_notional)
+                c, p = c.copy() if not c.empty else c, p.copy() if not p.empty else p
             
-        if spy_price: add_scaled_data("SPY", spy_price)
-        if qqq_price: add_scaled_data("QQQ", qqq_price)
-        if iwm_price: add_scaled_data("IWM", iwm_price)
+            if c.empty and p.empty: continue
+            
+            # Calculate total absolute exposure for this component (for normalization)
+            total_abs_gex = 0
+            if not c.empty and 'GEX' in c.columns:
+                total_abs_gex += c['GEX'].abs().sum()
+            if not p.empty and 'GEX' in p.columns:
+                total_abs_gex += p['GEX'].abs().sum()
+            
+            component_data.append({
+                'ticker': comp_tick,
+                'price': comp_price,
+                'calls': c,
+                'puts': p,
+                'total_abs_gex': total_abs_gex if total_abs_gex > 0 else 1
+            })
         
+        if not component_data:
+            return pd.DataFrame(), pd.DataFrame()
+        
+        # Calculate reference scale: use median absolute GEX so each component contributes equally
+        median_gex = np.median([cd['total_abs_gex'] for cd in component_data])
+        
+        # Second pass: normalize exposures and map strikes
+        exposure_cols = ['GEX', 'DEX', 'VEX', 'Charm', 'Speed', 'Vomma', 'Color']
+        
+        for cd in component_data:
+            comp_tick = cd['ticker']
+            comp_price = cd['price']
+            c = cd['calls']
+            p = cd['puts']
+            
+            # Normalization factor: scale this component's exposures to match median
+            norm_factor = median_gex / cd['total_abs_gex'] if cd['total_abs_gex'] > 0 else 1
+            
+            # Process Calls
+            if not c.empty:
+                c = c.copy()
+                # Map strikes to base strike grid
+                c['strike'] = c['strike'].apply(lambda x: find_nearest_base_strike(x, comp_price, base_price, base_strikes))
+                
+                # Normalize exposures (scale to equal weight)
+                for col in exposure_cols:
+                    if col in c.columns:
+                        c[col] = c[col] * norm_factor
+                
+                # Normalize OI/Volume for display consistency
+                total_oi = c['openInterest'].sum()
+                total_vol = c['volume'].sum()
+                if total_oi > 0:
+                    c['openInterest'] = c['openInterest'] / total_oi * 1_000_000
+                if total_vol > 0:
+                    c['volume'] = c['volume'] / total_vol * 1_000_000
+                
+                calls_list.append(c)
+
+            # Process Puts
+            if not p.empty:
+                p = p.copy()
+                p['strike'] = p['strike'].apply(lambda x: find_nearest_base_strike(x, comp_price, base_price, base_strikes))
+                
+                # Normalize exposures (scale to equal weight)
+                for col in exposure_cols:
+                    if col in p.columns:
+                        p[col] = p[col] * norm_factor
+                
+                # Normalize OI/Volume for display consistency
+                total_oi = p['openInterest'].sum()
+                total_vol = p['volume'].sum()
+                if total_oi > 0:
+                    p['openInterest'] = p['openInterest'] / total_oi * 1_000_000
+                if total_vol > 0:
+                    p['volume'] = p['volume'] / total_vol * 1_000_000
+                
+                puts_list.append(p)
+
+        # Step 4: Combine and Aggregate by Strike
         combined_calls = pd.concat(calls_list, ignore_index=True) if calls_list else pd.DataFrame()
         combined_puts = pd.concat(puts_list, ignore_index=True) if puts_list else pd.DataFrame()
-        
-        # Aggregate by strike - sum up exposures from different ETFs at same strike
-        if not combined_calls.empty:
-            # Columns to sum
+
+        def aggregate_market_data(df):
+            if df.empty: return df
             sum_cols = ['openInterest', 'volume', 'GEX', 'DEX', 'VEX', 'Charm', 'Speed', 'Vomma', 'Color']
-            sum_cols = [c for c in sum_cols if c in combined_calls.columns]
-            # Columns to average (prices)
-            avg_cols = ['lastPrice', 'bid', 'ask', 'impliedVolatility']
-            avg_cols = [c for c in avg_cols if c in combined_calls.columns]
+            avg_cols = ['lastPrice', 'bid', 'ask', 'impliedVolatility', 'delta', 'gamma', 'vega', 'theta', 'rho']
             
-            agg_dict = {col: 'sum' for col in sum_cols}
-            agg_dict.update({col: 'mean' for col in avg_cols})
+            agg_dict = {col: 'sum' for col in sum_cols if col in df.columns}
+            agg_dict.update({col: 'mean' for col in avg_cols if col in df.columns})
             
-            # Keep first value for non-numeric columns
-            for col in combined_calls.columns:
+            for col in df.columns:
                 if col not in agg_dict and col != 'strike':
                     agg_dict[col] = 'first'
-            
-            combined_calls = combined_calls.groupby('strike', as_index=False).agg(agg_dict)
-        
-        if not combined_puts.empty:
-            sum_cols = ['openInterest', 'volume', 'GEX', 'DEX', 'VEX', 'Charm', 'Speed', 'Vomma', 'Color']
-            sum_cols = [c for c in sum_cols if c in combined_puts.columns]
-            avg_cols = ['lastPrice', 'bid', 'ask', 'impliedVolatility']
-            avg_cols = [c for c in avg_cols if c in combined_puts.columns]
-            
-            agg_dict = {col: 'sum' for col in sum_cols}
-            agg_dict.update({col: 'mean' for col in avg_cols})
-            
-            for col in combined_puts.columns:
-                if col not in agg_dict and col != 'strike':
-                    agg_dict[col] = 'first'
-            
-            combined_puts = combined_puts.groupby('strike', as_index=False).agg(agg_dict)
+                    
+            return df.groupby('strike', as_index=False).agg(agg_dict)
+
+        combined_calls = aggregate_market_data(combined_calls)
+        combined_puts = aggregate_market_data(combined_puts)
         
         return combined_calls, combined_puts
 
