@@ -439,50 +439,106 @@ def calculate_time_to_expiration(expiry_date):
         print(f"Error calculating time to expiration: {e}")
         return 0
 
-def map_to_base_strikes(df, etf_price, base_price, moneyness_precision=0.001):
+def map_to_base_strikes(df, etf_price, base_price, bucket_size=10):
     """
-    Maps ETF strikes to base-equivalent strikes using moneyness.
+    Maps ETF strikes to base-equivalent strikes using moneyness,
+    then distributes using a Gaussian kernel with adaptive bandwidth.
     
-    Instead of interpolating between base strikes (which creates synthetic data),
-    we calculate the exact moneyness of each ETF strike and convert it to what
-    that same moneyness would be at the base price level.
-    
-    Example: SPY $601 at spot $600 = 100.17% moneyness
-             At SPX spot $6000, this becomes strike $6010
-    
-    This preserves the exact economic relationship of each contract to its spot.
+    This provides smooth distribution across strikes while preserving
+    the exact economic relationship of each contract to its spot.
     
     Args:
         df: DataFrame with 'strike' column
         etf_price: Current ETF spot price
         base_price: Current base (SPX/SPY) spot price  
-        moneyness_precision: Precision for moneyness rounding (0.001 = 0.1%)
+        bucket_size: Strike bucket width in dollars (default $10)
     
     Returns:
-        DataFrame with strikes converted to base-equivalent values
+        DataFrame with strikes distributed to base buckets
     """
     if df.empty:
         return df
         
     df = df.copy()
     
-    # Store original values for reference
+    # Store original values for Greek calculations
     df['_original_strike'] = df['strike']
     df['_original_spot'] = etf_price
     
-    # Calculate moneyness (strike / spot) and convert to base-equivalent strike
-    # moneyness = strike / etf_price
-    # base_equivalent_strike = moneyness * base_price
-    df['strike'] = (df['strike'] / etf_price) * base_price
+    # Estimate ETF's typical strike spacing
+    sorted_strikes = np.sort(df['strike'].unique())
+    if len(sorted_strikes) > 1:
+        strike_diffs = np.diff(sorted_strikes)
+        etf_strike_spacing = np.median(strike_diffs[strike_diffs > 0])
+    else:
+        etf_strike_spacing = 1.0
     
-    # Optionally round to moneyness precision to help aggregation
-    # This groups strikes that are within 0.1% moneyness of each other
-    if moneyness_precision > 0:
-        # Round strikes to nearest increment based on precision
-        strike_increment = base_price * moneyness_precision
-        df['strike'] = (df['strike'] / strike_increment).round() * strike_increment
+    # Convert to base-equivalent spacing
+    base_equivalent_spacing = etf_strike_spacing * (base_price / etf_price)
     
-    return df
+    # Bandwidth (σ) = half of base-equivalent spacing
+    sigma = max(base_equivalent_spacing / 2, bucket_size / 2)
+    
+    # Calculate moneyness and base-equivalent strikes
+    moneyness = df['strike'] / etf_price
+    target_strikes = moneyness * base_price
+    
+    # Determine spread range
+    spread_range = min(max(int(np.ceil(3 * sigma / bucket_size)), 1), 5)
+    offsets = np.arange(-spread_range, spread_range + 1) * bucket_size
+    
+    result_dfs = []
+    
+    # Weight columns to distribute
+    weight_cols = ['openInterest', 'volume', 'GEX', 'DEX', 'VEX', 'Charm', 'Speed', 'Vomma', 'Color']
+    
+    for offset in offsets:
+        df_bucket = df.copy()
+        base_bucket = np.round(target_strikes / bucket_size) * bucket_size
+        bucket_strike = base_bucket + offset
+        distance = bucket_strike - target_strikes
+        
+        # Gaussian weight
+        weight = np.exp(-distance**2 / (2 * sigma**2))
+        
+        mask = weight > 0.01
+        if not mask.any():
+            continue
+            
+        df_bucket = df_bucket[mask].copy()
+        weight = weight[mask]
+        
+        df_bucket['strike'] = bucket_strike[mask]
+        df_bucket['_bucket_weight'] = weight
+        
+        # Scale by weight
+        for col in weight_cols:
+            if col in df_bucket.columns:
+                df_bucket[col] = df_bucket[col] * weight
+        
+        result_dfs.append(df_bucket)
+    
+    if not result_dfs:
+        df['strike'] = np.round(target_strikes / bucket_size) * bucket_size
+        df['_bucket_weight'] = 1.0
+        return df
+    
+    result = pd.concat(result_dfs, ignore_index=True)
+    
+    # Normalize weights so each original contract sums to 1.0
+    if '_original_strike' in result.columns:
+        weight_sums = result.groupby('_original_strike')['_bucket_weight'].transform('sum')
+        weight_sums = weight_sums.replace(0, 1)
+        norm_factor = 1.0 / weight_sums
+        norm_factor = norm_factor.replace([np.inf, -np.inf], 1.0).fillna(1.0)
+        
+        for col in weight_cols:
+            if col in result.columns:
+                result[col] = result[col] * norm_factor
+        
+        result['_bucket_weight'] = result['_bucket_weight'] * norm_factor
+    
+    return result
 
 def fetch_options_for_date(ticker, date, exposure_metric="Open Interest", delta_adjusted: bool = False, calculate_in_notional: bool = True, S=None):
     if client is None:
@@ -1062,7 +1118,7 @@ def get_option_expirations(ticker):
         return []
 
 def get_color_with_opacity(value, max_value, base_color, color_intensity=True):
-    """Get color with opacity based on value."""
+    """Get color with opacity based on value. Legacy function for backward compatibility."""
     if not color_intensity:
         opacity = 1.0  # Full opacity when color intensity is disabled
     else:
@@ -1077,7 +1133,92 @@ def get_color_with_opacity(value, max_value, base_color, color_intensity=True):
         return f'rgba({r}, {g}, {b}, {opacity})'
     return base_color
 
-def create_exposure_chart(calls, puts, exposure_type, title, S, strike_range=0.02, show_calls=True, show_puts=True, show_net=True, color_intensity=True, call_color='#00FF00', put_color='#FF0000', selected_expiries=None, perspective='Customer', horizontal=False, show_abs_gex_area=False, abs_gex_opacity=0.2, highlight_max_level=False, max_level_color='#800080'):
+def hex_to_rgba(hex_color, alpha=1.0):
+    """Convert hex color to rgba string with specified alpha."""
+    hex_color = hex_color.lstrip('#')
+    if len(hex_color) == 3:
+        hex_color = ''.join([c*2 for c in hex_color])
+    return f'rgba({int(hex_color[0:2], 16)}, {int(hex_color[2:4], 16)}, {int(hex_color[4:6], 16)}, {alpha})'
+
+def get_colors(base_color, values, max_val, coloring_mode='Solid'):
+    """
+    Apply coloring mode to a set of values.
+    
+    Args:
+        base_color: Hex color string (e.g., '#00FF00')
+        values: Array/list of numeric values
+        max_val: Maximum value for normalization
+        coloring_mode: 'Solid', 'Linear Intensity', or 'Ranked Intensity'
+    
+    Returns:
+        Either a single color string (Solid mode) or list of RGBA colors
+    """
+    # Solid mode: return base color as-is
+    if coloring_mode == 'Solid':
+        return base_color
+    
+    # Handle edge case
+    if max_val == 0:
+        return base_color
+    
+    # Convert to list if series/array
+    vals = values.tolist() if hasattr(values, 'tolist') else list(values)
+    
+    if coloring_mode == 'Linear Intensity':
+        # Linear mapping: opacity from 0.3 to 1.0
+        # Formula: 0.3 + 0.7 * (|value| / max_value)
+        return [hex_to_rgba(base_color, 0.3 + 0.7 * (abs(v) / max_val)) for v in vals]
+    
+    elif coloring_mode == 'Ranked Intensity':
+        # Exponential mapping: opacity from 0.1 to 1.0 with cubic power
+        # Formula: 0.1 + 0.9 * ((|value| / max_value) ^ 3)
+        # This aggressively fades lower values, making only top exposures bright
+        return [hex_to_rgba(base_color, 0.1 + 0.9 * ((abs(v) / max_val) ** 3)) for v in vals]
+    
+    else:
+        return base_color
+
+def get_net_colors(values, max_val, call_color, put_color, coloring_mode='Solid'):
+    """
+    Apply coloring mode to net exposure values (can be positive or negative).
+    Color is based on sign: positive = call_color, negative = put_color.
+    
+    Args:
+        values: Array/list of numeric values (can be negative)
+        max_val: Maximum absolute value for normalization
+        call_color: Hex color for positive values
+        put_color: Hex color for negative values
+        coloring_mode: 'Solid', 'Linear Intensity', or 'Ranked Intensity'
+    
+    Returns:
+        List of colors (either hex or RGBA based on mode)
+    """
+    vals = values.tolist() if hasattr(values, 'tolist') else list(values)
+    
+    if coloring_mode == 'Solid':
+        return [call_color if v >= 0 else put_color for v in vals]
+    
+    if max_val == 0:
+        return [call_color if v >= 0 else put_color for v in vals]
+    
+    colors = []
+    for val in vals:
+        base = call_color if val >= 0 else put_color
+        
+        if coloring_mode == 'Linear Intensity':
+            opacity = 0.3 + 0.7 * (abs(val) / max_val)
+            colors.append(hex_to_rgba(base, min(1.0, opacity)))
+        
+        elif coloring_mode == 'Ranked Intensity':
+            opacity = 0.1 + 0.9 * ((abs(val) / max_val) ** 3)
+            colors.append(hex_to_rgba(base, min(1.0, opacity)))
+        
+        else:  # Solid fallback
+            colors.append(base)
+    
+    return colors
+
+def create_exposure_chart(calls, puts, exposure_type, title, S, strike_range=0.02, show_calls=True, show_puts=True, show_net=True, coloring_mode='Solid', call_color='#00FF00', put_color='#FF0000', selected_expiries=None, perspective='Customer', horizontal=False, show_abs_gex_area=False, abs_gex_opacity=0.2, highlight_max_level=False, max_level_color='#800080'):
     # Ensure the exposure_type column exists
     if exposure_type not in calls.columns or exposure_type not in puts.columns:
         print(f"Warning: {exposure_type} not found in data")
@@ -1174,15 +1315,21 @@ def create_exposure_chart(calls, puts, exposure_type, title, S, strike_range=0.0
     text_color = '#CCCCCC'
     background_color = '#1E1E1E'
     
+    # Calculate max exposure for normalization across all data (calls, puts, net)
+    max_exposure = 1.0
+    all_abs_vals = []
+    if not calls_df.empty:
+        all_abs_vals.extend(calls_df[exposure_type].abs().tolist())
+    if not puts_df.empty:
+        all_abs_vals.extend(puts_df[exposure_type].abs().tolist())
+    if all_abs_vals:
+        max_exposure = max(all_abs_vals)
+    if max_exposure == 0:
+        max_exposure = 1.0  # Prevent division by zero
+    
     if show_calls and not calls_df.empty:
-        if color_intensity:
-            # Calculate color intensity for calls with proper scaling
-            max_call_value = max(abs(calls_df[exposure_type].max()), abs(calls_df[exposure_type].min()))
-            if max_call_value == 0:
-                max_call_value = 1  # Prevent division by zero
-            call_colors = [get_color_with_opacity(volume, max_call_value, call_color, color_intensity) for volume in calls_df[exposure_type]]
-        else:
-            call_colors = call_color
+        # Apply coloring mode
+        call_colors = get_colors(call_color, calls_df[exposure_type], max_exposure, coloring_mode)
         
         if horizontal:
             fig.add_trace(go.Bar(
@@ -1209,14 +1356,8 @@ def create_exposure_chart(calls, puts, exposure_type, title, S, strike_range=0.0
             ))
     
     if show_puts and not puts_df.empty:
-        if color_intensity:
-            # Calculate color intensity for puts with proper scaling
-            max_put_value = max(abs(puts_df[exposure_type].max()), abs(puts_df[exposure_type].min()))
-            if max_put_value == 0:
-                max_put_value = 1  # Prevent division by zero
-            put_colors = [get_color_with_opacity(volume, max_put_value, put_color, color_intensity) for volume in puts_df[exposure_type]]
-        else:
-            put_colors = put_color
+        # Apply coloring mode
+        put_colors = get_colors(put_color, puts_df[exposure_type], max_exposure, coloring_mode)
             
         if horizontal:
             fig.add_trace(go.Bar(
@@ -1264,17 +1405,13 @@ def create_exposure_chart(calls, puts, exposure_type, title, S, strike_range=0.0
                 
             net_exposure.append(net_value)
         
-        if color_intensity:
-            # Calculate color intensity for net values with proper scaling
-            max_net_value = max(abs(min(net_exposure)), abs(max(net_exposure)))
-            if max_net_value == 0:
-                max_net_value = 1  # Prevent division by zero
-            net_colors = []
-            for volume in net_exposure:
-                base_color = call_color if volume >= 0 else put_color
-                net_colors.append(get_color_with_opacity(volume, max_net_value, base_color, color_intensity))
-        else:
-            net_colors = [call_color if volume >= 0 else put_color for volume in net_exposure]
+        # Calculate max for net exposure normalization
+        max_net_exposure = max(abs(min(net_exposure)), abs(max(net_exposure))) if net_exposure else 1.0
+        if max_net_exposure == 0:
+            max_net_exposure = 1.0
+        
+        # Apply coloring mode for net values
+        net_colors = get_net_colors(net_exposure, max_net_exposure, call_color, put_color, coloring_mode)
         
         if horizontal:
             fig.add_trace(go.Bar(
@@ -1502,7 +1639,7 @@ def create_volume_chart(call_volume, put_volume, use_itm=True, call_color='#00FF
     
     return fig.to_json()
 
-def create_options_volume_chart(calls, puts, S, strike_range=0.02, call_color='#00FF00', put_color='#FF0000', color_intensity=True, show_calls=True, show_puts=True, show_net=True, selected_expiries=None, perspective='Customer', horizontal=False, highlight_max_level=False, max_level_color='#800080'):
+def create_options_volume_chart(calls, puts, S, strike_range=0.02, call_color='#00FF00', put_color='#FF0000', coloring_mode='Solid', show_calls=True, show_puts=True, show_net=True, selected_expiries=None, perspective='Customer', horizontal=False, highlight_max_level=False, max_level_color='#800080'):
     # Filter strikes within range
     min_strike = S * (1 - strike_range)
     max_strike = S * (1 + strike_range)
@@ -1520,18 +1657,22 @@ def create_options_volume_chart(calls, puts, S, strike_range=0.02, call_color='#
     # Create figure
     fig = go.Figure()
     
+    # Calculate max volume for normalization across all data
+    max_volume = 1.0
+    all_abs_vals = []
+    if not calls.empty:
+        all_abs_vals.extend(calls['volume'].abs().tolist())
+    if not puts.empty:
+        all_abs_vals.extend(puts['volume'].abs().tolist())
+    if all_abs_vals:
+        max_volume = max(all_abs_vals)
+    if max_volume == 0:
+        max_volume = 1.0
+    
     # Add call volume bars
     if show_calls and not calls.empty:
-        if color_intensity:
-            # Calculate color intensity for calls
-            max_call_volume = calls['volume'].max()
-            r = int(call_color[1:3], 16)
-            g = int(call_color[3:5], 16)
-            b = int(call_color[5:7], 16)
-            # Ensure opacity is between 0.1 and 1.0
-            call_colors = [get_color_with_opacity(volume, max_call_volume, call_color) for volume in calls['volume']]
-        else:
-            call_colors = call_color
+        # Apply coloring mode
+        call_colors = get_colors(call_color, calls['volume'], max_volume, coloring_mode)
             
         if horizontal:
             fig.add_trace(go.Bar(
@@ -1559,16 +1700,8 @@ def create_options_volume_chart(calls, puts, S, strike_range=0.02, call_color='#
     
     # Add put volume bars (as negative values)
     if show_puts and not puts.empty:
-        if color_intensity:
-            # Calculate color intensity for puts
-            max_put_volume = puts['volume'].max()
-            r = int(put_color[1:3], 16)
-            g = int(put_color[3:5], 16)
-            b = int(put_color[5:7], 16)
-            # Ensure opacity is between 0.1 and 1.0
-            put_colors = [get_color_with_opacity(volume, max_put_volume, put_color) for volume in puts['volume']]
-        else:
-            put_colors = put_color
+        # Apply coloring mode
+        put_colors = get_colors(put_color, puts['volume'], max_volume, coloring_mode)
             
         if horizontal:
             fig.add_trace(go.Bar(
@@ -1597,10 +1730,10 @@ def create_options_volume_chart(calls, puts, S, strike_range=0.02, call_color='#
     # Add net volume bars if enabled
     if show_net and not (calls.empty and puts.empty):
         # Create net volume by combining calls and puts
-        all_strikes = sorted(set(calls['strike'].tolist() + puts['strike'].tolist()))
+        all_strikes_list = sorted(set(calls['strike'].tolist() + puts['strike'].tolist()))
         net_volume = []
         
-        for strike in all_strikes:
+        for strike in all_strikes_list:
             call_vol = calls[calls['strike'] == strike]['volume'].sum() if not calls.empty else 0
             put_vol = puts[puts['strike'] == strike]['volume'].sum() if not puts.empty else 0
             net_vol = call_vol - put_vol
@@ -1611,21 +1744,17 @@ def create_options_volume_chart(calls, puts, S, strike_range=0.02, call_color='#
                 
             net_volume.append(net_vol)
         
-        if color_intensity:
-            # Calculate color intensity for net values
-            max_net_volume = max(abs(min(net_volume)), abs(max(net_volume)))
-            net_colors = []
-            for volume in net_volume:
-                if volume >= 0:
-                    net_colors.append(get_color_with_opacity(volume, max_net_volume, call_color))
-                else:
-                    net_colors.append(get_color_with_opacity(abs(volume), max_net_volume, put_color))
-        else:
-            net_colors = [call_color if volume >= 0 else put_color for volume in net_volume]
+        # Calculate max for net volume normalization
+        max_net_volume = max(abs(min(net_volume)), abs(max(net_volume))) if net_volume else 1.0
+        if max_net_volume == 0:
+            max_net_volume = 1.0
+        
+        # Apply coloring mode for net values
+        net_colors = get_net_colors(net_volume, max_net_volume, call_color, put_color, coloring_mode)
         
         if horizontal:
             fig.add_trace(go.Bar(
-                y=all_strikes,
+                y=all_strikes_list,
                 x=net_volume,
                 name='Net',
                 marker_color=net_colors,
@@ -1637,7 +1766,7 @@ def create_options_volume_chart(calls, puts, S, strike_range=0.02, call_color='#
             ))
         else:
             fig.add_trace(go.Bar(
-                x=all_strikes,
+                x=all_strikes_list,
                 y=net_volume,
                 name='Net',
                 marker_color=net_colors,
@@ -2707,7 +2836,7 @@ def create_historical_bubble_levels_chart(ticker, strike_range, call_color='#00F
 
 
 
-def create_premium_chart(calls, puts, S, strike_range=0.02, call_color='#00FF00', put_color='#FF0000', color_intensity=True, show_calls=True, show_puts=True, show_net=True, selected_expiries=None, perspective='Customer', horizontal=False, highlight_max_level=False, max_level_color='#800080'):
+def create_premium_chart(calls, puts, S, strike_range=0.02, call_color='#00FF00', put_color='#FF0000', coloring_mode='Solid', show_calls=True, show_puts=True, show_net=True, selected_expiries=None, perspective='Customer', horizontal=False, highlight_max_level=False, max_level_color='#800080'):
     # Filter strikes within range
     min_strike = S * (1 - strike_range)
     max_strike = S * (1 + strike_range)
@@ -2725,14 +2854,22 @@ def create_premium_chart(calls, puts, S, strike_range=0.02, call_color='#00FF00'
     # Create figure
     fig = go.Figure()
     
+    # Calculate max premium for normalization across all data
+    max_premium = 1.0
+    all_abs_vals = []
+    if not calls.empty:
+        all_abs_vals.extend(calls['lastPrice'].abs().tolist())
+    if not puts.empty:
+        all_abs_vals.extend(puts['lastPrice'].abs().tolist())
+    if all_abs_vals:
+        max_premium = max(all_abs_vals)
+    if max_premium == 0:
+        max_premium = 1.0
+    
     # Add call premium bars
     if show_calls and not calls.empty:
-        if color_intensity:
-            # Calculate color intensity for calls
-            max_call_premium = calls['lastPrice'].max()
-            call_colors = [get_color_with_opacity(premium, max_call_premium, call_color) for premium in calls['lastPrice']]
-        else:
-            call_colors = call_color
+        # Apply coloring mode
+        call_colors = get_colors(call_color, calls['lastPrice'], max_premium, coloring_mode)
             
         if horizontal:
             fig.add_trace(go.Bar(
@@ -2760,12 +2897,8 @@ def create_premium_chart(calls, puts, S, strike_range=0.02, call_color='#00FF00'
     
     # Add put premium bars
     if show_puts and not puts.empty:
-        if color_intensity:
-            # Calculate color intensity for puts
-            max_put_premium = puts['lastPrice'].max()
-            put_colors = [get_color_with_opacity(premium, max_put_premium, put_color) for premium in puts['lastPrice']]
-        else:
-            put_colors = put_color
+        # Apply coloring mode
+        put_colors = get_colors(put_color, puts['lastPrice'], max_premium, coloring_mode)
             
         if horizontal:
             fig.add_trace(go.Bar(
@@ -2794,10 +2927,10 @@ def create_premium_chart(calls, puts, S, strike_range=0.02, call_color='#00FF00'
     # Add net premium bars if enabled
     if show_net and not (calls.empty and puts.empty):
         # Create net premium by combining calls and puts
-        all_strikes = sorted(set(calls['strike'].tolist() + puts['strike'].tolist()))
+        all_strikes_list = sorted(set(calls['strike'].tolist() + puts['strike'].tolist()))
         net_premium = []
         
-        for strike in all_strikes:
+        for strike in all_strikes_list:
             call_prem = calls[calls['strike'] == strike]['lastPrice'].sum() if not calls.empty else 0
             put_prem = puts[puts['strike'] == strike]['lastPrice'].sum() if not puts.empty else 0
             net_prem = call_prem - put_prem
@@ -2808,21 +2941,17 @@ def create_premium_chart(calls, puts, S, strike_range=0.02, call_color='#00FF00'
                 
             net_premium.append(net_prem)
         
-        if color_intensity:
-            # Calculate color intensity for net values
-            max_net_premium = max(abs(min(net_premium)), abs(max(net_premium)))
-            net_colors = []
-            for premium in net_premium:
-                if premium >= 0:
-                    net_colors.append(get_color_with_opacity(premium, max_net_premium, call_color))
-                else:
-                    net_colors.append(get_color_with_opacity(abs(premium), max_net_premium, put_color))
-        else:
-            net_colors = [call_color if premium >= 0 else put_color for premium in net_premium]
+        # Calculate max for net premium normalization
+        max_net_premium = max(abs(min(net_premium)), abs(max(net_premium))) if net_premium else 1.0
+        if max_net_premium == 0:
+            max_net_premium = 1.0
+        
+        # Apply coloring mode for net values
+        net_colors = get_net_colors(net_premium, max_net_premium, call_color, put_color, coloring_mode)
         
         if horizontal:
             fig.add_trace(go.Bar(
-                y=all_strikes,
+                y=all_strikes_list,
                 x=net_premium,
                 name='Net',
                 marker_color=net_colors,
@@ -3773,8 +3902,12 @@ def index():
                         </select>
                     </div>
                     <div class="control-group">
-                        <input type="checkbox" id="color_intensity" checked>
-                        <label for="color_intensity">Color Intensity</label>
+                        <label for="coloring_mode">Coloring Mode:</label>
+                        <select id="coloring_mode" title="Solid: All bars same color | Linear: Gradual fade by value | Ranked: Only highest exposures are bright, others heavily muted">
+                            <option value="Solid" selected>Solid</option>
+                            <option value="Linear Intensity">Linear Intensity</option>
+                            <option value="Ranked Intensity">Ranked Intensity</option>
+                        </select>
                     </div>
                     <div class="control-group">
                         <label>Price Levels:</label>
@@ -3981,8 +4114,9 @@ def index():
             updateData();
         });
 
-        // Perspective listener
+        // Perspective and coloring mode listeners
         document.getElementById('perspective').addEventListener('change', updateData);
+        document.getElementById('coloring_mode').addEventListener('change', updateData);
         document.getElementById('exposure_metric').addEventListener('change', updateData);
         document.getElementById('levels_count').addEventListener('input', updateData);
         document.getElementById('abs_gex_opacity').addEventListener('input', updateData);
@@ -4035,7 +4169,7 @@ def index():
             const showCalls = document.getElementById('show_calls').checked;
             const showPuts = document.getElementById('show_puts').checked;
             const showNet = document.getElementById('show_net').checked;
-            const colorIntensity = document.getElementById('color_intensity').checked;
+            const coloringMode = document.getElementById('coloring_mode').value;
             const levelsTypes = Array.from(document.querySelectorAll('.levels-option input:checked')).map(cb => cb.value);
             const levelsCount = parseInt(document.getElementById('levels_count').value);
             const useHeikinAshi = document.getElementById('use_heikin_ashi').checked;
@@ -4082,7 +4216,7 @@ def index():
                     show_calls: showCalls,
                     show_puts: showPuts,
                     show_net: showNet,
-                    color_intensity: colorIntensity,
+                    coloring_mode: coloringMode,
                     levels_types: levelsTypes,
                     levels_count: levelsCount,
                     use_heikin_ashi: useHeikinAshi,
@@ -4606,7 +4740,7 @@ def index():
                 show_puts: document.getElementById('show_puts').checked,
                 show_net: document.getElementById('show_net').checked,
                 perspective: document.getElementById('perspective').value,
-                color_intensity: document.getElementById('color_intensity').checked,
+                coloring_mode: document.getElementById('coloring_mode').value,
                 levels_types: Array.from(document.querySelectorAll('.levels-option input:checked')).map(cb => cb.value),
                 levels_count: document.getElementById('levels_count').value,
                 use_heikin_ashi: document.getElementById('use_heikin_ashi').checked,
@@ -4654,7 +4788,13 @@ def index():
             if (settings.show_puts !== undefined) document.getElementById('show_puts').checked = settings.show_puts;
             if (settings.show_net !== undefined) document.getElementById('show_net').checked = settings.show_net;
             if (settings.perspective) document.getElementById('perspective').value = settings.perspective;
-            if (settings.color_intensity !== undefined) document.getElementById('color_intensity').checked = settings.color_intensity;
+            // Handle coloring_mode with migration from old color_intensity setting
+            if (settings.coloring_mode) {
+                document.getElementById('coloring_mode').value = settings.coloring_mode;
+            } else if (settings.color_intensity !== undefined) {
+                // Migrate old color_intensity boolean to new coloring_mode
+                document.getElementById('coloring_mode').value = settings.color_intensity ? 'Linear Intensity' : 'Solid';
+            }
             if (settings.levels_types) {
                 document.querySelectorAll('.levels-option input').forEach(cb => cb.checked = false);
                 settings.levels_types.forEach(type => {
@@ -4890,7 +5030,12 @@ def update():
         show_calls = data.get('show_calls', True)
         show_puts = data.get('show_puts', True)
         show_net = data.get('show_net', True)
-        color_intensity = data.get('color_intensity', True)
+        # Handle coloring_mode with migration from old color_intensity setting
+        coloring_mode = data.get('coloring_mode', None)
+        if coloring_mode is None:
+            # Migrate from old boolean color_intensity
+            old_color_intensity = data.get('color_intensity', True)
+            coloring_mode = 'Linear Intensity' if old_color_intensity else 'Solid'
         call_color = data.get('call_color', '#00ff00')
         put_color = data.get('put_color', '#ff0000')
         exposure_levels_types = data.get('levels_types', [])
@@ -4943,34 +5088,34 @@ def update():
                 response['charm_historical_bubble'] = f"data:image/png;base64,{base64.b64encode(img_bytes).decode('utf-8')}"
         
         if data.get('show_gamma', True):
-            response['gamma'] = create_exposure_chart(calls, puts, "GEX", "Gamma Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, color_intensity, call_color, put_color, expiry_dates, perspective, horizontal, show_abs_gex_area=show_abs_gex, abs_gex_opacity=abs_gex_opacity, highlight_max_level=highlight_max_level, max_level_color=max_level_color)
+            response['gamma'] = create_exposure_chart(calls, puts, "GEX", "Gamma Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, coloring_mode, call_color, put_color, expiry_dates, perspective, horizontal, show_abs_gex_area=show_abs_gex, abs_gex_opacity=abs_gex_opacity, highlight_max_level=highlight_max_level, max_level_color=max_level_color)
         
         if data.get('show_delta', True):
-            response['delta'] = create_exposure_chart(calls, puts, "DEX", "Delta Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, color_intensity, call_color, put_color, expiry_dates, perspective, horizontal, highlight_max_level=highlight_max_level, max_level_color=max_level_color)
+            response['delta'] = create_exposure_chart(calls, puts, "DEX", "Delta Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, coloring_mode, call_color, put_color, expiry_dates, perspective, horizontal, highlight_max_level=highlight_max_level, max_level_color=max_level_color)
         
         if data.get('show_vanna', True):
-            response['vanna'] = create_exposure_chart(calls, puts, "VEX", "Vanna Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, color_intensity, call_color, put_color, expiry_dates, perspective, horizontal, highlight_max_level=highlight_max_level, max_level_color=max_level_color)
+            response['vanna'] = create_exposure_chart(calls, puts, "VEX", "Vanna Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, coloring_mode, call_color, put_color, expiry_dates, perspective, horizontal, highlight_max_level=highlight_max_level, max_level_color=max_level_color)
         
         if data.get('show_charm', True):
-            response['charm'] = create_exposure_chart(calls, puts, "Charm", "Charm Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, color_intensity, call_color, put_color, expiry_dates, perspective, horizontal, highlight_max_level=highlight_max_level, max_level_color=max_level_color)
+            response['charm'] = create_exposure_chart(calls, puts, "Charm", "Charm Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, coloring_mode, call_color, put_color, expiry_dates, perspective, horizontal, highlight_max_level=highlight_max_level, max_level_color=max_level_color)
         
         if data.get('show_speed', True):
-            response['speed'] = create_exposure_chart(calls, puts, "Speed", "Speed Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, color_intensity, call_color, put_color, expiry_dates, perspective, horizontal, highlight_max_level=highlight_max_level, max_level_color=max_level_color)
+            response['speed'] = create_exposure_chart(calls, puts, "Speed", "Speed Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, coloring_mode, call_color, put_color, expiry_dates, perspective, horizontal, highlight_max_level=highlight_max_level, max_level_color=max_level_color)
         
         if data.get('show_vomma', True):
-            response['vomma'] = create_exposure_chart(calls, puts, "Vomma", "Vomma Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, color_intensity, call_color, put_color, expiry_dates, perspective, horizontal, highlight_max_level=highlight_max_level, max_level_color=max_level_color)
+            response['vomma'] = create_exposure_chart(calls, puts, "Vomma", "Vomma Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, coloring_mode, call_color, put_color, expiry_dates, perspective, horizontal, highlight_max_level=highlight_max_level, max_level_color=max_level_color)
 
         if data.get('show_color', True):
-            response['color'] = create_exposure_chart(calls, puts, "Color", "Color Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, color_intensity, call_color, put_color, expiry_dates, perspective, horizontal, highlight_max_level=highlight_max_level, max_level_color=max_level_color)
+            response['color'] = create_exposure_chart(calls, puts, "Color", "Color Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, coloring_mode, call_color, put_color, expiry_dates, perspective, horizontal, highlight_max_level=highlight_max_level, max_level_color=max_level_color)
         
         if data.get('show_volume', True):
             response['volume'] = create_volume_chart(call_volume, put_volume, use_range, call_color, put_color, expiry_dates)
         
         if data.get('show_options_volume', True):
-            response['options_volume'] = create_options_volume_chart(calls, puts, S, strike_range, call_color, put_color, color_intensity, show_calls, show_puts, show_net, expiry_dates, perspective, horizontal, highlight_max_level=highlight_max_level, max_level_color=max_level_color)
+            response['options_volume'] = create_options_volume_chart(calls, puts, S, strike_range, call_color, put_color, coloring_mode, show_calls, show_puts, show_net, expiry_dates, perspective, horizontal, highlight_max_level=highlight_max_level, max_level_color=max_level_color)
         
         if data.get('show_premium', True):
-            response['premium'] = create_premium_chart(calls, puts, S, strike_range, call_color, put_color, color_intensity, show_calls, show_puts, show_net, expiry_dates, perspective, horizontal, highlight_max_level=highlight_max_level, max_level_color=max_level_color)
+            response['premium'] = create_premium_chart(calls, puts, S, strike_range, call_color, put_color, coloring_mode, show_calls, show_puts, show_net, expiry_dates, perspective, horizontal, highlight_max_level=highlight_max_level, max_level_color=max_level_color)
         
         if data.get('show_large_trades', True):
             response['large_trades'] = create_large_trades_table(calls, puts, S, strike_range, call_color, put_color, expiry_dates)
