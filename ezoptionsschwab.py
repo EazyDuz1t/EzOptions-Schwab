@@ -12,7 +12,6 @@ import pytz
 import sqlite3
 from contextlib import closing
 from scipy.stats import norm
-from scipy.optimize import brentq
 import base64
 import warnings
 import json
@@ -716,15 +715,14 @@ def fetch_options_for_date(ticker, date, exposure_metric="Open Interest", delta_
             for strike, options in strikes.items():
                 for option in options:
                     if any(option['symbol'].startswith(t) for t in display_tickers):
-                        # Calculate implied volatility from mid price if possible
+                        # Calculate implied volatility using bid/ask prices
                         bid = float(option['bid'])
                         ask = float(option['ask'])
-                        market_price = (bid + ask) / 2 if (bid > 0 and ask > 0) else float(option['last'])
                         
                         K = float(option['strikePrice'])
                         vol = 0.2
-                        if market_price > 0:
-                            vol = calculate_implied_volatility(market_price, S, K, t, r, 'c', 0)
+                        if bid > 0 or ask > 0:
+                            vol = calculate_implied_volatility(bid, ask, S, K, t, r, 'c', 0)
                             if vol is None: vol = 0.2
                         
                         # Calculate Greeks
@@ -759,15 +757,14 @@ def fetch_options_for_date(ticker, date, exposure_metric="Open Interest", delta_
             for strike, options in strikes.items():
                 for option in options:
                     if any(option['symbol'].startswith(t) for t in display_tickers):
-                        # Calculate implied volatility from mid price if possible
+                        # Calculate implied volatility using bid/ask prices
                         bid = float(option['bid'])
                         ask = float(option['ask'])
-                        market_price = (bid + ask) / 2 if (bid > 0 and ask > 0) else float(option['last'])
                         
                         K = float(option['strikePrice'])
                         vol = 0.2
-                        if market_price > 0:
-                            vol = calculate_implied_volatility(market_price, S, K, t, r, 'p', 0)
+                        if bid > 0 or ask > 0:
+                            vol = calculate_implied_volatility(bid, ask, S, K, t, r, 'p', 0)
                             if vol is None: vol = 0.2
                         
                         # Calculate Greeks
@@ -865,28 +862,101 @@ def calculate_bs_vega(S, K, t, r, sigma, q=0):
     except:
         return 0.0
 
-def calculate_implied_volatility(price, S, K, t, r, flag, q=0):
-    """Calculate Implied Volatility using Newton-Raphson method."""
-    sigma = 0.5  # Initial guess
-    for i in range(100):
+def calculate_implied_volatility(bid, ask, S, K, t, r, flag, q=0):
+    """Calculate Implied Volatility using Newton-Raphson method with bid/ask prices.
+    
+    Uses the mid-price of bid/ask for the calculation. Falls back to bid or ask
+    if one is zero. Returns None if both are zero or invalid.
+    
+    Args:
+        bid: Bid price of the option
+        ask: Ask price of the option
+        S: Current underlying price
+        K: Strike price
+        t: Time to expiration in years
+        r: Risk-free rate
+        flag: 'c' for call, 'p' for put
+        q: Dividend yield (default 0)
+    
+    Returns:
+        Implied volatility or None if calculation fails
+    """
+    # Calculate mid-price from bid/ask
+    if bid > 0 and ask > 0:
+        price = (bid + ask) / 2
+    elif ask > 0:
+        price = ask
+    elif bid > 0:
+        price = bid
+    else:
+        return None
+    
+    # Validate inputs
+    if price <= 0 or S <= 0 or K <= 0 or t <= 0:
+        return None
+    
+    # Minimum IV floor for far ITM options (moneyness > 15% ITM)
+    MIN_IV = 0.05  # 5% minimum IV
+    moneyness = K / S
+    if flag == 'c':
+        is_far_itm = moneyness < 0.85  # Call is far ITM if strike << spot
+    else:
+        is_far_itm = moneyness > 1.15  # Put is far ITM if strike >> spot
+    
+    # Calculate intrinsic value
+    if flag == 'c':
+        intrinsic = max(S * np.exp(-q * t) - K * np.exp(-r * t), 0)
+    else:
+        intrinsic = max(K * np.exp(-r * t) - S * np.exp(-q * t), 0)
+    
+    # For far ITM options, check if time value is too small for reliable IV calc
+    time_value = price - intrinsic
+    if is_far_itm and time_value < 0.01:
+        return MIN_IV  # Return minimum IV for far ITM with negligible time value
+    
+    # If price is below intrinsic, use intrinsic as floor
+    if price < intrinsic:
+        price = intrinsic + 0.01
+    
+    # Initial guess using Brenner-Subrahmanyam approximation
+    sigma = np.sqrt(2 * np.pi / t) * price / S
+    sigma = max(0.01, min(sigma, 3.0))  # Bound initial guess
+    
+    # Newton-Raphson iteration with improved convergence
+    max_iterations = 100
+    tolerance = 1e-6
+    
+    for i in range(max_iterations):
         bs_price = calculate_bs_price(flag, S, K, t, r, sigma, q)
-        diff = price - bs_price
-        
-        if abs(diff) < 1e-5:
-            return sigma
-            
-        vega = calculate_bs_vega(S, K, t, r, sigma, q)
-        if abs(vega) < 1e-8:
+        if bs_price is None:
             return None
             
-        sigma = sigma + diff / vega
+        diff = price - bs_price
         
-        if sigma <= 0:
-            sigma = 0.001 # Reset if negative
-        if sigma > 5:
-            sigma = 5.0 # Cap if too high
-            
-    return 0.2 # Default if failed
+        # Check for convergence
+        if abs(diff) < tolerance:
+            return max(sigma, MIN_IV)  # Enforce minimum IV floor
+        
+        vega = calculate_bs_vega(S, K, t, r, sigma, q)
+        
+        # If vega is too small, use bisection step instead
+        if abs(vega) < 1e-10:
+            # Try bisection approach
+            if diff > 0:
+                sigma = sigma * 1.5
+            else:
+                sigma = sigma * 0.5
+        else:
+            # Newton-Raphson step with damping for stability
+            step = diff / vega
+            # Limit step size to prevent overshooting
+            step = max(-sigma * 0.5, min(step, sigma * 2.0))
+            sigma = sigma + step
+        
+        # Keep sigma in reasonable bounds
+        sigma = max(MIN_IV, min(sigma, 5.0))
+    
+    return max(sigma, MIN_IV)  # Return last sigma with minimum IV floor
 
 def calculate_greeks(flag, S, K, t, sigma, r=0.02, q=0):
     """Calculate delta, gamma, vega, vanna."""
