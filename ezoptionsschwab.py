@@ -3388,6 +3388,9 @@ def index():
 <html>
 <head>
     <title>EzOptions - Schwab</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <meta name="mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-capable" content="yes">
     <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
     <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
     <style>
@@ -3889,6 +3892,103 @@ def index():
             font-weight: bold;
             font-size: 18px;
         }
+        
+        /* Mobile responsive styles */
+        @media screen and (max-width: 768px) {
+            .container {
+                width: 100%;
+                padding: 10px;
+            }
+            .header {
+                padding: 10px;
+            }
+            .header-top, .header-bottom {
+                flex-direction: column;
+                align-items: stretch;
+            }
+            .controls {
+                flex-direction: column;
+                width: 100%;
+            }
+            .control-group {
+                width: 100%;
+                justify-content: space-between;
+                min-height: 44px; /* Touch-friendly height */
+            }
+            .control-group label {
+                font-size: 14px;
+            }
+            input[type="text"], select {
+                min-width: 100px;
+                font-size: 16px; /* Prevent zoom on iOS */
+                min-height: 44px;
+            }
+            input[type="range"] {
+                width: 100px;
+            }
+            .expiry-dropdown, .levels-dropdown {
+                width: 100%;
+            }
+            .expiry-display, .levels-display {
+                min-height: 44px;
+                display: flex;
+                align-items: center;
+            }
+            .chart-selector {
+                flex-direction: column;
+            }
+            .chart-checkbox {
+                width: 100%;
+                min-height: 44px;
+                display: flex;
+                align-items: center;
+            }
+            .chart-checkbox input[type="checkbox"] {
+                width: 22px;
+                height: 22px;
+            }
+            .charts-grid.two-charts,
+            .charts-grid.three-charts,
+            .charts-grid.four-charts,
+            .charts-grid.many-charts {
+                grid-template-columns: 1fr;
+            }
+            .historical-bubbles-row.two-bubbles,
+            .historical-bubbles-row.three-bubbles,
+            .historical-bubbles-row.four-bubbles {
+                grid-template-columns: 1fr;
+            }
+            .chart-container {
+                height: 350px;
+            }
+            .historical-bubble-container {
+                height: 350px;
+            }
+            .price-info {
+                flex-direction: column;
+                align-items: flex-start;
+                font-size: 1em;
+            }
+            .stream-control button, .settings-control button {
+                min-height: 44px;
+                padding: 10px 16px;
+            }
+            button {
+                min-height: 44px;
+            }
+        }
+        
+        @media screen and (max-width: 480px) {
+            .title {
+                font-size: 1.2em;
+            }
+            .chart-container {
+                height: 300px;
+            }
+            .historical-bubble-container {
+                height: 300px;
+            }
+        }
     </style>
 </head>
 <body>
@@ -4130,13 +4230,14 @@ def index():
         let charts = {};
         let updateInterval;
         let lastUpdateTime = 0;
-        let chartRevisions = {}; // Store chart revisions
         let callColor = '#00FF00';
         let putColor = '#FF0000';
         let maxLevelColor = '#800080';
         let lastData = {}; // Store last received data
         let updateInProgress = false;
         let isStreaming = true;
+        let savedScrollPosition = 0; // Track scroll position
+        let chartContainerCache = {}; // Cache for chart containers to prevent recreation
         
         function showError(message) {
             const notification = document.getElementById('error-notification');
@@ -4337,6 +4438,9 @@ def index():
         }
         
         function updateCharts(data) {
+            // Save scroll position before any DOM changes
+            savedScrollPosition = window.scrollY || window.pageYOffset;
+            
             const selectedCharts = {
                 price: document.getElementById('price').checked,
                 gex_historical_bubble: document.getElementById('gex_historical_bubble').checked,
@@ -4373,17 +4477,22 @@ def index():
                 
                 const chartData = JSON.parse(data.price);
                 
-                // Preserve user's chart manipulation state
-                if (!chartRevisions.price) {
-                    chartRevisions.price = Date.now();
-                }
-                chartData.layout.uirevision = chartRevisions.price;
-                
                 // Configure chart sizing to fill container
                 chartData.layout.autosize = true;
                 chartData.layout.width = null;
                 chartData.layout.height = null;
                 chartData.layout.margin = {l: 50, r: 120, t: 30, b: 20};
+                
+                // Ensure axes auto-scale with new data
+                if (chartData.layout.xaxis) {
+                    chartData.layout.xaxis.autorange = true;
+                }
+                if (chartData.layout.yaxis) {
+                    chartData.layout.yaxis.autorange = true;
+                }
+                if (chartData.layout.yaxis2) {
+                    chartData.layout.yaxis2.autorange = true;
+                }
                 
                 // Update chart colors
                 if (chartData.data[0].type === 'candlestick') {
@@ -4393,7 +4502,6 @@ def index():
                     chartData.data[0].decreasing.fillcolor = putColor;
                 }
                 
-                // Simplified update logic with preserved state
                 const config = {
                     responsive: true,
                     displayModeBar: true,
@@ -4405,20 +4513,7 @@ def index():
                 };
                 
                 if (charts.price) {
-                    // Get current view state before update
-                    const currentView = Plotly.relayout('price-chart', {});
-                    
-                    // Update the chart while preserving the view
-                    Plotly.react('price-chart', chartData.data, {
-                        ...chartData.layout,
-                        ...currentView
-                    }, {
-                        ...config,
-                        animate: false,
-                        transition: {
-                            duration: 0
-                        }
-                    });
+                    Plotly.react('price-chart', chartData.data, chartData.layout, config);
                 } else {
                     charts.price = Plotly.newPlot('price-chart', chartData.data, chartData.layout, config);
                 }
@@ -4427,7 +4522,6 @@ def index():
                 if (priceContainer) {
                     priceContainer.style.display = 'none';
                     delete charts.price;
-                    delete chartRevisions.price;
                 }
             }
             
@@ -4438,50 +4532,69 @@ def index():
             // Count enabled historical bubble levels
             const enabledBubbles = historicalBubbles.filter(bubbleType => selectedCharts[bubbleType]);
             
-            // Clear existing containers and classes
-            historicalBubblesRow.innerHTML = '';
-            historicalBubblesRow.className = 'historical-bubbles-row';
+            // Only rebuild containers if the set of enabled bubbles changed
+            const currentBubbleIds = Array.from(historicalBubblesRow.querySelectorAll('.historical-bubble-container')).map(el => el.dataset.bubbleType || '');
+            const needsRebuild = enabledBubbles.length !== currentBubbleIds.length || 
+                                 !enabledBubbles.every((b, i) => currentBubbleIds[i] === b);
             
-            // Hide the row if no bubbles are enabled
-            if (enabledBubbles.length === 0) {
-                historicalBubblesRow.style.display = 'none';
-            } else {
-                historicalBubblesRow.style.display = 'grid';
-                
-                // Add appropriate class based on number of enabled bubbles
-                if (enabledBubbles.length === 1) {
-                    historicalBubblesRow.classList.add('one-bubble');
-                } else if (enabledBubbles.length === 2) {
-                    historicalBubblesRow.classList.add('two-bubbles');
-                } else if (enabledBubbles.length === 3) {
-                    historicalBubblesRow.classList.add('three-bubbles');
-                } else if (enabledBubbles.length === 4) {
-                    historicalBubblesRow.classList.add('four-bubbles');
-                }
-                
-                // Add or update selected historical bubble levels
-                enabledBubbles.forEach(bubbleType => {
-                    const bubbleContainer = document.createElement('div');
-                    bubbleContainer.className = 'historical-bubble-container';
+            if (needsRebuild) {
+                // Clear existing containers and classes
+                historicalBubblesRow.innerHTML = '';
+                historicalBubblesRow.className = 'historical-bubbles-row';
+            
+                // Hide the row if no bubbles are enabled
+                if (enabledBubbles.length === 0) {
+                    historicalBubblesRow.style.display = 'none';
+                } else {
+                    historicalBubblesRow.style.display = 'grid';
                     
-                    const chartDiv = document.createElement('div');
-                    chartDiv.className = 'chart-container';
-                    chartDiv.id = `${bubbleType.replace('_', '-')}-chart`;
-                    
-                    // Create image element
-                    const img = document.createElement('img');
-                    img.style.width = '100%';
-                    img.style.height = '100%';
-                    img.style.objectFit = 'contain';
-                    img.style.imageRendering = 'crisp-edges';
-                    
-                    if (data[bubbleType]) {
-                        img.src = data[bubbleType];
+                    // Add appropriate class based on number of enabled bubbles
+                    if (enabledBubbles.length === 1) {
+                        historicalBubblesRow.classList.add('one-bubble');
+                    } else if (enabledBubbles.length === 2) {
+                        historicalBubblesRow.classList.add('two-bubbles');
+                    } else if (enabledBubbles.length === 3) {
+                        historicalBubblesRow.classList.add('three-bubbles');
+                    } else if (enabledBubbles.length === 4) {
+                        historicalBubblesRow.classList.add('four-bubbles');
                     }
                     
-                    chartDiv.appendChild(img);
-                    bubbleContainer.appendChild(chartDiv);
-                    historicalBubblesRow.appendChild(bubbleContainer);
+                    // Add or update selected historical bubble levels
+                    enabledBubbles.forEach(bubbleType => {
+                        const bubbleContainer = document.createElement('div');
+                        bubbleContainer.className = 'historical-bubble-container';
+                        bubbleContainer.dataset.bubbleType = bubbleType;
+                        
+                        const chartDiv = document.createElement('div');
+                        chartDiv.className = 'chart-container';
+                        chartDiv.id = `${bubbleType.replace('_', '-')}-chart`;
+                        
+                        // Create image element
+                        const img = document.createElement('img');
+                        img.style.width = '100%';
+                        img.style.height = '100%';
+                        img.style.objectFit = 'contain';
+                        img.style.imageRendering = 'crisp-edges';
+                        img.dataset.bubbleType = bubbleType;
+                        
+                        if (data[bubbleType]) {
+                            img.src = data[bubbleType];
+                        }
+                        
+                        chartDiv.appendChild(img);
+                        bubbleContainer.appendChild(chartDiv);
+                        historicalBubblesRow.appendChild(bubbleContainer);
+                    });
+                }
+            } else {
+                // Just update the image sources without rebuilding DOM
+                enabledBubbles.forEach(bubbleType => {
+                    if (data[bubbleType]) {
+                        const img = historicalBubblesRow.querySelector(`img[data-bubble-type="${bubbleType}"]`);
+                        if (img && img.src !== data[bubbleType]) {
+                            img.src = data[bubbleType];
+                        }
+                    }
                 });
             }
             
@@ -4489,7 +4602,6 @@ def index():
             historicalBubbles.forEach(bubbleType => {
                 if (!selectedCharts[bubbleType]) {
                     delete charts[bubbleType];
-                    delete chartRevisions[bubbleType];
                 }
             });
             
@@ -4499,46 +4611,71 @@ def index():
                 chartsGrid = document.createElement('div');
                 chartsGrid.className = 'charts-grid';
                 document.getElementById('chart-grid').appendChild(chartsGrid);
-            } else {
-                // Clear existing containers and classes
-                chartsGrid.innerHTML = '';
-                chartsGrid.className = 'charts-grid';
             }
+            
+            // Check if we need to rebuild the grid (enabled charts changed)
+            const currentChartIds = Array.from(chartsGrid.querySelectorAll('.chart-container')).map(el => el.id.replace('-chart', ''));
             
             // Count enabled regular charts (excluding price and historical bubble levels)
             const regularCharts = Object.entries(selectedCharts).filter(([key, selected]) => 
                 selected && !['price'].includes(key) && !historicalBubbles.includes(key) && data[key]
             );
             
+            const regularChartIds = regularCharts.map(([key]) => key);
+            const needsGridRebuild = regularChartIds.length !== currentChartIds.length ||
+                                     !regularChartIds.every((id, i) => currentChartIds[i] === id);
+            
             // Hide the charts grid if no regular charts are enabled
             if (regularCharts.length === 0) {
                 chartsGrid.style.display = 'none';
+                chartsGrid.innerHTML = '';
             } else {
                 chartsGrid.style.display = 'grid';
                 
-                // Add appropriate class based on number of enabled charts
-                if (regularCharts.length === 1) {
-                    chartsGrid.classList.add('one-chart');
-                } else if (regularCharts.length === 2) {
-                    chartsGrid.classList.add('two-charts');
-                } else if (regularCharts.length === 3) {
-                    chartsGrid.classList.add('three-charts');
-                } else if (regularCharts.length === 4) {
-                    chartsGrid.classList.add('four-charts');
-                } else {
-                    chartsGrid.classList.add('many-charts');
+                // Only rebuild if chart selection changed
+                if (needsGridRebuild) {
+                    chartsGrid.innerHTML = '';
+                    chartsGrid.className = 'charts-grid';
+                    
+                    // Add appropriate class based on number of enabled charts
+                    if (regularCharts.length === 1) {
+                        chartsGrid.classList.add('one-chart');
+                    } else if (regularCharts.length === 2) {
+                        chartsGrid.classList.add('two-charts');
+                    } else if (regularCharts.length === 3) {
+                        chartsGrid.classList.add('three-charts');
+                    } else if (regularCharts.length === 4) {
+                        chartsGrid.classList.add('four-charts');
+                    } else {
+                        chartsGrid.classList.add('many-charts');
+                    }
+                    
+                    regularCharts.forEach(([key, selected]) => {
+                        const newContainer = document.createElement('div');
+                        newContainer.className = 'chart-container';
+                        newContainer.id = `${key}-chart`;
+                        chartsGrid.appendChild(newContainer);
+                        chartContainerCache[key] = newContainer;
+                    });
                 }
                 
+                // Update chart data
                 regularCharts.forEach(([key, selected]) => {
-                    const newContainer = document.createElement('div');
-                    newContainer.className = 'chart-container';
-                    newContainer.id = `${key}-chart`;
-                    chartsGrid.appendChild(newContainer);
+                    let container = document.getElementById(`${key}-chart`);
+                    if (!container) {
+                        container = document.createElement('div');
+                        container.className = 'chart-container';
+                        container.id = `${key}-chart`;
+                        chartsGrid.appendChild(container);
+                    }
                     
                     try {
                         // Special handling for options chain (HTML table)
                         if (key === 'large_trades') {
-                            newContainer.innerHTML = data[key];
+                            // Only update if content changed
+                            if (container.innerHTML !== data[key]) {
+                                container.innerHTML = data[key];
+                            }
                         } else {
                             const chartData = JSON.parse(data[key]);
                             
@@ -4548,10 +4685,13 @@ def index():
                             chartData.layout.height = null;
                             chartData.layout.margin = {l: 50, r: 50, t: 50, b: 50};
                             
-                            if (!chartRevisions[key]) {
-                                chartRevisions[key] = Date.now();
+                            // Ensure axes auto-scale with new data
+                            if (chartData.layout.xaxis) {
+                                chartData.layout.xaxis.autorange = true;
                             }
-                            chartData.layout.uirevision = chartRevisions[key];
+                            if (chartData.layout.yaxis) {
+                                chartData.layout.yaxis.autorange = true;
+                            }
                             
                             chartData.layout.plot_bgcolor = '#1E1E1E';
                             chartData.layout.paper_bgcolor = '#1E1E1E';
@@ -4566,13 +4706,7 @@ def index():
                             };
                             
                             if (charts[key]) {
-                                Plotly.react(`${key}-chart`, chartData.data, chartData.layout, {
-                                    ...config,
-                                    animate: false,
-                                    transition: {
-                                        duration: 0
-                                    }
-                                });
+                                Plotly.react(`${key}-chart`, chartData.data, chartData.layout, config);
                             } else {
                                 charts[key] = Plotly.newPlot(`${key}-chart`, chartData.data, chartData.layout, config);
                             }
@@ -4591,11 +4725,14 @@ def index():
                         container.remove();
                     }
                     delete charts[key];
-                    delete chartRevisions[key];
+                    delete chartContainerCache[key];
                 }
             });
             
-
+            // Restore scroll position after DOM updates
+            requestAnimationFrame(() => {
+                window.scrollTo(0, savedScrollPosition);
+            });
         }
         
         function updatePriceInfo(info) {
