@@ -343,6 +343,8 @@ def format_display_ticker(ticker):
     elif ticker in ['$SPX', 'SPX']:
         # For SPX, return SPXW for options symbols and $SPX for underlying
         return ['SPXW', '$SPX']
+    elif ticker == 'MARKET2':
+        return ['SPY', 'QQQ', 'IWM']
     return [ticker]
 
 def format_large_number(num):
@@ -558,7 +560,17 @@ def fetch_options_for_date(ticker, date, exposure_metric="Open Interest", delta_
             return pd.DataFrame(), pd.DataFrame()
 
         # Step 2: Components to combine
-        component_tickers = ["$SPX", "SPY", "QQQ", "IWM"]
+        if ticker == "MARKET":
+            bucket_size = 10
+            component_tickers = ["$SPX", "SPY", "QQQ", "IWM"]
+        else:
+            # Calculate appropriate bucket size from base chain (SPY) for MARKET2
+            base_all_strikes = []
+            if not base_calls_raw.empty: base_all_strikes.extend(base_calls_raw['strike'].tolist())
+            if not base_puts_raw.empty: base_all_strikes.extend(base_puts_raw['strike'].tolist())
+            bucket_size = get_strike_interval(base_all_strikes) if base_all_strikes else 1.0
+            component_tickers = ["SPY", "QQQ", "IWM"]
+        
         calls_list = []
         puts_list = []
 
@@ -627,7 +639,7 @@ def fetch_options_for_date(ticker, date, exposure_metric="Open Interest", delta_
                     c['volume'] = c['volume'] / total_vol * 1_000_000
                 
                 # Map strikes to base-equivalent using moneyness
-                c = map_to_base_strikes(c, comp_price, base_price)
+                c = map_to_base_strikes(c, comp_price, base_price, bucket_size=bucket_size)
                 
                 calls_list.append(c)
 
@@ -649,7 +661,7 @@ def fetch_options_for_date(ticker, date, exposure_metric="Open Interest", delta_
                     p['volume'] = p['volume'] / total_vol * 1_000_000
                 
                 # Map strikes to base-equivalent using moneyness
-                p = map_to_base_strikes(p, comp_price, base_price)
+                p = map_to_base_strikes(p, comp_price, base_price, bucket_size=bucket_size)
                 
                 puts_list.append(p)
 
@@ -2013,7 +2025,7 @@ def update_options_chain(ticker, expiration_date=None):
     except Exception as e:
         print(f"Error updating options chain: {e}")
 
-def get_price_history(ticker):
+def get_price_history(ticker, timeframe=1):
     if ticker == "MARKET":
         ticker = "$SPX"
     elif ticker == "MARKET2":
@@ -2033,7 +2045,7 @@ def get_price_history(ticker):
             periodType="day",
             period=5,  # Get 5 days of data
             frequencyType="minute",
-            frequency=1,
+            frequency=timeframe,
             startDate=int(start_date.timestamp() * 1000),
             endDate=int(end_date.timestamp() * 1000),
             needExtendedHoursData=True
@@ -4006,6 +4018,16 @@ def index():
                         <input type="text" id="ticker" placeholder="Enter Ticker" value="SPY" title="Enter a ticker symbol (e.g., SPY, AAPL) or special aggregate tickers: 'MARKET' (SPX base) or 'MARKET2' (SPY base)">
                     </div>
                     <div class="control-group">
+                        <label for="timeframe">Timeframe:</label>
+                        <select id="timeframe">
+                            <option value="1">1 min</option>
+                            <option value="5">5 min</option>
+                            <option value="15">15 min</option>
+                            <option value="30">30 min</option>
+                            <option value="60">1 hour</option>
+                        </select>
+                    </div>
+                    <div class="control-group">
                         <label>Expiry:</label>
                         <div class="expiry-dropdown">
                             <div class="expiry-display" id="expiry-display">
@@ -4286,6 +4308,7 @@ def index():
         });
 
         // Perspective and coloring mode listeners
+        document.getElementById('timeframe').addEventListener('change', updateData);
         document.getElementById('perspective').addEventListener('change', updateData);
         document.getElementById('coloring_mode').addEventListener('change', updateData);
         document.getElementById('exposure_metric').addEventListener('change', updateData);
@@ -4384,6 +4407,7 @@ def index():
                 body: JSON.stringify({ 
                     ticker, 
                     expiry,
+                    timeframe: document.getElementById('timeframe').value,
                     show_calls: showCalls,
                     show_puts: showPuts,
                     show_net: showNet,
@@ -4939,6 +4963,7 @@ def index():
         function gatherSettings() {
             return {
                 ticker: document.getElementById('ticker').value,
+                timeframe: document.getElementById('timeframe').value,
                 strike_range: document.getElementById('strike_range').value,
                 exposure_metric: document.getElementById('exposure_metric').value,
                 delta_adjusted_exposures: document.getElementById('delta_adjusted_exposures').checked,
@@ -4984,6 +5009,7 @@ def index():
         
         function applySettings(settings) {
             if (settings.ticker) document.getElementById('ticker').value = settings.ticker;
+            if (settings.timeframe) document.getElementById('timeframe').value = settings.timeframe;
             if (settings.strike_range) {
                 document.getElementById('strike_range').value = settings.strike_range;
                 document.getElementById('strike_range_value').textContent = settings.strike_range + '%';
@@ -5199,13 +5225,16 @@ def update():
         # Store centroid data
         store_centroid_data(ticker, S, calls, puts)
         
-        # Clear old data at the end of the day
+        # Clear centroid data at the end of the day
         current_time = datetime.now()
         if current_time.hour == 23 and current_time.minute == 59:
             clear_old_data()
         
+        # Get timeframe from request
+        timeframe = int(data.get('timeframe', 1))
+
         # Get fresh price data
-        price_data = get_price_history(ticker)
+        price_data = get_price_history(ticker, timeframe=timeframe)
         
         # Calculate volumes and other metrics
         use_range = data.get('use_range', False)  # Rename to use_range for clarity
