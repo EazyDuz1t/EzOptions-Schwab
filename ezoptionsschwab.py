@@ -78,7 +78,7 @@ def init_db():
 
 # Function to store centroid data
 def store_centroid_data(ticker, price, calls, puts):
-    """Store call and put centroid data for 15-minute intervals during market hours only"""
+    """Store call and put centroid data for 5-minute intervals during market hours only"""
     # Get current time in Eastern Time
     est = pytz.timezone('US/Eastern')
     current_time_est = datetime.now(est)
@@ -96,19 +96,17 @@ def store_centroid_data(ticker, price, calls, puts):
     current_time = int(current_time_est.timestamp())
     current_date = current_time_est.strftime('%Y-%m-%d')
     
-    # Round to nearest 15-minute interval (900 seconds)
-    interval_timestamp = (current_time // 900) * 900
+    # Round to nearest 5-minute interval (300 seconds)
+    interval_timestamp = (current_time // 300) * 300
     
-    # Check if we already have data for this 15-minute interval
+    # Delete existing data for this 5-minute interval to update with most recent data
     with closing(sqlite3.connect('options_data.db')) as conn:
         with closing(conn.cursor()) as cursor:
             cursor.execute('''
-                SELECT id FROM centroid_data 
+                DELETE FROM centroid_data 
                 WHERE ticker = ? AND timestamp = ? AND date = ?
             ''', (ticker, interval_timestamp, current_date))
-            
-            if cursor.fetchone():
-                return  # Data already exists for this interval
+            conn.commit()
     
     # Calculate centroids (volume-weighted average strike prices)
     call_centroid = 0
@@ -185,12 +183,17 @@ def store_interval_data(ticker, price, strike_range, calls, puts):
     current_time = int(time.time())
     current_date = datetime.now().strftime('%Y-%m-%d')
     
-    # Only store data if it's a new 1-minute interval
-    last_data = get_interval_data(ticker)
-    if last_data:
-        last_timestamp = last_data[-1][0]
-        if current_time - last_timestamp < 60:  # Less than 60 seconds since last update
-            return
+    # Round to nearest 5-minute interval (300 seconds)
+    interval_timestamp = (current_time // 300) * 300
+    
+    # Delete existing data for this 5-minute interval to update with most recent data
+    with closing(sqlite3.connect('options_data.db')) as conn:
+        with closing(conn.cursor()) as cursor:
+            cursor.execute('''
+                DELETE FROM interval_data 
+                WHERE ticker = ? AND timestamp = ? AND date = ?
+            ''', (ticker, interval_timestamp, current_date))
+            conn.commit()
     
     # Calculate strike range boundaries
     min_strike = price * (1 - strike_range)
@@ -235,7 +238,7 @@ def store_interval_data(ticker, price, strike_range, calls, puts):
                 cursor.execute('''
                     INSERT INTO interval_data (ticker, timestamp, price, strike, net_gamma, net_delta, net_vanna, net_charm, date)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ''', (ticker, current_time, price, strike, exposure['gamma'], exposure['delta'], exposure['vanna'], exposure['charm'], current_date))
+                ''', (ticker, interval_timestamp, price, strike, exposure['gamma'], exposure['delta'], exposure['vanna'], exposure['charm'], current_date))
             conn.commit()
 
 # Function to get interval data
@@ -2676,22 +2679,22 @@ def create_large_trades_table(calls, puts, S, strike_range, call_color='#00FF00'
 
 
 def create_historical_bubble_levels_chart(ticker, strike_range, call_color='#00FFA3', put_color='#FF3B3B', exposure_type='gamma', perspective='Customer'):
-    """Create a chart showing price and exposure (gamma, delta, or vanna) over time for the last hour."""
+    """Create a chart showing price and exposure (gamma, delta, or vanna) over time for the full session."""
     # Get interval data from database
     interval_data = get_interval_data(ticker)
     
     if not interval_data:
         return None
     
-    # Calculate timestamp for 1 hour ago
-    one_hour_ago = int(time.time()) - 3600
+    # Get the latest price from the most recent data point to establish strike range
+    latest_price = interval_data[-1][1]
+    min_strike = latest_price * (1 - strike_range)
+    max_strike = latest_price * (1 + strike_range)
     
-    # Group data by timestamp and filter for last hour
+    # Group data by timestamp (show full session, no time filtering)
     data_by_time = {}
     for row in interval_data:
         timestamp = row[0]
-        if timestamp < one_hour_ago:
-            continue  # Skip data older than 1 hour
             
         price = row[1]
         strike = row[2]
@@ -2704,9 +2707,7 @@ def create_historical_bubble_levels_chart(ticker, strike_range, call_color='#00F
         else:
             net_charm = 0
         
-        # Filter strikes based on strike_range relative to current price
-        min_strike = price * (1 - strike_range)
-        max_strike = price * (1 + strike_range)
+        # Filter strikes based on fixed strike_range relative to latest price
         if strike < min_strike or strike > max_strike:
             continue  # Skip strikes outside the range
         
@@ -2868,7 +2869,7 @@ def create_historical_bubble_levels_chart(ticker, strike_range, call_color='#00F
             xanchor='center'
         ),
         xaxis=dict(
-            title='Time (Last Hour)',
+            title='Time (Full Session)',
             title_font=dict(color='#CCCCCC', size=18),  # Added size
             tickfont=dict(color='#CCCCCC', size=16),  # Added size
             gridcolor='#333333',
