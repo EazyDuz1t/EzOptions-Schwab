@@ -32,8 +32,10 @@ def not_found_error(error):
 
 @app.errorhandler(500)
 def internal_error(error):
+    # Expose the error message for API-like endpoints so the frontend can show details
+    msg = getattr(error, 'description', None) or str(error)
     if request.path.startswith('/api/') or request.path.startswith('/update') or request.path.startswith('/expirations'):
-        return jsonify({'error': 'Internal server error'}), 500
+        return jsonify({'error': msg}), 500
     return "500 - Internal Server Error", 500
 
 # Initialize SQLite database
@@ -852,8 +854,10 @@ def fetch_options_for_date(ticker, date, exposure_metric="Open Interest", delta_
         return calls, puts
         
     except Exception as e:
-        print(f"Error fetching options chain: {e}")
-        return pd.DataFrame(), pd.DataFrame()
+        msg = f"Error fetching options chain: {e}"
+        print(msg)
+        # Propagate so callers (API routes) can return the error to clients
+        raise Exception(msg)
 
 def calculate_bs_price(flag, S, K, t, r, sigma, q=0):
     """Calculate Black-Scholes option price with dividends."""
@@ -1163,7 +1167,7 @@ def calculate_greek_exposures(option, S, weight, delta_adjusted: bool = False, c
 
 def get_current_price(ticker):
     if client is None:
-        return None
+        raise Exception("Schwab API client not initialized. Check your environment variables.")
         
     if ticker == "MARKET":
         ticker = "$SPX"
@@ -1176,10 +1180,11 @@ def get_current_price(ticker):
         quote = quote_response.json()
         if quote and ticker in quote:
             return quote[ticker]['quote']['lastPrice']
-        return None
+        raise Exception("Malformed quote data returned from Schwab API")
     except Exception as e:
-        print(f"Error fetching price from Schwab API: {e}")
-        return None
+        msg = f"Error fetching price from Schwab API: {e}"
+        print(msg)
+        raise Exception(msg)
 
 def get_option_expirations(ticker):
     if client is None:
@@ -1199,8 +1204,10 @@ def get_option_expirations(ticker):
             return sorted(expiration_dates)
         return []
     except Exception as e:
-        print(f"Error fetching option expirations: {e}")
-        return []
+        msg = f"Error fetching option expirations: {e}"
+        print(msg)
+        # Propagate the error so route handlers or Flask error handlers can return it to clients
+        raise Exception(msg)
 
 def get_color_with_opacity(value, max_value, base_color, color_intensity=True):
     """Get color with opacity based on value. Legacy function for backward compatibility."""
@@ -2055,20 +2062,20 @@ def get_price_history(ticker, timeframe=1):
         )
         
         if not response.ok:
-            return None
-            
+            raise Exception(f"Failed to fetch price history: {response.status_code} {response.reason}")
+
         data = response.json()
         if not data or 'candles' not in data:
-            return None
-            
+            raise Exception("Malformed price history data from Schwab API")
+
         # Filter for market hours
         candles = filter_market_hours(data['candles'])
         if not candles:
-            return None
-            
+            raise Exception("No market-hour candles returned from Schwab API")
+
         # Sort candles by timestamp
         candles.sort(key=lambda x: x['datetime'])
-        
+
         # Get previous trading day's close
         prev_day_candles = []
         for candle in reversed(candles):
@@ -2077,18 +2084,18 @@ def get_price_history(ticker, timeframe=1):
                 prev_day_candles.append(candle)
                 if len(prev_day_candles) >= 30:  # Get at least 30 minutes of data
                     break
-        
+
         # Get the last candle of the previous trading day
         prev_day_close = prev_day_candles[-1]['close'] if prev_day_candles else None
-        
+
         return {
             'candles': candles,
             'prev_day_close': prev_day_close
         }
-        
     except Exception as e:
-        print(f"[DEBUG] Error fetching price history: {e}")
-        return None
+        msg = f"[DEBUG] Error fetching price history: {e}"
+        print(msg)
+        raise Exception(msg)
 
 def filter_market_hours(candles):
     """Filter candles to only include regular market hours (9:30 AM - 4:00 PM ET)"""
@@ -3376,6 +3383,7 @@ def fetch_options_for_multiple_dates(ticker, dates, exposure_metric="Open Intere
     """Fetch options for multiple expiration dates and combine them"""
     all_calls = []
     all_puts = []
+    last_exception = None
     
     for date in dates:
         try:
@@ -3385,13 +3393,18 @@ def fetch_options_for_multiple_dates(ticker, dates, exposure_metric="Open Intere
             if not puts.empty:
                 all_puts.append(puts)
         except Exception as e:
-            print(f"Error fetching options for {date}: {e}")
+            msg = f"Error fetching options for {date}: {e}"
+            print(msg)
+            last_exception = e
             continue
     
     # Combine all dataframes
     combined_calls = pd.concat(all_calls, ignore_index=True) if all_calls else pd.DataFrame()
     combined_puts = pd.concat(all_puts, ignore_index=True) if all_puts else pd.DataFrame()
-    
+    # If we couldn't fetch any data and there was an exception, propagate it
+    if combined_calls.empty and combined_puts.empty and last_exception is not None:
+        raise last_exception
+
     return combined_calls, combined_puts
 
 @app.route('/')
