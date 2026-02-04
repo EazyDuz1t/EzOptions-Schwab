@@ -53,12 +53,18 @@ def init_db():
                     net_delta REAL NOT NULL,
                     net_vanna REAL NOT NULL,
                     net_charm REAL,
+                    abs_gex_total REAL,
                     date TEXT NOT NULL
                 )
             ''')
             # Try to add net_charm column if it doesn't exist (for existing databases)
             try:
                 cursor.execute('ALTER TABLE interval_data ADD COLUMN net_charm REAL')
+            except sqlite3.OperationalError:
+                pass 
+            # Add abs_gex_total column if it's missing
+            try:
+                cursor.execute('ALTER TABLE interval_data ADD COLUMN abs_gex_total REAL')
             except sqlite3.OperationalError:
                 pass 
             
@@ -213,12 +219,13 @@ def store_interval_data(ticker, price, strike_range, calls, puts):
         delta = row['DEX']
         vanna = row['VEX']
         charm = row['Charm']
-        exposure_by_strike[strike] = {
-            'gamma': exposure_by_strike.get(strike, {}).get('gamma', 0) + gamma,
-            'delta': exposure_by_strike.get(strike, {}).get('delta', 0) + delta,
-            'vanna': exposure_by_strike.get(strike, {}).get('vanna', 0) + vanna,
-            'charm': exposure_by_strike.get(strike, {}).get('charm', 0) + charm
-        }
+        cur = exposure_by_strike.get(strike, {'gamma':0,'delta':0,'vanna':0,'charm':0,'call_gamma':0,'put_gamma':0})
+        cur['gamma'] = cur.get('gamma',0) + gamma
+        cur['delta'] = cur.get('delta',0) + delta
+        cur['vanna'] = cur.get('vanna',0) + vanna
+        cur['charm'] = cur.get('charm',0) + charm
+        cur['call_gamma'] = cur.get('call_gamma',0) + gamma
+        exposure_by_strike[strike] = cur
         
     for _, row in range_puts.iterrows():
         strike = row['strike']
@@ -226,21 +233,23 @@ def store_interval_data(ticker, price, strike_range, calls, puts):
         delta = row['DEX']
         vanna = row['VEX']
         charm = row['Charm']
-        exposure_by_strike[strike] = {
-            'gamma': exposure_by_strike.get(strike, {}).get('gamma', 0) - gamma,
-            'delta': exposure_by_strike.get(strike, {}).get('delta', 0) + delta,
-            'vanna': exposure_by_strike.get(strike, {}).get('vanna', 0) + vanna,
-            'charm': exposure_by_strike.get(strike, {}).get('charm', 0) + charm
-        }
+        cur = exposure_by_strike.get(strike, {'gamma':0,'delta':0,'vanna':0,'charm':0,'call_gamma':0,'put_gamma':0})
+        cur['gamma'] = cur.get('gamma',0) - gamma
+        cur['delta'] = cur.get('delta',0) + delta
+        cur['vanna'] = cur.get('vanna',0) + vanna
+        cur['charm'] = cur.get('charm',0) + charm
+        cur['put_gamma'] = cur.get('put_gamma',0) + gamma
+        exposure_by_strike[strike] = cur
     
     # Store data for each strike
     with closing(sqlite3.connect('options_data.db')) as conn:
         with closing(conn.cursor()) as cursor:
             for strike, exposure in exposure_by_strike.items():
+                abs_gex_total = abs(exposure.get('call_gamma',0)) + abs(exposure.get('put_gamma',0))
                 cursor.execute('''
-                    INSERT INTO interval_data (ticker, timestamp, price, strike, net_gamma, net_delta, net_vanna, net_charm, date)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ''', (ticker, interval_timestamp, price, strike, exposure['gamma'], exposure['delta'], exposure['vanna'], exposure['charm'], current_date))
+                    INSERT INTO interval_data (ticker, timestamp, price, strike, net_gamma, net_delta, net_vanna, net_charm, abs_gex_total, date)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (ticker, interval_timestamp, price, strike, exposure['gamma'], exposure['delta'], exposure['vanna'], exposure['charm'], abs_gex_total, current_date))
             conn.commit()
 
 # Function to get interval data
@@ -251,7 +260,7 @@ def get_interval_data(ticker, date=None):
     with closing(sqlite3.connect('options_data.db')) as conn:
         with closing(conn.cursor()) as cursor:
             cursor.execute('''
-                SELECT timestamp, price, strike, net_gamma, net_delta, net_vanna, net_charm
+                SELECT timestamp, price, strike, net_gamma, net_delta, net_vanna, net_charm, abs_gex_total
                 FROM interval_data
                 WHERE ticker = ? AND date = ?
                 ORDER BY timestamp, strike
@@ -2685,8 +2694,12 @@ def create_large_trades_table(calls, puts, S, strike_range, call_color='#00FF00'
 
 
 
-def create_historical_bubble_levels_chart(ticker, strike_range, call_color='#00FFA3', put_color='#FF3B3B', exposure_type='gamma', perspective='Customer'):
-    """Create a chart showing price and exposure (gamma, delta, or vanna) over time for the full session."""
+def create_historical_bubble_levels_chart(ticker, strike_range, call_color='#00FFA3', put_color='#FF3B3B', exposure_type='gamma', perspective='Customer', absolute=False, highlight_max_level=False, max_level_color='#800080'):
+    """Create a chart showing price and exposure (gamma, delta, or vanna) over time for the full session.
+
+    Supports optional highlighting of the max exposure bubble via highlight_max_level and max_level_color.
+    If absolute is True and exposure_type == 'gamma', gamma exposures are plotted as absolute values (useful for absolute GEX charts).
+    """
     # Get interval data from database
     interval_data = get_interval_data(ticker)
     
@@ -2713,6 +2726,11 @@ def create_historical_bubble_levels_chart(ticker, strike_range, call_color='#00F
             net_charm = row[6] if row[6] is not None else 0
         else:
             net_charm = 0
+        # Check if abs_gex_total exists (newer DB schema)
+        if len(row) > 7:
+            abs_gex_total = row[7] if row[7] is not None else None
+        else:
+            abs_gex_total = None
         
         # Filter strikes based on fixed strike_range relative to latest price
         if strike < min_strike or strike > max_strike:
@@ -2741,6 +2759,13 @@ def create_historical_bubble_levels_chart(ticker, strike_range, call_color='#00F
             
         if exposure is None:
             exposure = 0
+        
+        # If absolute flag is set for gamma, prefer stored abs_gex_total (call+put magnitudes)
+        if absolute and exposure_type == 'gamma':
+            if abs_gex_total is not None:
+                exposure = abs_gex_total
+            else:
+                exposure = abs(exposure)
             
         data_by_time[timestamp]['strikes'].append((strike, exposure))
     
@@ -2830,6 +2855,24 @@ def create_historical_bubble_levels_chart(ticker, strike_range, call_color='#00F
         size = max(4, min(25, abs(exposure) * 20 / max_exposure))
         bubble_sizes.append(size)
     
+    # If highlight is enabled, mark the max bubble for each timestamp (historical highlighting)
+    if highlight_max_level:
+        try:
+            # Compute local maximum absolute exposure for each timestamp
+            local_max_by_dt = {dt: max(abs(v) for v in vals) for dt, vals in exposures_by_time.items()}
+
+            # Prepare a list of line widths to add an outline to highlighted bubbles
+            highlight_line_widths = [0] * len(colors)
+
+            # Iterate through each bubble and mark it if it equals the local max for its timestamp
+            for idx, (dt, e) in enumerate(zip(timestamps, exposures)):
+                local_max = local_max_by_dt.get(dt, 0)
+                if local_max > 0 and abs(e) == local_max:
+                    colors[idx] = max_level_color
+                    highlight_line_widths[idx] = 4
+        except Exception as e:
+            print(f"Error computing highlight for historical bubble levels: {e}")
+    
     # Create figure
     fig = go.Figure()
     
@@ -2840,6 +2883,10 @@ def create_historical_bubble_levels_chart(ticker, strike_range, call_color='#00F
         'vanna': 'Vanna',
         'charm': 'Charm'
     }.get(exposure_type, 'Exposure')
+
+    # If absolute gamma is requested, adjust the label
+    if absolute and exposure_type == 'gamma':
+        exposure_name = 'Gamma (Abs)'
     
     fig.add_trace(go.Scatter(
         x=timestamps,
@@ -2854,6 +2901,17 @@ def create_historical_bubble_levels_chart(ticker, strike_range, call_color='#00F
         ),
         yaxis='y1'
     ))
+    
+    # If highlight was computed above, apply marker line widths and color for outline
+    if highlight_max_level and 'highlight_line_widths' in locals():
+        try:
+            # Find the bubble trace and update its marker line widths
+            for i, trace in enumerate(fig.data):
+                if trace.name == exposure_name and 'markers' in trace.mode:
+                    fig.data[i].update(marker=dict(line=dict(width=highlight_line_widths, color=max_level_color)))
+                    break
+        except Exception as e:
+            print(f"Error applying highlight to bubble trace: {e}")
     
     # Add price line last (top layer)
     unique_times = sorted(set(timestamps))
@@ -4189,6 +4247,10 @@ def index():
                 <input type="checkbox" id="gex_historical_bubble" checked>
                 <label for="gex_historical_bubble">GEX Historical Bubble Levels</label>
             </div>
+            <div class="chart-checkbox" style="margin-left:12px;">
+                <input type="checkbox" id="gex_absolute">
+                <label for="gex_absolute">Absolute GEX (bubble)</label>
+            </div>
             <div class="chart-checkbox">
                 <input type="checkbox" id="dex_historical_bubble" checked>
                 <label for="dex_historical_bubble">DEX Historical Bubble Levels</label>
@@ -4306,6 +4368,7 @@ def index():
         });
 
         document.getElementById('highlight_max_level').addEventListener('change', updateData);
+        document.getElementById('gex_absolute').addEventListener('change', updateData);
         
         // Helper function to create rgba color with opacity
         function createRgbaColor(hexColor, opacity) {
@@ -4393,6 +4456,7 @@ def index():
             const highlightMaxLevel = document.getElementById('highlight_max_level').checked;
             
             // Get visible charts
+            const gexAbsolute = document.getElementById('gex_absolute').checked;
             const visibleCharts = {
                 show_price: document.getElementById('price').checked,
                 show_gex_historical_bubble: document.getElementById('gex_historical_bubble').checked,
@@ -4442,6 +4506,7 @@ def index():
                     put_color: putColor,
                     highlight_max_level: highlightMaxLevel,
                     max_level_color: maxLevelColor,
+                    absolute_gex: gexAbsolute,
                     ...visibleCharts
                 })
             })
@@ -4993,6 +5058,7 @@ def index():
                 horizontal_bars: document.getElementById('horizontal_bars').checked,
                 show_abs_gex: document.getElementById('show_abs_gex').checked,
                 abs_gex_opacity: document.getElementById('abs_gex_opacity').value,
+                gex_absolute: document.getElementById('gex_absolute').checked,
                 use_range: document.getElementById('use_range').checked,
                 call_color: document.getElementById('call_color').value,
                 put_color: document.getElementById('put_color').value,
@@ -5318,22 +5384,24 @@ def update():
             )
         
         if data.get('show_gex_historical_bubble', True):
-            img_bytes = create_historical_bubble_levels_chart(ticker, strike_range, call_color, put_color, 'gamma', perspective)
+            # Accept either 'gex_absolute' (old key) or 'absolute_gex' (JS payload) for compatibility
+            absolute_gex = bool(data.get('gex_absolute', data.get('absolute_gex', False)))
+            img_bytes = create_historical_bubble_levels_chart(ticker, strike_range, call_color, put_color, 'gamma', perspective, absolute=absolute_gex, highlight_max_level=highlight_max_level, max_level_color=max_level_color)
             if img_bytes:
                 response['gex_historical_bubble'] = f"data:image/png;base64,{base64.b64encode(img_bytes).decode('utf-8')}"
         
         if data.get('show_dex_historical_bubble', True):
-            img_bytes = create_historical_bubble_levels_chart(ticker, strike_range, call_color, put_color, 'delta', perspective)
+            img_bytes = create_historical_bubble_levels_chart(ticker, strike_range, call_color, put_color, 'delta', perspective, highlight_max_level=highlight_max_level, max_level_color=max_level_color)
             if img_bytes:
                 response['dex_historical_bubble'] = f"data:image/png;base64,{base64.b64encode(img_bytes).decode('utf-8')}"
         
         if data.get('show_vanna_historical_bubble', True):
-            img_bytes = create_historical_bubble_levels_chart(ticker, strike_range, call_color, put_color, 'vanna', perspective)
+            img_bytes = create_historical_bubble_levels_chart(ticker, strike_range, call_color, put_color, 'vanna', perspective, highlight_max_level=highlight_max_level, max_level_color=max_level_color)
             if img_bytes:
                 response['vanna_historical_bubble'] = f"data:image/png;base64,{base64.b64encode(img_bytes).decode('utf-8')}"
         
         if data.get('show_charm_historical_bubble', True):
-            img_bytes = create_historical_bubble_levels_chart(ticker, strike_range, call_color, put_color, 'charm', perspective)
+            img_bytes = create_historical_bubble_levels_chart(ticker, strike_range, call_color, put_color, 'charm', perspective, highlight_max_level=highlight_max_level, max_level_color=max_level_color)
             if img_bytes:
                 response['charm_historical_bubble'] = f"data:image/png;base64,{base64.b64encode(img_bytes).decode('utf-8')}"
         
