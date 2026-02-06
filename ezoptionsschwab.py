@@ -1676,7 +1676,7 @@ def create_exposure_chart(calls, puts, exposure_type, title, S, strike_range=0.0
         showlegend=False,  # Removed legend
         bargap=0.1,
         bargroupgap=0.1,
-        margin=dict(l=50, r=50, t=70, b=100),  # Increased top margin for net value
+        margin=dict(l=50, r=50, t=50, b=20),
         hoverlabel=dict(
             bgcolor=background_color,
             font_size=12,
@@ -2985,7 +2985,7 @@ def create_historical_bubble_levels_chart(ticker, strike_range, call_color='#00F
             font=dict(color='#CCCCCC', size=16),  # Added size
             bgcolor='#1E1E1E'
         ),
-        margin=dict(l=50, r=50, t=50, b=50),
+        margin=dict(l=50, r=50, t=40, b=20),
         showlegend=True,
         height=800,
         width=1200
@@ -3229,7 +3229,7 @@ def create_premium_chart(calls, puts, S, strike_range=0.02, call_color='#00FF00'
         ),
         bargap=0.1,
         bargroupgap=0.1,
-        margin=dict(l=50, r=50, t=50, b=100),
+        margin=dict(l=50, r=50, t=40, b=20),
         hoverlabel=dict(
             bgcolor='#1E1E1E',
             font_size=12,
@@ -3427,7 +3427,7 @@ def create_centroid_chart(ticker, call_color='#00FF00', put_color='#FF0000', sel
             font=dict(color='#CCCCCC', size=16),
             bgcolor='#1E1E1E'
         ),
-        margin=dict(l=50, r=50, t=50, b=50),
+        margin=dict(l=50, r=50, t=40, b=20),
         showlegend=True,
         height=800,
         width=1200
@@ -4799,7 +4799,7 @@ def index():
                             chartData.layout.autosize = true;
                             chartData.layout.width = null;
                             chartData.layout.height = null;
-                            chartData.layout.margin = {l: 50, r: 50, t: 50, b: 50};
+                            chartData.layout.margin = {l: 50, r: 50, t: 40, b: 20};
                             
                             // Ensure axes auto-scale with new data
                             if (chartData.layout.xaxis) {
@@ -5011,10 +5011,10 @@ def index():
             updateExpiryDisplay();
             updateData();
         });
-        
-        // Initial load
-        loadExpirations();
-        
+
+        // Initial load - automatically load saved settings, or use defaults
+        loadSettings(false);
+
         // Auto-update every 1 second
         updateInterval = setInterval(updateData, 1000);
         
@@ -5183,26 +5183,42 @@ def index():
             .catch(error => showError('Error saving settings: ' + error));
         }
         
-        function loadSettings() {
+        function loadSettings(showFeedback = true) {
             fetch('/load_settings')
             .then(response => response.json())
             .then(data => {
                 if (data.error) {
-                    showError('Error loading settings: ' + data.error);
+                    if (showFeedback) {
+                        showError('Error loading settings: ' + data.error);
+                    }
+                    // If auto-loading fails, fall back to default initialization
+                    if (!showFeedback) {
+                        loadExpirations();
+                    }
                 } else {
                     applySettings(data);
-                    const btn = document.getElementById('loadSettings');
-                    btn.classList.add('success');
-                    btn.textContent = '✓ Loaded';
-                    setTimeout(() => {
-                        btn.classList.remove('success');
-                        btn.textContent = '📂 Load';
-                    }, 2000);
+                    if (showFeedback) {
+                        const btn = document.getElementById('loadSettings');
+                        btn.classList.add('success');
+                        btn.textContent = '✓ Loaded';
+                        setTimeout(() => {
+                            btn.classList.remove('success');
+                            btn.textContent = '📂 Load';
+                        }, 2000);
+                    }
                     // Reload expirations for the new ticker and update
                     loadExpirations();
                 }
             })
-            .catch(error => showError('Error loading settings: ' + error));
+            .catch(error => {
+                if (showFeedback) {
+                    showError('Error loading settings: ' + error);
+                }
+                // If auto-loading fails, fall back to default initialization
+                if (!showFeedback) {
+                    loadExpirations();
+                }
+            });
         }
         
         document.getElementById('saveSettings').addEventListener('click', saveSettings);
