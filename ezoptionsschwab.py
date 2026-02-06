@@ -588,7 +588,13 @@ def fetch_options_for_date(ticker, date, exposure_metric="Open Interest", delta_
         calls_list = []
         puts_list = []
 
-        # First pass: collect total exposure magnitudes for normalization
+        # Columns that get per-Greek normalization
+        exposure_cols = ['GEX', 'DEX', 'VEX', 'Charm', 'Speed', 'Vomma', 'Color']
+        activity_cols = ['openInterest', 'volume']
+
+        # First pass: collect data and compute per-Greek total absolute exposure
+        # for each component.  This lets us normalize each Greek independently
+        # so that e.g. 5 000 OI on IWM is proportionally as loud as 500 000 on SPX.
         component_data = []
         for comp_tick in component_tickers:
             if comp_tick == base_ticker:
@@ -602,55 +608,65 @@ def fetch_options_for_date(ticker, date, exposure_metric="Open Interest", delta_
             
             if c.empty and p.empty: continue
             
-            # Calculate total absolute exposure for this component (for normalization)
-            total_abs_gex = 0
-            if not c.empty and 'GEX' in c.columns:
-                total_abs_gex += c['GEX'].abs().sum()
-            if not p.empty and 'GEX' in p.columns:
-                total_abs_gex += p['GEX'].abs().sum()
+            # Per-Greek total absolute exposure ----------------------------
+            totals = {}
+            for col in exposure_cols + activity_cols:
+                total = 0
+                if not c.empty and col in c.columns:
+                    total += c[col].abs().sum()
+                if not p.empty and col in p.columns:
+                    total += p[col].abs().sum()
+                totals[col] = total if total > 0 else 1  # avoid /0
             
             component_data.append({
                 'ticker': comp_tick,
                 'price': comp_price,
                 'calls': c,
                 'puts': p,
-                'total_abs_gex': total_abs_gex if total_abs_gex > 0 else 1
+                'totals': totals          # dict keyed by column name
             })
         
         if not component_data:
             return pd.DataFrame(), pd.DataFrame()
         
-        # Calculate reference scale: use median absolute GEX so each component contributes equally
-        median_gex = np.median([cd['total_abs_gex'] for cd in component_data])
+        # Compute geometric-mean scale factor per column across all components.
+        # geometric_mean(x1,x2,...,xN) = exp(mean(log(x)))
+        # This is less sensitive to an SPX outlier than arithmetic mean and
+        # more stable than median for small N (3–4 components).
+        geo_scale = {}
+        for col in exposure_cols + activity_cols:
+            log_sum = sum(np.log(cd['totals'][col]) for cd in component_data)
+            geo_scale[col] = np.exp(log_sum / len(component_data))
         
-        # Second pass: normalize exposures and map strikes using moneyness
-        exposure_cols = ['GEX', 'DEX', 'VEX', 'Charm', 'Speed', 'Vomma', 'Color']
-        
+        # Second pass: per-Greek self-normalization, then scale-back, then
+        # map strikes to base-equivalent via moneyness.
         for cd in component_data:
             comp_tick = cd['ticker']
             comp_price = cd['price']
             c = cd['calls']
             p = cd['puts']
-            
-            # Normalization factor: scale this component's exposures to match median
-            norm_factor = median_gex / cd['total_abs_gex'] if cd['total_abs_gex'] > 0 else 1
+            totals = cd['totals']
+
+            # Build per-column norm factors: value / component_total * geo_scale
+            # This turns each component's values into proportions of its own
+            # activity, then scales them to a common display magnitude.
+            col_norm = {}
+            for col in exposure_cols + activity_cols:
+                col_norm[col] = geo_scale[col] / totals[col]
             
             # Process Calls
             if not c.empty:
                 c = c.copy()
                 
-                # Normalize exposures (scale to equal weight) before mapping
+                # Normalize each Greek independently
                 for col in exposure_cols:
                     if col in c.columns:
-                        c[col] = c[col] * norm_factor
+                        c[col] = c[col] * col_norm[col]
                 
-                # Normalize OI/Volume for display consistency before mapping
-                total_oi = c['openInterest'].sum()
-                total_vol = c['volume'].sum()
-                if total_oi > 0:
-                    c['openInterest'] = c['openInterest'] / total_oi * 1_000_000
-                if total_vol > 0:
-                    c['volume'] = c['volume'] / total_vol * 1_000_000
+                # Normalize OI/Volume with per-column factor (preserves relative activity)
+                for col in activity_cols:
+                    if col in c.columns:
+                        c[col] = c[col] * col_norm[col]
                 
                 # Map strikes to base-equivalent using moneyness
                 c = map_to_base_strikes(c, comp_price, base_price, bucket_size=bucket_size)
@@ -661,18 +677,15 @@ def fetch_options_for_date(ticker, date, exposure_metric="Open Interest", delta_
             if not p.empty:
                 p = p.copy()
                 
-                # Normalize exposures (scale to equal weight) before mapping
+                # Normalize each Greek independently
                 for col in exposure_cols:
                     if col in p.columns:
-                        p[col] = p[col] * norm_factor
+                        p[col] = p[col] * col_norm[col]
                 
-                # Normalize OI/Volume for display consistency before mapping
-                total_oi = p['openInterest'].sum()
-                total_vol = p['volume'].sum()
-                if total_oi > 0:
-                    p['openInterest'] = p['openInterest'] / total_oi * 1_000_000
-                if total_vol > 0:
-                    p['volume'] = p['volume'] / total_vol * 1_000_000
+                # Normalize OI/Volume with per-column factor (preserves relative activity)
+                for col in activity_cols:
+                    if col in p.columns:
+                        p[col] = p[col] * col_norm[col]
                 
                 # Map strikes to base-equivalent using moneyness
                 p = map_to_base_strikes(p, comp_price, base_price, bucket_size=bucket_size)
