@@ -12,7 +12,6 @@ import pytz
 import sqlite3
 from contextlib import closing
 from scipy.stats import norm
-import base64
 import warnings
 import json
 
@@ -2852,22 +2851,32 @@ def create_historical_bubble_levels_chart(ticker, strike_range, call_color='#00F
                     adjusted_strikes.append(strike + offset)
     
     # Create colors and sizes for the adjusted strikes
+    hover_sides = []
+    formatted_exposures = []
+    original_strikes = []
     for i, exposure in enumerate(exposures):
         dt = timestamps[i]
         max_exposure = max_exposure_by_time[dt]
         if max_exposure == 0:
             max_exposure = 1  # Prevent division by zero
-            
-        # Calculate color
-        if exposure >= 0:
+
+        # Calculate color and side label
+        if absolute and exposure_type == 'gamma':
             colors.append(get_color_with_opacity(exposure, max_exposure, call_color, True))
+            hover_sides.append('Total')
+        elif exposure >= 0:
+            colors.append(get_color_with_opacity(exposure, max_exposure, call_color, True))
+            hover_sides.append('Call')
         else:
             colors.append(get_color_with_opacity(exposure, max_exposure, put_color, True))
-            
+            hover_sides.append('Put')
+
         # Calculate bubble size (scaled to the max exposure for this time slice)
         size = max(4, min(25, abs(exposure) * 20 / max_exposure))
         bubble_sizes.append(size)
-    
+        formatted_exposures.append(format_large_number(exposure))
+        original_strikes.append(strikes[i])
+
     # If highlight is enabled, mark the max bubble for each timestamp (historical highlighting)
     if highlight_max_level:
         try:
@@ -2885,10 +2894,10 @@ def create_historical_bubble_levels_chart(ticker, strike_range, call_color='#00F
                     highlight_line_widths[idx] = 4
         except Exception as e:
             print(f"Error computing highlight for historical bubble levels: {e}")
-    
+
     # Create figure
     fig = go.Figure()
-    
+
     # Add exposure bubbles for each strike first (bottom layer)
     exposure_name = {
         'gamma': 'Gamma',
@@ -2900,7 +2909,10 @@ def create_historical_bubble_levels_chart(ticker, strike_range, call_color='#00F
     # If absolute gamma is requested, adjust the label
     if absolute and exposure_type == 'gamma':
         exposure_name = 'Gamma (Abs)'
-    
+
+    # Build customdata: [side, original_strike, formatted_exposure]
+    bubble_customdata = list(zip(hover_sides, original_strikes, formatted_exposures))
+
     fig.add_trace(go.Scatter(
         x=timestamps,
         y=adjusted_strikes,
@@ -2912,9 +2924,11 @@ def create_historical_bubble_levels_chart(ticker, strike_range, call_color='#00F
             opacity=1.0,
             line=dict(width=0)
         ),
+        customdata=bubble_customdata,
+        hovertemplate='<b>%{customdata[0]}</b><br>Strike: $%{customdata[1]:.2f}<br>' + exposure_name + ': %{customdata[2]}<br>Time: %{x|%H:%M}<extra></extra>',
         yaxis='y1'
     ))
-    
+
     # If highlight was computed above, apply marker line widths and color for outline
     if highlight_max_level and 'highlight_line_widths' in locals():
         try:
@@ -2925,7 +2939,7 @@ def create_historical_bubble_levels_chart(ticker, strike_range, call_color='#00F
                     break
         except Exception as e:
             print(f"Error applying highlight to bubble trace: {e}")
-    
+
     # Add price line last (top layer)
     unique_times = sorted(set(timestamps))
     unique_prices = [data_by_time[int(t.timestamp())]['price'] for t in unique_times]
@@ -2935,6 +2949,7 @@ def create_historical_bubble_levels_chart(ticker, strike_range, call_color='#00F
         mode='lines',
         name='Price',
         line=dict(color='gold', width=2),
+        hovertemplate='<b>Price</b>: $%{y:.2f}<br>Time: %{x|%H:%M}<extra></extra>',
         yaxis='y1'
     ))
     
@@ -2942,14 +2957,14 @@ def create_historical_bubble_levels_chart(ticker, strike_range, call_color='#00F
     fig.update_layout(
         title=dict(
             text=f'Historical Bubble Levels - {exposure_name}',
-            font=dict(color='#CCCCCC', size=24),  # Increased from 16
+            font=dict(color='#CCCCCC', size=16),
             x=0.5,
             xanchor='center'
         ),
         xaxis=dict(
             title='Time (Full Session)',
-            title_font=dict(color='#CCCCCC', size=18),  # Added size
-            tickfont=dict(color='#CCCCCC', size=16),  # Added size
+            title_font=dict(color='#CCCCCC'),
+            tickfont=dict(color='#CCCCCC'),
             gridcolor='#333333',
             linecolor='#333333',
             showgrid=False,
@@ -2965,8 +2980,8 @@ def create_historical_bubble_levels_chart(ticker, strike_range, call_color='#00F
         ),
         yaxis=dict(
             title='Price/Strike',
-            title_font=dict(color='#CCCCCC', size=18),  # Added size
-            tickfont=dict(color='#CCCCCC', size=16),  # Added size
+            title_font=dict(color='#CCCCCC'),
+            tickfont=dict(color='#CCCCCC'),
             gridcolor='#333333',
             linecolor='#333333',
             showgrid=False,
@@ -2975,25 +2990,34 @@ def create_historical_bubble_levels_chart(ticker, strike_range, call_color='#00F
         ),
         plot_bgcolor='#1E1E1E',
         paper_bgcolor='#1E1E1E',
-        font=dict(color='#CCCCCC', size=16),  # Added size
+        font=dict(color='#CCCCCC'),
         legend=dict(
             orientation="h",
             yanchor="bottom",
             y=1.02,
             xanchor="right",
             x=1,
-            font=dict(color='#CCCCCC', size=16),  # Added size
+            font=dict(color='#CCCCCC'),
             bgcolor='#1E1E1E'
         ),
-        margin=dict(l=50, r=50, t=40, b=20),
+        margin=dict(l=50, r=50, t=50, b=20),
         showlegend=True,
-        height=800,
-        width=1200
+        autosize=True,
+        hovermode='closest',
+        hoverlabel=dict(
+            bgcolor='#1E1E1E',
+            font_size=12,
+            font_family="Arial"
+        ),
+        spikedistance=1000,
+        hoverdistance=100
     )
-    
-    # Convert figure to image with higher scale factor
-    img_bytes = fig.to_image(format="png", width=1200, height=800, scale=2)
-    return img_bytes
+
+    # Add hover spikes
+    fig.update_xaxes(showspikes=True, spikecolor='#CCCCCC', spikethickness=1)
+    fig.update_yaxes(showspikes=True, spikecolor='#CCCCCC', spikethickness=1)
+
+    return fig.to_json()
 
 
 
@@ -3304,21 +3328,18 @@ def create_centroid_chart(ticker, call_color='#00FF00', put_color='#FF0000', sel
         fig.update_layout(
             title=dict(
                 text=chart_title,
-                font=dict(color='#CCCCCC', size=24),
+                font=dict(color='#CCCCCC', size=16),
                 x=0.5,
                 xanchor='center'
             ),
             plot_bgcolor='#1E1E1E',
             paper_bgcolor='#1E1E1E',
-            font=dict(color='#CCCCCC', size=16),
-            xaxis=dict(title='Time', title_font=dict(color='#CCCCCC', size=18), tickfont=dict(color='#CCCCCC', size=16)),
-            yaxis=dict(title='Price/Strike', title_font=dict(color='#CCCCCC', size=18), tickfont=dict(color='#CCCCCC', size=16)),
-            height=800,
-            width=1200
+            font=dict(color='#CCCCCC'),
+            xaxis=dict(title='Time', title_font=dict(color='#CCCCCC'), tickfont=dict(color='#CCCCCC')),
+            yaxis=dict(title='Price/Strike', title_font=dict(color='#CCCCCC'), tickfont=dict(color='#CCCCCC')),
+            autosize=True
         )
-        # Convert figure to image with higher scale factor
-        img_bytes = fig.to_image(format="png", width=1200, height=800, scale=2)
-        return img_bytes
+        return fig.to_json()
     
     # Convert data to lists for plotting
     timestamps = []
@@ -3352,7 +3373,7 @@ def create_centroid_chart(ticker, call_color='#00FF00', put_color='#FF0000', sel
         customdata=call_volumes,
         connectgaps=False
     ))
-    
+
     # Add put centroid line (middle layer)
     fig.add_trace(go.Scatter(
         x=timestamps,
@@ -3364,7 +3385,7 @@ def create_centroid_chart(ticker, call_color='#00FF00', put_color='#FF0000', sel
         customdata=put_volumes,
         connectgaps=False
     ))
-    
+
     # Add price line last (bottom layer)
     fig.add_trace(go.Scatter(
         x=timestamps,
@@ -3384,14 +3405,14 @@ def create_centroid_chart(ticker, call_color='#00FF00', put_color='#FF0000', sel
     fig.update_layout(
         title=dict(
             text=chart_title,
-            font=dict(color='#CCCCCC', size=24),
+            font=dict(color='#CCCCCC', size=16),
             x=0.5,
             xanchor='center'
         ),
         xaxis=dict(
             title='Time',
-            title_font=dict(color='#CCCCCC', size=18),
-            tickfont=dict(color='#CCCCCC', size=16),
+            title_font=dict(color='#CCCCCC'),
+            tickfont=dict(color='#CCCCCC'),
             gridcolor='#333333',
             linecolor='#333333',
             showgrid=False,
@@ -3407,8 +3428,8 @@ def create_centroid_chart(ticker, call_color='#00FF00', put_color='#FF0000', sel
         ),
         yaxis=dict(
             title='Price/Strike',
-            title_font=dict(color='#CCCCCC', size=18),
-            tickfont=dict(color='#CCCCCC', size=16),
+            title_font=dict(color='#CCCCCC'),
+            tickfont=dict(color='#CCCCCC'),
             gridcolor='#333333',
             linecolor='#333333',
             showgrid=False,
@@ -3417,29 +3438,34 @@ def create_centroid_chart(ticker, call_color='#00FF00', put_color='#FF0000', sel
         ),
         plot_bgcolor='#1E1E1E',
         paper_bgcolor='#1E1E1E',
-        font=dict(color='#CCCCCC', size=16),
+        font=dict(color='#CCCCCC'),
         legend=dict(
             orientation="h",
             yanchor="bottom",
             y=1.02,
             xanchor="right",
             x=1,
-            font=dict(color='#CCCCCC', size=16),
+            font=dict(color='#CCCCCC'),
             bgcolor='#1E1E1E'
         ),
-        margin=dict(l=50, r=50, t=40, b=20),
+        margin=dict(l=50, r=50, t=50, b=20),
         showlegend=True,
-        height=800,
-        width=1200
+        autosize=True,
+        hovermode='x unified',
+        hoverlabel=dict(
+            bgcolor='#1E1E1E',
+            font_size=12,
+            font_family="Arial"
+        ),
+        spikedistance=1000,
+        hoverdistance=100
     )
-    
+
     # Add hover spikes
     fig.update_xaxes(showspikes=True, spikecolor='#CCCCCC', spikethickness=1)
     fig.update_yaxes(showspikes=True, spikecolor='#CCCCCC', spikethickness=1)
-    
-    # Convert figure to image with higher scale factor
-    img_bytes = fig.to_image(format="png", width=1200, height=800, scale=2)
-    return img_bytes
+
+    return fig.to_json()
 
 def infer_side(last, bid, ask):
     # If last is closer to ask, it's a buy; if closer to bid, it's a sell
@@ -3786,17 +3812,6 @@ def index():
         .historical-bubble-container .chart-container {
             height: 100%;
             width: 100%;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-        }
-        
-        .historical-bubble-container .chart-container img {
-            width: 100%;
-            height: 100%;
-            object-fit: contain;
-            image-rendering: -webkit-optimize-contrast;
-            image-rendering: crisp-edges;
         }
         
         .chart-container {
@@ -4644,26 +4659,39 @@ def index():
             // Handle historical bubble levels and centroid
             const historicalBubbles = ['gex_historical_bubble', 'dex_historical_bubble', 'vanna_historical_bubble', 'charm_historical_bubble', 'centroid'];
             const historicalBubblesRow = document.getElementById('historical-bubbles-row');
-            
+
             // Count enabled historical bubble levels
             const enabledBubbles = historicalBubbles.filter(bubbleType => selectedCharts[bubbleType]);
-            
+
+            const bubbleConfig = {
+                responsive: true,
+                displayModeBar: true,
+                modeBarButtonsToRemove: ['lasso2d', 'select2d'],
+                displaylogo: false,
+                scrollZoom: true
+            };
+
             // Only rebuild containers if the set of enabled bubbles changed
             const currentBubbleIds = Array.from(historicalBubblesRow.querySelectorAll('.historical-bubble-container')).map(el => el.dataset.bubbleType || '');
-            const needsRebuild = enabledBubbles.length !== currentBubbleIds.length || 
+            const needsRebuild = enabledBubbles.length !== currentBubbleIds.length ||
                                  !enabledBubbles.every((b, i) => currentBubbleIds[i] === b);
-            
+
             if (needsRebuild) {
-                // Clear existing containers and classes
+                // Purge existing Plotly charts before clearing DOM
+                currentBubbleIds.forEach(bt => {
+                    const el = document.getElementById(bt + '-chart');
+                    if (el) { try { Plotly.purge(el); } catch(e) {} }
+                    delete charts[bt];
+                });
                 historicalBubblesRow.innerHTML = '';
                 historicalBubblesRow.className = 'historical-bubbles-row';
-            
+
                 // Hide the row if no bubbles are enabled
                 if (enabledBubbles.length === 0) {
                     historicalBubblesRow.style.display = 'none';
                 } else {
                     historicalBubblesRow.style.display = 'grid';
-                    
+
                     // Add appropriate class based on number of enabled bubbles
                     if (enabledBubbles.length === 1) {
                         historicalBubblesRow.classList.add('one-bubble');
@@ -4674,49 +4702,45 @@ def index():
                     } else if (enabledBubbles.length === 4) {
                         historicalBubblesRow.classList.add('four-bubbles');
                     }
-                    
-                    // Add or update selected historical bubble levels
+
+                    // Create containers and render Plotly charts
                     enabledBubbles.forEach(bubbleType => {
                         const bubbleContainer = document.createElement('div');
                         bubbleContainer.className = 'historical-bubble-container';
                         bubbleContainer.dataset.bubbleType = bubbleType;
-                        
+
                         const chartDiv = document.createElement('div');
                         chartDiv.className = 'chart-container';
-                        chartDiv.id = `${bubbleType.replace('_', '-')}-chart`;
-                        
-                        // Create image element
-                        const img = document.createElement('img');
-                        img.style.width = '100%';
-                        img.style.height = '100%';
-                        img.style.objectFit = 'contain';
-                        img.style.imageRendering = 'crisp-edges';
-                        img.dataset.bubbleType = bubbleType;
-                        
-                        if (data[bubbleType]) {
-                            img.src = data[bubbleType];
-                        }
-                        
-                        chartDiv.appendChild(img);
+                        chartDiv.id = bubbleType + '-chart';
+
                         bubbleContainer.appendChild(chartDiv);
                         historicalBubblesRow.appendChild(bubbleContainer);
+
+                        if (data[bubbleType]) {
+                            const chartData = JSON.parse(data[bubbleType]);
+                            charts[bubbleType] = Plotly.newPlot(chartDiv, chartData.data, chartData.layout, bubbleConfig);
+                        }
                     });
                 }
             } else {
-                // Just update the image sources without rebuilding DOM
+                // Efficiently update existing Plotly charts without rebuilding DOM
                 enabledBubbles.forEach(bubbleType => {
                     if (data[bubbleType]) {
-                        const img = historicalBubblesRow.querySelector(`img[data-bubble-type="${bubbleType}"]`);
-                        if (img && img.src !== data[bubbleType]) {
-                            img.src = data[bubbleType];
+                        const chartDiv = document.getElementById(bubbleType + '-chart');
+                        if (chartDiv) {
+                            const chartData = JSON.parse(data[bubbleType]);
+                            Plotly.react(chartDiv, chartData.data, chartData.layout, bubbleConfig);
+                            charts[bubbleType] = true;
                         }
                     }
                 });
             }
-            
+
             // Clean up disabled historical bubble levels from charts object
             historicalBubbles.forEach(bubbleType => {
                 if (!selectedCharts[bubbleType]) {
+                    const el = document.getElementById(bubbleType + '-chart');
+                    if (el) { try { Plotly.purge(el); } catch(e) {} }
                     delete charts[bubbleType];
                 }
             });
@@ -5415,24 +5439,16 @@ def update():
         if data.get('show_gex_historical_bubble', True):
             # Accept either 'gex_absolute' (old key) or 'absolute_gex' (JS payload) for compatibility
             absolute_gex = bool(data.get('gex_absolute', data.get('absolute_gex', False)))
-            img_bytes = create_historical_bubble_levels_chart(ticker, strike_range, call_color, put_color, 'gamma', perspective, absolute=absolute_gex, highlight_max_level=highlight_max_level, max_level_color=max_level_color)
-            if img_bytes:
-                response['gex_historical_bubble'] = f"data:image/png;base64,{base64.b64encode(img_bytes).decode('utf-8')}"
-        
+            response['gex_historical_bubble'] = create_historical_bubble_levels_chart(ticker, strike_range, call_color, put_color, 'gamma', perspective, absolute=absolute_gex, highlight_max_level=highlight_max_level, max_level_color=max_level_color)
+
         if data.get('show_dex_historical_bubble', True):
-            img_bytes = create_historical_bubble_levels_chart(ticker, strike_range, call_color, put_color, 'delta', perspective, highlight_max_level=highlight_max_level, max_level_color=max_level_color)
-            if img_bytes:
-                response['dex_historical_bubble'] = f"data:image/png;base64,{base64.b64encode(img_bytes).decode('utf-8')}"
-        
+            response['dex_historical_bubble'] = create_historical_bubble_levels_chart(ticker, strike_range, call_color, put_color, 'delta', perspective, highlight_max_level=highlight_max_level, max_level_color=max_level_color)
+
         if data.get('show_vanna_historical_bubble', True):
-            img_bytes = create_historical_bubble_levels_chart(ticker, strike_range, call_color, put_color, 'vanna', perspective, highlight_max_level=highlight_max_level, max_level_color=max_level_color)
-            if img_bytes:
-                response['vanna_historical_bubble'] = f"data:image/png;base64,{base64.b64encode(img_bytes).decode('utf-8')}"
-        
+            response['vanna_historical_bubble'] = create_historical_bubble_levels_chart(ticker, strike_range, call_color, put_color, 'vanna', perspective, highlight_max_level=highlight_max_level, max_level_color=max_level_color)
+
         if data.get('show_charm_historical_bubble', True):
-            img_bytes = create_historical_bubble_levels_chart(ticker, strike_range, call_color, put_color, 'charm', perspective, highlight_max_level=highlight_max_level, max_level_color=max_level_color)
-            if img_bytes:
-                response['charm_historical_bubble'] = f"data:image/png;base64,{base64.b64encode(img_bytes).decode('utf-8')}"
+            response['charm_historical_bubble'] = create_historical_bubble_levels_chart(ticker, strike_range, call_color, put_color, 'charm', perspective, highlight_max_level=highlight_max_level, max_level_color=max_level_color)
         
         if data.get('show_gamma', True):
             response['gamma'] = create_exposure_chart(calls, puts, "GEX", "Gamma Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, coloring_mode, call_color, put_color, expiry_dates, perspective, horizontal, show_abs_gex_area=show_abs_gex, abs_gex_opacity=abs_gex_opacity, highlight_max_level=highlight_max_level, max_level_color=max_level_color)
@@ -5468,9 +5484,7 @@ def update():
             response['large_trades'] = create_large_trades_table(calls, puts, S, strike_range, call_color, put_color, expiry_dates)
         
         if data.get('show_centroid', True):
-            img_bytes = create_centroid_chart(ticker, call_color, put_color, expiry_dates)
-            if img_bytes:
-                response['centroid'] = f"data:image/png;base64,{base64.b64encode(img_bytes).decode('utf-8')}"
+            response['centroid'] = create_centroid_chart(ticker, call_color, put_color, expiry_dates)
 
         
         # Add volume data to response
