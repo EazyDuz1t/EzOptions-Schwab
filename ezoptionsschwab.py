@@ -1,4 +1,4 @@
-from flask import Flask, render_template_string, jsonify, request
+﻿from flask import Flask, render_template_string, jsonify, request
 import pandas as pd
 import plotly.graph_objects as go
 import numpy as np
@@ -1576,7 +1576,7 @@ def create_exposure_chart(calls, puts, exposure_type, title, S, strike_range=0.0
         )
     
     # Calculate padding as percentage of price range
-    padding = (max_strike - min_strike) * 0.1
+    padding = (max_strike - min_strike) * 0.02
     
     # Add expiry info to title if multiple expiries are selected
     chart_title = title
@@ -1609,7 +1609,8 @@ def create_exposure_chart(calls, puts, exposure_type, title, S, strike_range=0.0
     if horizontal:
         # Strike axis is Y
         yaxis_config.update(dict(
-            autorange=True,
+            range=[min_strike, max_strike],
+            autorange=False,
             tickformat='.0f',
             showticklabels=True,
             ticks='outside',
@@ -1625,7 +1626,8 @@ def create_exposure_chart(calls, puts, exposure_type, title, S, strike_range=0.0
     else:
         # Strike axis is X
         xaxis_config.update(dict(
-            autorange=True,
+            range=[min_strike, max_strike],
+            autorange=False,
             tickangle=45,
             tickformat='.0f',
             showticklabels=True,
@@ -1647,20 +1649,20 @@ def create_exposure_chart(calls, puts, exposure_type, title, S, strike_range=0.0
             font=dict(color=text_color, size=16),
             x=0.5,
             xanchor='center',
-            y=0.95  # Adjust title position to make room for net exposure
+            y=0.98  # Push title higher to avoid collision with price annotation
         ),
         annotations=list(fig.layout.annotations) + [
             dict(
                 text=f"Net: {format_large_number(abs(total_net_exposure))}",
-                x=0.95,
-                y=1.05,  # Adjusted from 1.1 to 1.05 to move it slightly down
+                x=0.98,
+                y=1.03,
                 xref='paper',
                 yref='paper',
                 xanchor='right',
-                yanchor='middle',
+                yanchor='top',
                 showarrow=False,
                 font=dict(
-                    size=16,
+                    size=14,
                     color=call_color if total_net_exposure >= 0 else put_color
                 )
             )
@@ -1675,7 +1677,7 @@ def create_exposure_chart(calls, puts, exposure_type, title, S, strike_range=0.0
         showlegend=False,  # Removed legend
         bargap=0.1,
         bargroupgap=0.1,
-        margin=dict(l=50, r=50, t=50, b=20),
+        margin=dict(l=50, r=80, t=60, b=20),
         hoverlabel=dict(
             bgcolor=background_color,
             font_size=12,
@@ -1944,11 +1946,13 @@ def create_options_volume_chart(calls, puts, S, strike_range=0.02, call_color='#
     
     if horizontal:
          yaxis_config.update(dict(
-            autorange=True
+            range=[min_strike, max_strike],
+            autorange=False
          ))
     else:
         xaxis_config.update(dict(
-            autorange=True,
+            range=[min_strike, max_strike],
+            autorange=False,
             tickangle=45,
             tickformat='.0f',
             showticklabels=True,
@@ -1976,7 +1980,7 @@ def create_options_volume_chart(calls, puts, S, strike_range=0.02, call_color='#
         legend=dict(
             orientation="h",
             yanchor="bottom",
-            y=1.02,
+            y=0.95,
             xanchor="right",
             x=1,
             font=dict(color='#CCCCCC'),
@@ -2262,7 +2266,7 @@ def create_price_chart(price_data, calls=None, puts=None, exposure_levels_types=
     price_min = min(lows)
     price_max = max(highs)
     price_range = price_max - price_min
-    padding = price_range * 0.1  # 10% padding
+    padding = price_range * 0.02  # 2% padding
     
     # Get current price for strike range calculation
     current_price = closes[-1] if closes else (price_min + price_max) / 2
@@ -3213,11 +3217,13 @@ def create_premium_chart(calls, puts, S, strike_range=0.02, call_color='#00FF00'
     
     if horizontal:
          yaxis_config.update(dict(
-            autorange=True
+            range=[min_strike, max_strike],
+            autorange=False
          ))
     else:
         xaxis_config.update(dict(
-            autorange=True,
+            range=[min_strike, max_strike],
+            autorange=False,
             tickangle=45,
             tickformat='.0f',
             showticklabels=True,
@@ -4101,6 +4107,101 @@ def index():
                 height: 300px;
             }
         }
+
+        /* Fullscreen chart overlay */
+        .chart-fullscreen-btn {
+            position: absolute;
+            top: 8px;
+            left: 8px;
+            z-index: 200;
+            background: rgba(45, 45, 45, 0.85);
+            border: 1px solid #555;
+            color: #ccc;
+            width: 30px;
+            height: 30px;
+            border-radius: 4px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            opacity: 0;
+            transition: opacity 0.2s;
+            padding: 0;
+            line-height: 1;
+        }
+        .chart-container:hover .chart-fullscreen-btn,
+        .chart-fullscreen-btn:focus {
+            opacity: 1;
+        }
+        .chart-fullscreen-btn:hover {
+            background: rgba(80, 80, 80, 0.95);
+            color: #fff;
+            border-color: #777;
+        }
+        .chart-container.fullscreen {
+            position: fixed !important;
+            top: 0 !important;
+            left: 0 !important;
+            width: 100vw !important;
+            height: 100vh !important;
+            max-height: 100vh !important;
+            z-index: 9999 !important;
+            border-radius: 0 !important;
+            margin: 0 !important;
+            padding: 10px !important;
+            background-color: #1E1E1E !important;
+            box-sizing: border-box !important;
+            overflow: visible !important;
+        }
+        .chart-container.fullscreen > div {
+            width: 100% !important;
+            height: 100% !important;
+            overflow: visible !important;
+        }
+        .chart-container.fullscreen .chart-fullscreen-btn {
+            opacity: 1;
+            position: fixed;
+            top: 14px;
+            left: 14px;
+            z-index: 10001;
+        }
+        /* Pop-out button */
+        .chart-popout-btn {
+            position: absolute;
+            top: 8px;
+            left: 42px;
+            z-index: 200;
+            background: rgba(45, 45, 45, 0.85);
+            border: 1px solid #555;
+            color: #ccc;
+            width: 30px;
+            height: 30px;
+            border-radius: 4px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            opacity: 0;
+            transition: opacity 0.2s;
+            padding: 0;
+            line-height: 1;
+        }
+        .chart-container:hover .chart-popout-btn,
+        .chart-popout-btn:focus {
+            opacity: 1;
+        }
+        .chart-popout-btn:hover {
+            background: rgba(80, 80, 80, 0.95);
+            color: #fff;
+            border-color: #777;
+        }
+        .chart-container.fullscreen .chart-popout-btn {
+            opacity: 1;
+            position: fixed;
+            top: 14px;
+            left: 50px;
+            z-index: 10001;
+        }
     </style>
 </head>
 <body>
@@ -4364,7 +4465,211 @@ def index():
         let isStreaming = true;
         let savedScrollPosition = 0; // Track scroll position
         let chartContainerCache = {}; // Cache for chart containers to prevent recreation
-        
+
+        // --- Fullscreen chart support ---
+        const fsExpandSvg = '<svg viewBox="0 0 14 14" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M1 5V1h4M9 1h4v4M13 9v4H9M5 13H1V9"/></svg>';
+        const fsCollapseSvg = '<svg viewBox="0 0 14 14" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M5 1v4H1M9 5h4V1M9 13V9h4M1 9h4v4"/></svg>';
+
+        function toggleChartFullscreen(container) {
+            const isFullscreen = container.classList.contains('fullscreen');
+
+            // Exit any other fullscreen chart first
+            document.querySelectorAll('.chart-container.fullscreen').forEach(el => {
+                el.classList.remove('fullscreen');
+                const b = el.querySelector('.chart-fullscreen-btn');
+                if (b) b.innerHTML = fsExpandSvg;
+            });
+
+            if (!isFullscreen) {
+                container.classList.add('fullscreen');
+                document.body.style.overflow = 'hidden';
+                const b = container.querySelector('.chart-fullscreen-btn');
+                if (b) b.innerHTML = fsCollapseSvg;
+            } else {
+                document.body.style.overflow = '';
+            }
+
+            // Let Plotly know about the size change
+            requestAnimationFrame(() => {
+                document.querySelectorAll('.chart-container').forEach(el => {
+                    const plot = el.querySelector('.js-plotly-plot');
+                    if (plot) { try { Plotly.Plots.resize(plot); } catch(e) {} }
+                });
+            });
+        }
+
+        function addFullscreenButton(container) {
+            if (!container || container.querySelector('.chart-fullscreen-btn')) return;
+            const btn = document.createElement('button');
+            btn.className = 'chart-fullscreen-btn';
+            btn.innerHTML = container.classList.contains('fullscreen') ? fsCollapseSvg : fsExpandSvg;
+            btn.title = 'Toggle fullscreen (Esc to exit)';
+            btn.addEventListener('click', function(e) {
+                e.stopPropagation();
+                e.preventDefault();
+                toggleChartFullscreen(container);
+            });
+            container.appendChild(btn);
+        }
+
+        // ESC key exits fullscreen chart
+        document.addEventListener('keydown', function(e) {
+            if (e.key === 'Escape') {
+                const fs = document.querySelector('.chart-container.fullscreen');
+                if (fs) {
+                    fs.classList.remove('fullscreen');
+                    document.body.style.overflow = '';
+                    const b = fs.querySelector('.chart-fullscreen-btn');
+                    if (b) b.innerHTML = fsExpandSvg;
+                    requestAnimationFrame(() => {
+                        document.querySelectorAll('.chart-container').forEach(el => {
+                            const plot = el.querySelector('.js-plotly-plot');
+                            if (plot) { try { Plotly.Plots.resize(plot); } catch(e) {} }
+                        });
+                    });
+                }
+            }
+        });
+        // Helper: returns appropriate Plotly margins depending on whether chart is fullscreen
+        function getChartMargins(containerId, defaultMargins) {
+            const container = document.getElementById(containerId);
+            if (container && container.classList.contains('fullscreen')) {
+                return {
+                    l: Math.max(defaultMargins.l || 50, 60),
+                    r: Math.max(defaultMargins.r || 50, 130),
+                    t: Math.max(defaultMargins.t || 40, 60),
+                    b: Math.max(defaultMargins.b || 20, 40)
+                };
+            }
+            return defaultMargins;
+        }
+        // --- End fullscreen support ---
+
+        // --- Pop-out (Picture-in-Picture) chart support ---
+        const popoutWindows = {}; // Map of chartId -> Window reference
+        const popoutSvg = '<svg viewBox="0 0 14 14" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M10 1h3v3M13 1L8 6M5 2H2v10h10V9"/></svg>';
+
+        function openPopoutChart(chartId) {
+            // If already open and not closed, focus it
+            if (popoutWindows[chartId] && !popoutWindows[chartId].closed) {
+                popoutWindows[chartId].focus();
+                return;
+            }
+
+            // Derive a display name from the chart id
+            const displayName = chartId.replace('-chart', '').replace(/_/g, ' ').replace(/\\b\\w/g, c => c.toUpperCase());
+
+            const popup = window.open('', 'popout_' + chartId, 'width=900,height=650,menubar=no,toolbar=no,location=no,status=no,resizable=yes,scrollbars=no');
+            if (!popup) {
+                showError('Pop-up blocked! Please allow pop-ups for this site.');
+                return;
+            }
+
+            popup.document.write(`<!DOCTYPE html>
+<html><head><title>${displayName} - EzOptions</title>
+<script src="https://cdn.plot.ly/plotly-latest.min.js"><\\/script>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #1E1E1E; overflow: hidden; position: relative; }
+  #popout-logo { position: fixed; top: 6px; left: 10px; z-index: 100; font-family: Arial, sans-serif; font-size: 11px; font-weight: bold; color: #800080; opacity: 0.7; pointer-events: none; letter-spacing: 0.5px; }
+  #popout-plot { width: 100vw; height: 100vh; }
+  #popout-html { width: 100vw; height: 100vh; overflow: auto; background: #1E1E1E; color: white; font-family: Arial, sans-serif; }
+</style></head><body>
+<div id="popout-logo">EzDuz1t Options</div>
+<div id="popout-plot"></div>
+<div id="popout-html" style="display:none;"></div>
+<script>
+  let plotInited = false;
+  window.updatePopoutChart = function(chartDataJSON, isHtml) {
+    if (isHtml) {
+      document.getElementById('popout-plot').style.display = 'none';
+      const htmlDiv = document.getElementById('popout-html');
+      htmlDiv.style.display = 'block';
+      htmlDiv.innerHTML = chartDataJSON;
+      return;
+    }
+    document.getElementById('popout-html').style.display = 'none';
+    const plotDiv = document.getElementById('popout-plot');
+    plotDiv.style.display = 'block';
+    try {
+      const chartData = JSON.parse(chartDataJSON);
+      chartData.layout.autosize = true;
+      chartData.layout.width = null;
+      chartData.layout.height = null;
+      chartData.layout.margin = { l: 60, r: 130, t: 60, b: 40 };
+      const config = { responsive: true, displayModeBar: true, modeBarButtonsToRemove: ['lasso2d','select2d'], displaylogo: false, scrollZoom: true };
+      if (plotInited) {
+        Plotly.react('popout-plot', chartData.data, chartData.layout, config);
+      } else {
+        Plotly.newPlot('popout-plot', chartData.data, chartData.layout, config);
+        plotInited = true;
+      }
+    } catch(e) { console.error('Popout chart error:', e); }
+  };
+  window.addEventListener('resize', function() {
+    const el = document.getElementById('popout-plot');
+    if (el && el.querySelector('.js-plotly-plot')) { try { Plotly.Plots.resize(el); } catch(e) {} }
+  });
+<\\/script></body></html>`);
+            popup.document.close();
+
+            popoutWindows[chartId] = popup;
+
+            // Push initial data after a small delay so the popup's DOM is ready
+            setTimeout(() => { pushDataToPopout(chartId); }, 300);
+
+            // Clean up reference when popup closes
+            const checkClosed = setInterval(() => {
+                if (popup.closed) {
+                    clearInterval(checkClosed);
+                    delete popoutWindows[chartId];
+                }
+            }, 1000);
+        }
+
+        function pushDataToPopout(chartId) {
+            const popup = popoutWindows[chartId];
+            if (!popup || popup.closed) { delete popoutWindows[chartId]; return; }
+            if (typeof popup.updatePopoutChart !== 'function') return; // not ready yet
+
+            // Determine the data key from chart id  (e.g. 'gamma-chart' -> 'gamma', 'price-chart' -> 'price')
+            const dataKey = chartId.replace('-chart', '');
+            const chartPayload = lastData[dataKey];
+            if (!chartPayload) return;
+
+            const isHtml = (dataKey === 'large_trades');
+            try {
+                popup.updatePopoutChart(chartPayload, isHtml);
+            } catch(e) {
+                // popup may have navigated away or been closed
+                console.warn('Could not push to popout:', e);
+            }
+        }
+
+        function pushAllPopouts() {
+            Object.keys(popoutWindows).forEach(chartId => pushDataToPopout(chartId));
+        }
+
+        function addPopoutButton(container) {
+            if (!container || container.querySelector('.chart-popout-btn')) return;
+            const btn = document.createElement('button');
+            btn.className = 'chart-popout-btn';
+            btn.innerHTML = popoutSvg;
+            btn.title = 'Pop out chart to separate window';
+            btn.addEventListener('click', function(e) {
+                e.stopPropagation();
+                e.preventDefault();
+                openPopoutChart(container.id);
+            });
+            container.appendChild(btn);
+        }
+
+        // Clean up popout windows on page unload
+        window.addEventListener('beforeunload', function() {
+            Object.values(popoutWindows).forEach(w => { try { w.close(); } catch(e) {} });
+        });
+        // --- End pop-out support ---
+
         function showError(message) {
             const notification = document.getElementById('error-notification');
             const messageElement = document.getElementById('error-message');
@@ -4612,7 +4917,7 @@ def index():
                 chartData.layout.autosize = true;
                 chartData.layout.width = null;
                 chartData.layout.height = null;
-                chartData.layout.margin = {l: 50, r: 120, t: 30, b: 20};
+                chartData.layout.margin = getChartMargins('price-chart', {l: 50, r: 120, t: 30, b: 20});
                 
                 // Ensure axes auto-scale with new data
                 if (chartData.layout.xaxis) {
@@ -4718,6 +5023,7 @@ def index():
 
                         if (data[bubbleType]) {
                             const chartData = JSON.parse(data[bubbleType]);
+                            chartData.layout.margin = getChartMargins(chartDiv.id, chartData.layout.margin || {l: 50, r: 50, t: 50, b: 20});
                             charts[bubbleType] = Plotly.newPlot(chartDiv, chartData.data, chartData.layout, bubbleConfig);
                         }
                     });
@@ -4729,6 +5035,7 @@ def index():
                         const chartDiv = document.getElementById(bubbleType + '-chart');
                         if (chartDiv) {
                             const chartData = JSON.parse(data[bubbleType]);
+                            chartData.layout.margin = getChartMargins(chartDiv.id, chartData.layout.margin || {l: 50, r: 50, t: 50, b: 20});
                             Plotly.react(chartDiv, chartData.data, chartData.layout, bubbleConfig);
                             charts[bubbleType] = true;
                         }
@@ -4823,7 +5130,7 @@ def index():
                             chartData.layout.autosize = true;
                             chartData.layout.width = null;
                             chartData.layout.height = null;
-                            chartData.layout.margin = {l: 50, r: 50, t: 40, b: 20};
+                            chartData.layout.margin = getChartMargins(`${key}-chart`, {l: 50, r: 50, t: 40, b: 20});
                             
                             // Ensure axes auto-scale with new data
                             if (chartData.layout.xaxis) {
@@ -4869,6 +5176,21 @@ def index():
                 }
             });
             
+            // Add fullscreen and popout buttons to all chart containers
+            document.querySelectorAll('.chart-container').forEach(c => { addFullscreenButton(c); addPopoutButton(c); });
+
+            // Push updated data to any open popout windows
+            pushAllPopouts();
+
+            // If a chart is currently fullscreen, ensure it resizes to fill viewport
+            const fsChart = document.querySelector('.chart-container.fullscreen');
+            if (fsChart) {
+                requestAnimationFrame(() => {
+                    const plot = fsChart.querySelector('.js-plotly-plot');
+                    if (plot) { try { Plotly.Plots.resize(plot); } catch(e) {} }
+                });
+            }
+
             // Restore scroll position after DOM updates
             requestAnimationFrame(() => {
                 window.scrollTo(0, savedScrollPosition);
