@@ -4856,9 +4856,9 @@ def index():
                 
                 // Only update if data has changed
                 if (JSON.stringify(data) !== JSON.stringify(lastData)) {
+                    lastData = data;  // Update before rendering so popout windows get fresh data
                     updateCharts(data);
                     updatePriceInfo(data.price_info);
-                    lastData = data;
                 }
             })
             .catch(error => {
