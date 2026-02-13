@@ -1325,7 +1325,7 @@ def get_net_colors(values, max_val, call_color, put_color, coloring_mode='Solid'
     
     return colors
 
-def create_exposure_chart(calls, puts, exposure_type, title, S, strike_range=0.02, show_calls=True, show_puts=True, show_net=True, coloring_mode='Solid', call_color='#00FF00', put_color='#FF0000', selected_expiries=None, perspective='Customer', horizontal=False, show_abs_gex_area=False, abs_gex_opacity=0.2, highlight_max_level=False, max_level_color='#800080'):
+def create_exposure_chart(calls, puts, exposure_type, title, S, strike_range=0.02, show_calls=True, show_puts=True, show_net=True, coloring_mode='Solid', call_color='#00FF00', put_color='#FF0000', selected_expiries=None, horizontal=False, show_abs_gex_area=False, abs_gex_opacity=0.2, highlight_max_level=False, max_level_color='#800080'):
     # Ensure the exposure_type column exists
     if exposure_type not in calls.columns or exposure_type not in puts.columns:
         print(f"Warning: {exposure_type} not found in data")
@@ -1367,10 +1367,6 @@ def create_exposure_chart(calls, puts, exposure_type, title, S, strike_range=0.0
     else:
         # For other exposures, sum them (puts are same sign as calls usually)
         total_net_exposure = total_call_exposure + total_put_exposure
-    
-    # Apply perspective (Dealer = Short, flip the sign of Net values)
-    if perspective == 'Dealer':
-        total_net_exposure = total_net_exposure * -1
     
     # Create the main title and net exposure as separate annotations
     fig = go.Figure()
@@ -1506,10 +1502,6 @@ def create_exposure_chart(calls, puts, exposure_type, title, S, strike_range=0.0
             else:
                 net_value = call_value + put_value
             
-            # Apply perspective (Dealer = Short, flip the sign of Net values)
-            if perspective == 'Dealer':
-                net_value = net_value * -1
-                
             net_exposure.append(net_value)
         
         # Calculate max for net exposure normalization
@@ -1748,7 +1740,7 @@ def create_volume_chart(call_volume, put_volume, use_itm=True, call_color='#00FF
     
     return fig.to_json()
 
-def create_options_volume_chart(calls, puts, S, strike_range=0.02, call_color='#00FF00', put_color='#FF0000', coloring_mode='Solid', show_calls=True, show_puts=True, show_net=True, selected_expiries=None, perspective='Customer', horizontal=False, highlight_max_level=False, max_level_color='#800080'):
+def create_options_volume_chart(calls, puts, S, strike_range=0.02, call_color='#00FF00', put_color='#FF0000', coloring_mode='Solid', show_calls=True, show_puts=True, show_net=True, selected_expiries=None, horizontal=False, highlight_max_level=False, max_level_color='#800080'):
     # Filter strikes within range
     min_strike = S * (1 - strike_range)
     max_strike = S * (1 + strike_range)
@@ -1847,10 +1839,6 @@ def create_options_volume_chart(calls, puts, S, strike_range=0.02, call_color='#
             put_vol = puts[puts['strike'] == strike]['volume'].sum() if not puts.empty else 0
             net_vol = call_vol - put_vol
             
-            # Apply perspective (Dealer = Short, flip the sign of Net values)
-            if perspective == 'Dealer':
-                net_vol = net_vol * -1
-                
             net_volume.append(net_vol)
         
         # Calculate max for net volume normalization
@@ -2474,18 +2462,22 @@ def create_price_chart(price_data, calls=None, puts=None, exposure_levels_types=
                 for strike, val in top_levels:
                     all_top_levels.append((strike, val, exposure_levels_type, i))
 
-        # Find absolute max across ALL displayed levels for highlighting
-        overall_max_abs_val = 0
+        # Find the max level independently for EACH exposure type for highlighting
+        max_abs_by_type = {}
         if highlight_max_level and all_top_levels:
-            overall_max_abs_val = max(abs(l[1]) for l in all_top_levels)
+            for strike, val, etype, tidx in all_top_levels:
+                abs_val = abs(val)
+                if etype not in max_abs_by_type or abs_val > max_abs_by_type[etype]:
+                    max_abs_by_type[etype] = abs_val
 
         # Draw all collected levels
         for strike, val, exposure_levels_type, type_index in all_top_levels:
             # Pick dash style
             dash_style = dash_styles[type_index % len(dash_styles)]
             
-            # Check if this is the absolute maximum level to highlight
-            is_max_level = highlight_max_level and abs(val) == overall_max_abs_val and overall_max_abs_val > 0
+            # Check if this is the maximum level within its own exposure type
+            type_max = max_abs_by_type.get(exposure_levels_type, 0)
+            is_max_level = highlight_max_level and type_max > 0 and abs(val) == type_max
             
             if is_max_level:
                 color = max_level_color
@@ -2704,7 +2696,7 @@ def create_large_trades_table(calls, puts, S, strike_range, call_color='#00FF00'
 
 
 
-def create_historical_bubble_levels_chart(ticker, strike_range, call_color='#00FFA3', put_color='#FF3B3B', exposure_type='gamma', perspective='Customer', absolute=False, highlight_max_level=False, max_level_color='#800080'):
+def create_historical_bubble_levels_chart(ticker, strike_range, call_color='#00FFA3', put_color='#FF3B3B', exposure_type='gamma', absolute=False, highlight_max_level=False, max_level_color='#800080'):
     """Create a chart showing price and exposure (gamma, delta, or vanna) over time for the full session.
 
     Supports optional highlighting of the max exposure bubble via highlight_max_level and max_level_color.
@@ -2763,10 +2755,6 @@ def create_historical_bubble_levels_chart(ticker, strike_range, call_color='#00F
         elif exposure_type == 'charm':
             exposure = net_charm
         
-        # Apply perspective (Dealer = Short, flip the sign of values)
-        if perspective == 'Dealer':
-            exposure = exposure * -1
-            
         if exposure is None:
             exposure = 0
         
@@ -3019,7 +3007,7 @@ def create_historical_bubble_levels_chart(ticker, strike_range, call_color='#00F
 
 
 
-def create_premium_chart(calls, puts, S, strike_range=0.02, call_color='#00FF00', put_color='#FF0000', coloring_mode='Solid', show_calls=True, show_puts=True, show_net=True, selected_expiries=None, perspective='Customer', horizontal=False, highlight_max_level=False, max_level_color='#800080'):
+def create_premium_chart(calls, puts, S, strike_range=0.02, call_color='#00FF00', put_color='#FF0000', coloring_mode='Solid', show_calls=True, show_puts=True, show_net=True, selected_expiries=None, horizontal=False, highlight_max_level=False, max_level_color='#800080'):
     # Filter strikes within range
     min_strike = S * (1 - strike_range)
     max_strike = S * (1 + strike_range)
@@ -3118,10 +3106,6 @@ def create_premium_chart(calls, puts, S, strike_range=0.02, call_color='#00FF00'
             put_prem = puts[puts['strike'] == strike]['lastPrice'].sum() if not puts.empty else 0
             net_prem = call_prem - put_prem
             
-            # Apply perspective (Dealer = Short, flip the sign of Net values)
-            if perspective == 'Dealer':
-                net_prem = net_prem * -1
-                
             net_premium.append(net_prem)
         
         # Calculate max for net premium normalization
@@ -4282,13 +4266,6 @@ def index():
                         <label for="show_net">Net</label>
                     </div>
                     <div class="control-group">
-                        <label for="perspective">Perspective:</label>
-                        <select id="perspective">
-                            <option value="Customer" selected>Customer</option>
-                            <option value="Dealer">Dealer</option>
-                        </select>
-                    </div>
-                    <div class="control-group">
                         <label for="coloring_mode">Coloring Mode:</label>
                         <select id="coloring_mode" title="Solid: All bars same color | Linear: Gradual fade by value | Ranked: Only highest exposures are bright, others heavily muted">
                             <option value="Solid" selected>Solid</option>
@@ -4711,9 +4688,8 @@ def index():
             updateData();
         });
 
-        // Perspective and coloring mode listeners
+        // Coloring mode listeners
         document.getElementById('timeframe').addEventListener('change', updateData);
-        document.getElementById('perspective').addEventListener('change', updateData);
         document.getElementById('coloring_mode').addEventListener('change', updateData);
         document.getElementById('exposure_metric').addEventListener('change', updateData);
         document.getElementById('levels_count').addEventListener('input', updateData);
@@ -4779,7 +4755,6 @@ def index():
             const deltaAdjusted = document.getElementById('delta_adjusted_exposures').checked;
             const calculateInNotional = document.getElementById('calculate_in_notional').checked;
             const strikeRange = parseFloat(document.getElementById('strike_range').value) / 100;
-            const perspective = document.getElementById('perspective').value;
             const highlightMaxLevel = document.getElementById('highlight_max_level').checked;
             
             // Get visible charts
@@ -4828,7 +4803,6 @@ def index():
                     delta_adjusted: deltaAdjusted,
                     calculate_in_notional: calculateInNotional,
                     strike_range: strikeRange,
-                    perspective: perspective,
                     call_color: callColor,
                     put_color: putColor,
                     highlight_max_level: highlightMaxLevel,
@@ -5403,7 +5377,6 @@ def index():
                 show_calls: document.getElementById('show_calls').checked,
                 show_puts: document.getElementById('show_puts').checked,
                 show_net: document.getElementById('show_net').checked,
-                perspective: document.getElementById('perspective').value,
                 coloring_mode: document.getElementById('coloring_mode').value,
                 levels_types: Array.from(document.querySelectorAll('.levels-option input:checked')).map(cb => cb.value),
                 levels_count: document.getElementById('levels_count').value,
@@ -5453,7 +5426,6 @@ def index():
             if (settings.show_calls !== undefined) document.getElementById('show_calls').checked = settings.show_calls;
             if (settings.show_puts !== undefined) document.getElementById('show_puts').checked = settings.show_puts;
             if (settings.show_net !== undefined) document.getElementById('show_net').checked = settings.show_net;
-            if (settings.perspective) document.getElementById('perspective').value = settings.perspective;
             // Handle coloring_mode with migration from old color_intensity setting
             if (settings.coloring_mode) {
                 document.getElementById('coloring_mode').value = settings.coloring_mode;
@@ -5726,7 +5698,6 @@ def update():
         exposure_levels_types = data.get('levels_types', [])
         exposure_levels_count = int(data.get('levels_count', 3))
         use_heikin_ashi = data.get('use_heikin_ashi', False)
-        perspective = data.get('perspective', 'Customer')
         horizontal = data.get('horizontal_bars', False)
         show_abs_gex = data.get('show_abs_gex', False)
         abs_gex_opacity = float(data.get('abs_gex_opacity', 0.2))
@@ -5755,46 +5726,46 @@ def update():
         if data.get('show_gex_historical_bubble', True):
             # Accept either 'gex_absolute' (old key) or 'absolute_gex' (JS payload) for compatibility
             absolute_gex = bool(data.get('gex_absolute', data.get('absolute_gex', False)))
-            response['gex_historical_bubble'] = create_historical_bubble_levels_chart(ticker, strike_range, call_color, put_color, 'gamma', perspective, absolute=absolute_gex, highlight_max_level=highlight_max_level, max_level_color=max_level_color)
+            response['gex_historical_bubble'] = create_historical_bubble_levels_chart(ticker, strike_range, call_color, put_color, 'gamma', absolute=absolute_gex, highlight_max_level=highlight_max_level, max_level_color=max_level_color)
 
         if data.get('show_dex_historical_bubble', True):
-            response['dex_historical_bubble'] = create_historical_bubble_levels_chart(ticker, strike_range, call_color, put_color, 'delta', perspective, highlight_max_level=highlight_max_level, max_level_color=max_level_color)
+            response['dex_historical_bubble'] = create_historical_bubble_levels_chart(ticker, strike_range, call_color, put_color, 'delta', highlight_max_level=highlight_max_level, max_level_color=max_level_color)
 
         if data.get('show_vanna_historical_bubble', True):
-            response['vanna_historical_bubble'] = create_historical_bubble_levels_chart(ticker, strike_range, call_color, put_color, 'vanna', perspective, highlight_max_level=highlight_max_level, max_level_color=max_level_color)
+            response['vanna_historical_bubble'] = create_historical_bubble_levels_chart(ticker, strike_range, call_color, put_color, 'vanna', highlight_max_level=highlight_max_level, max_level_color=max_level_color)
 
         if data.get('show_charm_historical_bubble', True):
-            response['charm_historical_bubble'] = create_historical_bubble_levels_chart(ticker, strike_range, call_color, put_color, 'charm', perspective, highlight_max_level=highlight_max_level, max_level_color=max_level_color)
+            response['charm_historical_bubble'] = create_historical_bubble_levels_chart(ticker, strike_range, call_color, put_color, 'charm', highlight_max_level=highlight_max_level, max_level_color=max_level_color)
         
         if data.get('show_gamma', True):
-            response['gamma'] = create_exposure_chart(calls, puts, "GEX", "Gamma Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, coloring_mode, call_color, put_color, expiry_dates, perspective, horizontal, show_abs_gex_area=show_abs_gex, abs_gex_opacity=abs_gex_opacity, highlight_max_level=highlight_max_level, max_level_color=max_level_color)
+            response['gamma'] = create_exposure_chart(calls, puts, "GEX", "Gamma Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, coloring_mode, call_color, put_color, expiry_dates, horizontal, show_abs_gex_area=show_abs_gex, abs_gex_opacity=abs_gex_opacity, highlight_max_level=highlight_max_level, max_level_color=max_level_color)
         
         if data.get('show_delta', True):
-            response['delta'] = create_exposure_chart(calls, puts, "DEX", "Delta Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, coloring_mode, call_color, put_color, expiry_dates, perspective, horizontal, highlight_max_level=highlight_max_level, max_level_color=max_level_color)
+            response['delta'] = create_exposure_chart(calls, puts, "DEX", "Delta Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, coloring_mode, call_color, put_color, expiry_dates, horizontal, highlight_max_level=highlight_max_level, max_level_color=max_level_color)
         
         if data.get('show_vanna', True):
-            response['vanna'] = create_exposure_chart(calls, puts, "VEX", "Vanna Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, coloring_mode, call_color, put_color, expiry_dates, perspective, horizontal, highlight_max_level=highlight_max_level, max_level_color=max_level_color)
+            response['vanna'] = create_exposure_chart(calls, puts, "VEX", "Vanna Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, coloring_mode, call_color, put_color, expiry_dates, horizontal, highlight_max_level=highlight_max_level, max_level_color=max_level_color)
         
         if data.get('show_charm', True):
-            response['charm'] = create_exposure_chart(calls, puts, "Charm", "Charm Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, coloring_mode, call_color, put_color, expiry_dates, perspective, horizontal, highlight_max_level=highlight_max_level, max_level_color=max_level_color)
+            response['charm'] = create_exposure_chart(calls, puts, "Charm", "Charm Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, coloring_mode, call_color, put_color, expiry_dates, horizontal, highlight_max_level=highlight_max_level, max_level_color=max_level_color)
         
         if data.get('show_speed', True):
-            response['speed'] = create_exposure_chart(calls, puts, "Speed", "Speed Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, coloring_mode, call_color, put_color, expiry_dates, perspective, horizontal, highlight_max_level=highlight_max_level, max_level_color=max_level_color)
+            response['speed'] = create_exposure_chart(calls, puts, "Speed", "Speed Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, coloring_mode, call_color, put_color, expiry_dates, horizontal, highlight_max_level=highlight_max_level, max_level_color=max_level_color)
         
         if data.get('show_vomma', True):
-            response['vomma'] = create_exposure_chart(calls, puts, "Vomma", "Vomma Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, coloring_mode, call_color, put_color, expiry_dates, perspective, horizontal, highlight_max_level=highlight_max_level, max_level_color=max_level_color)
+            response['vomma'] = create_exposure_chart(calls, puts, "Vomma", "Vomma Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, coloring_mode, call_color, put_color, expiry_dates, horizontal, highlight_max_level=highlight_max_level, max_level_color=max_level_color)
 
         if data.get('show_color', True):
-            response['color'] = create_exposure_chart(calls, puts, "Color", "Color Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, coloring_mode, call_color, put_color, expiry_dates, perspective, horizontal, highlight_max_level=highlight_max_level, max_level_color=max_level_color)
+            response['color'] = create_exposure_chart(calls, puts, "Color", "Color Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, coloring_mode, call_color, put_color, expiry_dates, horizontal, highlight_max_level=highlight_max_level, max_level_color=max_level_color)
         
         if data.get('show_volume', True):
             response['volume'] = create_volume_chart(call_volume, put_volume, use_range, call_color, put_color, expiry_dates)
         
         if data.get('show_options_volume', True):
-            response['options_volume'] = create_options_volume_chart(calls, puts, S, strike_range, call_color, put_color, coloring_mode, show_calls, show_puts, show_net, expiry_dates, perspective, horizontal, highlight_max_level=highlight_max_level, max_level_color=max_level_color)
+            response['options_volume'] = create_options_volume_chart(calls, puts, S, strike_range, call_color, put_color, coloring_mode, show_calls, show_puts, show_net, expiry_dates, horizontal, highlight_max_level=highlight_max_level, max_level_color=max_level_color)
         
         if data.get('show_premium', True):
-            response['premium'] = create_premium_chart(calls, puts, S, strike_range, call_color, put_color, coloring_mode, show_calls, show_puts, show_net, expiry_dates, perspective, horizontal, highlight_max_level=highlight_max_level, max_level_color=max_level_color)
+            response['premium'] = create_premium_chart(calls, puts, S, strike_range, call_color, put_color, coloring_mode, show_calls, show_puts, show_net, expiry_dates, horizontal, highlight_max_level=highlight_max_level, max_level_color=max_level_color)
         
         if data.get('show_large_trades', True):
             response['large_trades'] = create_large_trades_table(calls, puts, S, strike_range, call_color, put_color, expiry_dates)
