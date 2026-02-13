@@ -838,14 +838,11 @@ def fetch_options_for_date(ticker, date, exposure_metric="Open Interest", delta_
             weight = 0
             if exposure_metric == 'Volume':
                 weight = option_data['volume']
-            elif exposure_metric == 'OI Weighted by Volume':
-                # Geometric Mean: sqrt(OI * volume)
+            elif exposure_metric == 'Max OI vs Volume':
+                # Use the greater of OI and volume as the weight
                 oi = option_data['openInterest']
                 vol = option_data['volume']
-                if vol > 0 and oi > 0:
-                    weight = math.sqrt(oi * vol)
-                else:
-                    weight = oi * 0.1
+                weight = max(oi, vol)
             else: # Open Interest
                 weight = option_data['openInterest']
                 
@@ -856,14 +853,11 @@ def fetch_options_for_date(ticker, date, exposure_metric="Open Interest", delta_
             weight = 0
             if exposure_metric == 'Volume':
                 weight = option_data['volume']
-            elif exposure_metric == 'OI Weighted by Volume':
-                # Geometric Mean: sqrt(OI * volume)
+            elif exposure_metric == 'Max OI vs Volume':
+                # Use the greater of OI and volume as the weight
                 oi = option_data['openInterest']
                 vol = option_data['volume']
-                if vol > 0 and oi > 0:
-                    weight = math.sqrt(oi * vol)
-                else:
-                    weight = oi * 0.1
+                weight = max(oi, vol)
             else: # Open Interest
                 weight = option_data['openInterest']
                 
@@ -4264,7 +4258,7 @@ def index():
                         <select id="exposure_metric" title="Select the metric used to weight exposure formulas (GEX/DEX/VEX etc)">
                             <option value="Open Interest" selected>Open Interest</option>
                             <option value="Volume">Volume</option>
-                            <option value="OI Weighted by Volume">OI Weighted by Volume</option>
+                            <option value="Max OI vs Volume">Max OI vs Volume</option>
                         </select>
                     </div>
                     <div class="control-group" title="When enabled, exposure formulas are adjusted by delta.">
