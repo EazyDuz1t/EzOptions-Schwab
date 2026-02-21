@@ -357,7 +357,7 @@ def format_display_ticker(ticker):
         # For SPX, return SPXW for options symbols and $SPX for underlying
         return ['SPXW', '$SPX']
     elif ticker == 'MARKET2':
-        return ['SPY', 'QQQ', 'IWM']
+        return ['SPY']
     return [ticker]
 
 def format_large_number(num):
@@ -453,107 +453,6 @@ def calculate_time_to_expiration(expiry_date):
         print(f"Error calculating time to expiration: {e}")
         return 0
 
-def map_to_base_strikes(df, etf_price, base_price, bucket_size=10):
-    """
-    Maps ETF strikes to base-equivalent strikes using moneyness,
-    then distributes using a Gaussian kernel with adaptive bandwidth.
-    
-    This provides smooth distribution across strikes while preserving
-    the exact economic relationship of each contract to its spot.
-    
-    Args:
-        df: DataFrame with 'strike' column
-        etf_price: Current ETF spot price
-        base_price: Current base (SPX/SPY) spot price  
-        bucket_size: Strike bucket width in dollars (default $10)
-    
-    Returns:
-        DataFrame with strikes distributed to base buckets
-    """
-    if df.empty:
-        return df
-        
-    df = df.copy()
-    
-    # Store original values for Greek calculations
-    df['_original_strike'] = df['strike']
-    df['_original_spot'] = etf_price
-    
-    # Estimate ETF's typical strike spacing
-    sorted_strikes = np.sort(df['strike'].unique())
-    if len(sorted_strikes) > 1:
-        strike_diffs = np.diff(sorted_strikes)
-        etf_strike_spacing = np.median(strike_diffs[strike_diffs > 0])
-    else:
-        etf_strike_spacing = 1.0
-    
-    # Convert to base-equivalent spacing
-    base_equivalent_spacing = etf_strike_spacing * (base_price / etf_price)
-    
-    # Bandwidth (σ) = half of base-equivalent spacing
-    sigma = max(base_equivalent_spacing / 2, bucket_size / 2)
-    
-    # Calculate moneyness and base-equivalent strikes
-    moneyness = df['strike'] / etf_price
-    target_strikes = moneyness * base_price
-    
-    # Determine spread range
-    spread_range = min(max(int(np.ceil(3 * sigma / bucket_size)), 1), 5)
-    offsets = np.arange(-spread_range, spread_range + 1) * bucket_size
-    
-    result_dfs = []
-    
-    # Weight columns to distribute
-    weight_cols = ['openInterest', 'volume', 'GEX', 'DEX', 'VEX', 'Charm', 'Speed', 'Vomma', 'Color']
-    
-    for offset in offsets:
-        df_bucket = df.copy()
-        base_bucket = np.round(target_strikes / bucket_size) * bucket_size
-        bucket_strike = base_bucket + offset
-        distance = bucket_strike - target_strikes
-        
-        # Gaussian weight
-        weight = np.exp(-distance**2 / (2 * sigma**2))
-        
-        mask = weight > 0.01
-        if not mask.any():
-            continue
-            
-        df_bucket = df_bucket[mask].copy()
-        weight = weight[mask]
-        
-        df_bucket['strike'] = bucket_strike[mask]
-        df_bucket['_bucket_weight'] = weight
-        
-        # Scale by weight
-        for col in weight_cols:
-            if col in df_bucket.columns:
-                df_bucket[col] = df_bucket[col] * weight
-        
-        result_dfs.append(df_bucket)
-    
-    if not result_dfs:
-        df['strike'] = np.round(target_strikes / bucket_size) * bucket_size
-        df['_bucket_weight'] = 1.0
-        return df
-    
-    result = pd.concat(result_dfs, ignore_index=True)
-    
-    # Normalize weights so each original contract sums to 1.0
-    if '_original_strike' in result.columns:
-        weight_sums = result.groupby('_original_strike')['_bucket_weight'].transform('sum')
-        weight_sums = weight_sums.replace(0, 1)
-        norm_factor = 1.0 / weight_sums
-        norm_factor = norm_factor.replace([np.inf, -np.inf], 1.0).fillna(1.0)
-        
-        for col in weight_cols:
-            if col in result.columns:
-                result[col] = result[col] * norm_factor
-        
-        result['_bucket_weight'] = result['_bucket_weight'] * norm_factor
-    
-    return result
-
 def fetch_options_for_date(ticker, date, exposure_metric="Open Interest", delta_adjusted: bool = False, calculate_in_notional: bool = True, S=None):
     if client is None:
         raise Exception("Schwab API client not initialized. Check your environment variables.")
@@ -573,16 +472,17 @@ def fetch_options_for_date(ticker, date, exposure_metric="Open Interest", delta_
             return pd.DataFrame(), pd.DataFrame()
 
         # Step 2: Components to combine
+        # Calculate bucket size from the base chain's actual strike spacing
+        # (e.g. SPX → typically $5, SPY → $1). Avoids hardcoding.
+        base_all_strikes = []
+        if not base_calls_raw.empty: base_all_strikes.extend(base_calls_raw['strike'].tolist())
+        if not base_puts_raw.empty: base_all_strikes.extend(base_puts_raw['strike'].tolist())
+        bucket_size = get_strike_interval(base_all_strikes) if base_all_strikes else 5.0
+
         if ticker == "MARKET":
-            bucket_size = 10
-            component_tickers = ["$SPX", "SPY", "QQQ", "IWM"]
+            component_tickers = ["$SPX", "SPY"]
         else:
-            # Calculate appropriate bucket size from base chain (SPY) for MARKET2
-            base_all_strikes = []
-            if not base_calls_raw.empty: base_all_strikes.extend(base_calls_raw['strike'].tolist())
-            if not base_puts_raw.empty: base_all_strikes.extend(base_puts_raw['strike'].tolist())
-            bucket_size = get_strike_interval(base_all_strikes) if base_all_strikes else 1.0
-            component_tickers = ["SPY", "QQQ", "IWM"]
+            component_tickers = ["SPY"]
         
         calls_list = []
         puts_list = []
@@ -628,68 +528,118 @@ def fetch_options_for_date(ticker, date, exposure_metric="Open Interest", delta_
         if not component_data:
             return pd.DataFrame(), pd.DataFrame()
         
-        # Compute geometric-mean scale factor per column across all components.
-        # geometric_mean(x1,x2,...,xN) = exp(mean(log(x)))
-        # This is less sensitive to an SPX outlier than arithmetic mean and
-        # more stable than median for small N (3–4 components).
-        geo_scale = {}
-        for col in exposure_cols + activity_cols:
-            log_sum = sum(np.log(cd['totals'][col]) for cd in component_data)
-            geo_scale[col] = np.exp(log_sum / len(component_data))
+        # Use the base component's totals as a fixed reference anchor.
+        # Base component (SPX) stays untouched (factor = 1.0).
+        # Non-base components: factor = base_total / component_total
+        # (scaled UP so their total matches SPX's magnitude).
+        # Combined total ≈ N × base_total.
+        #
+        # Key stability property: a change in QQQ's or IWM's totals only
+        # affects that component's bars — SPX/SPY bars stay unchanged.
+        base_cd = next((cd for cd in component_data if cd['ticker'] == base_ticker), component_data[0])
+        base_totals = base_cd['totals']
         
-        # Second pass: per-Greek self-normalization, then scale-back, then
-        # map strikes to base-equivalent via moneyness.
+        # Second pass: per-column normalization anchored to base component,
+        # then map strikes to base-equivalent via moneyness.
+        # Matches ezoptions.py: base component (SPX) is UNTOUCHED,
+        # non-base components are scaled so their total matches SPX's total.
         for cd in component_data:
             comp_tick = cd['ticker']
             comp_price = cd['price']
             c = cd['calls']
             p = cd['puts']
             totals = cd['totals']
+            
+            is_base = (comp_tick == base_ticker)
 
-            # Build per-column norm factors: value / component_total * geo_scale
-            # This turns each component's values into proportions of its own
-            # activity, then scales them to a common display magnitude.
+            # Build per-column norm factors anchored to base component.
+            # Base component: factor = 1.0 (unchanged).
+            # Non-base: factor = base_total / component_total (scale up to match SPX magnitude).
             col_norm = {}
             for col in exposure_cols + activity_cols:
-                col_norm[col] = geo_scale[col] / totals[col]
+                if is_base:
+                    col_norm[col] = 1.0
+                else:
+                    col_norm[col] = base_totals[col] / totals[col]
             
             # Process Calls
             if not c.empty:
                 c = c.copy()
                 
-                # Normalize each Greek independently
-                for col in exposure_cols:
-                    if col in c.columns:
+                # Normalize each column independently (Greeks + OI/Volume)
+                # Base component is untouched (factor=1.0), others scaled to match base
+                for col in exposure_cols + activity_cols:
+                    if col in c.columns and not is_base:
                         c[col] = c[col] * col_norm[col]
                 
-                # Normalize OI/Volume with per-column factor (preserves relative activity)
-                for col in activity_cols:
-                    if col in c.columns:
-                        c[col] = c[col] * col_norm[col]
-                
-                # Map strikes to base-equivalent using moneyness
-                c = map_to_base_strikes(c, comp_price, base_price, bucket_size=bucket_size)
-                
-                calls_list.append(c)
+                if is_base:
+                    # Base component: strikes are already native SPX strikes.
+                    # No moneyness mapping needed — just snap to nearest bucket
+                    # to avoid floating-point ghost rows.
+                    c['strike'] = (c['strike'] / bucket_size).round() * bucket_size
+                    calls_list.append(c)
+                else:
+                    # Map strikes to base-equivalent via moneyness with linear
+                    # interpolation between the two nearest buckets.  This prevents
+                    # "bucket-hopping" where a small price change snaps 100% of a
+                    # strike's exposure from one bucket to an adjacent one.
+                    # Total exposure is conserved: weight_lo + weight_hi = 1.0.
+                    weight_cols = exposure_cols + activity_cols
+                    exact = (c['strike'] / comp_price) * base_price
+                    # Round to avoid floating-point boundary jitter
+                    exact = exact.round(6)
+                    bucket_lo = np.floor(exact / bucket_size) * bucket_size
+                    bucket_hi = bucket_lo + bucket_size
+                    weight_hi = (exact - bucket_lo) / bucket_size
+                    weight_lo = 1.0 - weight_hi
+                    
+                    c_lo = c.copy()
+                    c_hi = c.copy()
+                    c_lo['strike'] = bucket_lo
+                    c_hi['strike'] = bucket_hi
+                    for col in weight_cols:
+                        if col in c_lo.columns:
+                            c_lo[col] = c_lo[col] * weight_lo
+                            c_hi[col] = c_hi[col] * weight_hi
+                    
+                    calls_list.append(c_lo)
+                    calls_list.append(c_hi)
 
             # Process Puts
             if not p.empty:
                 p = p.copy()
                 
-                # Normalize each Greek independently
-                for col in exposure_cols:
-                    if col in p.columns:
+                # Normalize each column independently (Greeks + OI/Volume)
+                # Base component is untouched (factor=1.0), others scaled to match base
+                for col in exposure_cols + activity_cols:
+                    if col in p.columns and not is_base:
                         p[col] = p[col] * col_norm[col]
                 
-                # Normalize OI/Volume with per-column factor (preserves relative activity)
-                for col in activity_cols:
-                    if col in p.columns:
-                        p[col] = p[col] * col_norm[col]
-                
-                # Map strikes to base-equivalent using moneyness
-                p = map_to_base_strikes(p, comp_price, base_price, bucket_size=bucket_size)
-                
-                puts_list.append(p)
+                if is_base:
+                    # Base component: strikes are already native SPX strikes.
+                    p['strike'] = (p['strike'] / bucket_size).round() * bucket_size
+                    puts_list.append(p)
+                else:
+                    # Map strikes to base-equivalent via moneyness with linear interpolation
+                    exact = (p['strike'] / comp_price) * base_price
+                    # Round to avoid floating-point boundary jitter
+                    exact = exact.round(6)
+                    bucket_lo = np.floor(exact / bucket_size) * bucket_size
+                    bucket_hi = bucket_lo + bucket_size
+                    weight_hi = (exact - bucket_lo) / bucket_size
+                    weight_lo = 1.0 - weight_hi
+                    
+                    p_lo = p.copy()
+                    p_hi = p.copy()
+                    p_lo['strike'] = bucket_lo
+                    p_hi['strike'] = bucket_hi
+                    for col in weight_cols:
+                        if col in p_lo.columns:
+                            p_lo[col] = p_lo[col] * weight_lo
+                            p_hi[col] = p_hi[col] * weight_hi
+                    
+                    puts_list.append(p_lo)
+                    puts_list.append(p_hi)
 
         # Step 3: Combine and Aggregate by Strike
         combined_calls = pd.concat(calls_list, ignore_index=True) if calls_list else pd.DataFrame()
@@ -1141,13 +1091,13 @@ def calculate_greek_exposures(option, S, weight, delta_adjusted: bool = False, c
     
     # VEX: Vanna exposure
     vanna_exposure = vanna * weight * contract_size * spot_multiplier * 0.01
-    
+
     # Charm
     charm = calculate_charm(flag, S, K, t, vol, r, q)
     charm_exposure = charm * weight * contract_size * spot_multiplier / 365.0
     
     # Speed
-    # Speed Exposure (Notional) ~ Speed * S * S * 0.01 (Matches ezoptions.py Speed * S * spot_multiplier)
+    # Speed Exposure (Notional) ~ Speed * S * S * 0.01 
     speed = calculate_speed(flag, S, K, t, vol, r, q)
     speed_exposure = speed * weight * contract_size * S * spot_multiplier * 0.01
     
@@ -1169,7 +1119,6 @@ def calculate_greek_exposures(option, S, weight, delta_adjusted: bool = False, c
         vomma_exposure *= abs_delta
         color_exposure *= abs_delta
 
-    
     return {
         'DEX': dex,
         'GEX': gex,
@@ -1325,7 +1274,7 @@ def get_net_colors(values, max_val, call_color, put_color, coloring_mode='Solid'
     
     return colors
 
-def create_exposure_chart(calls, puts, exposure_type, title, S, strike_range=0.02, show_calls=True, show_puts=True, show_net=True, coloring_mode='Solid', call_color='#00FF00', put_color='#FF0000', selected_expiries=None, horizontal=False, show_abs_gex_area=False, abs_gex_opacity=0.2, highlight_max_level=False, max_level_color='#800080'):
+def create_exposure_chart(calls, puts, exposure_type, title, S, strike_range=0.02, show_calls=True, show_puts=True, show_net=True, coloring_mode='Solid', call_color='#00FF00', put_color='#FF0000', selected_expiries=None, horizontal=False, show_abs_gex_area=False, abs_gex_opacity=0.2, highlight_max_level=False, max_level_color='#800080', max_level_mode='Absolute'):
     # Ensure the exposure_type column exists
     if exposure_type not in calls.columns or exposure_type not in puts.columns:
         print(f"Warning: {exposure_type} not found in data")
@@ -1354,19 +1303,20 @@ def create_exposure_chart(calls, puts, exposure_type, title, S, strike_range=0.0
         calls_df = aggregate_by_strike(calls_df, [exposure_type], strike_interval)
         puts_df = aggregate_by_strike(puts_df, [exposure_type], strike_interval)
     
-    # Calculate total net exposure
-    total_call_exposure = calls_df[exposure_type].sum() if not calls_df.empty else 0
-    total_put_exposure = puts_df[exposure_type].sum() if not puts_df.empty else 0
-    
+    # Calculate total net exposure from the entire chain (not just strike range)
+    total_call_exposure = calls[exposure_type].sum() if not calls.empty and exposure_type in calls.columns else 0
+    total_put_exposure = puts[exposure_type].sum() if not puts.empty and exposure_type in puts.columns else 0
+
     if exposure_type == 'GEX':
-        # For gamma exposure, subtract puts from calls (puts are positive in calculation)
         total_net_exposure = total_call_exposure - total_put_exposure
     elif exposure_type == 'DEX':
-        # For delta exposure, sum them (puts are negative in calculation)
         total_net_exposure = total_call_exposure + total_put_exposure
     else:
-        # For other exposures, sum them (puts are same sign as calls usually)
         total_net_exposure = total_call_exposure + total_put_exposure
+        # Calculate total net volume from the entire chain (not just strike range)
+        total_call_volume = calls['volume'].sum() if not calls.empty and 'volume' in calls.columns else 0
+        total_put_volume = puts['volume'].sum() if not puts.empty and 'volume' in puts.columns else 0
+        total_net_volume = total_call_volume - total_put_volume
     
     # Create the main title and net exposure as separate annotations
     fig = go.Figure()
@@ -1681,37 +1631,46 @@ def create_exposure_chart(calls, puts, exposure_type, title, S, strike_range=0.0
     # Logic for Highlighting Max Level
     if highlight_max_level:
         try:
-            max_abs_val = 0
-            max_trace_idx = -1
-            max_bar_idx = -1
-            
-            for i, trace in enumerate(fig.data):
-                if trace.type == 'bar':
-                    # Get values based on orientation
-                    vals = trace.x if horizontal else trace.y
-                    if vals:
-                        abs_vals = [abs(v) for v in vals]
-                        if abs_vals:
-                            local_max = max(abs_vals)
-                            if local_max > max_abs_val:
-                                max_abs_val = local_max
-                                max_trace_idx = i
-                                max_bar_idx = abs_vals.index(local_max)
-            
-            if max_trace_idx != -1:
-                # Set marker line for the specific bar
-                # marker.line.width can be an array to highlight specific bars
-                vals = fig.data[max_trace_idx].x if horizontal else fig.data[max_trace_idx].y
-                line_widths = [0] * len(vals)
-                line_widths[max_bar_idx] = 5
-                
-                # Use update instead of direct assignment to ensure Plotly handles it correctly
-                fig.data[max_trace_idx].update(marker=dict(
-                    line=dict(
-                        width=line_widths,
-                        color=max_level_color
-                    )
-                ))
+            if max_level_mode == 'Net':
+                # Highlight the bar in the Net trace that best represents the overall chain net.
+                # Overall direction = sign of total net. Then find the bar most aligned with that direction.
+                net_trace_idx = next((i for i, t in enumerate(fig.data) if t.type == 'bar' and t.name == 'Net'), None)
+                if net_trace_idx is not None:
+                    raw = fig.data[net_trace_idx].x if horizontal else fig.data[net_trace_idx].y
+                    if raw:
+                        vals = list(raw)
+                        total_net = sum(vals)
+                        if total_net >= 0:
+                            max_bar_idx = vals.index(max(vals))
+                        else:
+                            max_bar_idx = vals.index(min(vals))
+                        line_widths = [0] * len(vals)
+                        line_widths[max_bar_idx] = 5
+                        fig.data[net_trace_idx].update(marker=dict(
+                            line=dict(width=line_widths, color=max_level_color)
+                        ))
+            else:  # 'Absolute' - default behaviour
+                max_abs_val = 0
+                max_trace_idx = -1
+                max_bar_idx = -1
+                for i, trace in enumerate(fig.data):
+                    if trace.type == 'bar':
+                        vals = trace.x if horizontal else trace.y
+                        if vals:
+                            abs_vals = [abs(v) for v in vals]
+                            if abs_vals:
+                                local_max = max(abs_vals)
+                                if local_max > max_abs_val:
+                                    max_abs_val = local_max
+                                    max_trace_idx = i
+                                    max_bar_idx = abs_vals.index(local_max)
+                if max_trace_idx != -1:
+                    vals = fig.data[max_trace_idx].x if horizontal else fig.data[max_trace_idx].y
+                    line_widths = [0] * len(vals)
+                    line_widths[max_bar_idx] = 5
+                    fig.data[max_trace_idx].update(marker=dict(
+                        line=dict(width=line_widths, color=max_level_color)
+                    ))
         except Exception as e:
             print(f"Error highlighting max level: {e}")
 
@@ -1740,7 +1699,7 @@ def create_volume_chart(call_volume, put_volume, use_itm=True, call_color='#00FF
     
     return fig.to_json()
 
-def create_options_volume_chart(calls, puts, S, strike_range=0.02, call_color='#00FF00', put_color='#FF0000', coloring_mode='Solid', show_calls=True, show_puts=True, show_net=True, selected_expiries=None, horizontal=False, highlight_max_level=False, max_level_color='#800080'):
+def create_options_volume_chart(calls, puts, S, strike_range=0.02, call_color='#00FF00', put_color='#FF0000', coloring_mode='Solid', show_calls=True, show_puts=True, show_net=True, selected_expiries=None, horizontal=False, highlight_max_level=False, max_level_color='#800080', max_level_mode='Absolute'):
     # Filter strikes within range
     min_strike = S * (1 - strike_range)
     max_strike = S * (1 + strike_range)
@@ -1989,32 +1948,44 @@ def create_options_volume_chart(calls, puts, S, strike_range=0.02, call_color='#
     # Logic for Highlighting Max Level
     if highlight_max_level:
         try:
-            max_abs_val = 0
-            max_trace_idx = -1
-            max_bar_idx = -1
-            
-            for i, trace in enumerate(fig.data):
-                if trace.type == 'bar':
-                    vals = trace.x if horizontal else trace.y
-                    if vals:
-                        abs_vals = [abs(v) for v in vals]
-                        if abs_vals:
-                            local_max = max(abs_vals)
-                            if local_max > max_abs_val:
-                                max_abs_val = local_max
-                                max_trace_idx = i
-                                max_bar_idx = abs_vals.index(local_max)
-            
-            if max_trace_idx != -1:
-                vals = fig.data[max_trace_idx].x if horizontal else fig.data[max_trace_idx].y
-                line_widths = [0] * len(vals)
-                line_widths[max_bar_idx] = 5
-                fig.data[max_trace_idx].update(marker=dict(
-                    line=dict(
-                        width=line_widths,
-                        color=max_level_color
-                    )
-                ))
+            if max_level_mode == 'Net':
+                net_trace_idx = next((i for i, t in enumerate(fig.data) if t.type == 'bar' and t.name == 'Net'), None)
+                if net_trace_idx is not None:
+                    raw = fig.data[net_trace_idx].x if horizontal else fig.data[net_trace_idx].y
+                    if raw:
+                        vals = list(raw)
+                        total_net = sum(vals)
+                        if total_net >= 0:
+                            max_bar_idx = vals.index(max(vals))
+                        else:
+                            max_bar_idx = vals.index(min(vals))
+                        line_widths = [0] * len(vals)
+                        line_widths[max_bar_idx] = 5
+                        fig.data[net_trace_idx].update(marker=dict(
+                            line=dict(width=line_widths, color=max_level_color)
+                        ))
+            else:
+                max_abs_val = 0
+                max_trace_idx = -1
+                max_bar_idx = -1
+                for i, trace in enumerate(fig.data):
+                    if trace.type == 'bar':
+                        vals = trace.x if horizontal else trace.y
+                        if vals:
+                            abs_vals = [abs(v) for v in vals]
+                            if abs_vals:
+                                local_max = max(abs_vals)
+                                if local_max > max_abs_val:
+                                    max_abs_val = local_max
+                                    max_trace_idx = i
+                                    max_bar_idx = abs_vals.index(local_max)
+                if max_trace_idx != -1:
+                    vals = fig.data[max_trace_idx].x if horizontal else fig.data[max_trace_idx].y
+                    line_widths = [0] * len(vals)
+                    line_widths[max_bar_idx] = 5
+                    fig.data[max_trace_idx].update(marker=dict(
+                        line=dict(width=line_widths, color=max_level_color)
+                    ))
         except Exception as e:
             print(f"Error highlighting max level in options volume: {e}")
 
@@ -3007,7 +2978,287 @@ def create_historical_bubble_levels_chart(ticker, strike_range, call_color='#00F
 
 
 
-def create_premium_chart(calls, puts, S, strike_range=0.02, call_color='#00FF00', put_color='#FF0000', coloring_mode='Solid', show_calls=True, show_puts=True, show_net=True, selected_expiries=None, horizontal=False, highlight_max_level=False, max_level_color='#800080'):
+def create_open_interest_chart(calls, puts, S, strike_range=0.02, call_color='#00FF00', put_color='#FF0000', coloring_mode='Solid', show_calls=True, show_puts=True, show_net=True, selected_expiries=None, horizontal=False, highlight_max_level=False, max_level_color='#800080', max_level_mode='Absolute'):
+    # Filter strikes within range
+    min_strike = S * (1 - strike_range)
+    max_strike = S * (1 + strike_range)
+    
+    calls = calls[(calls['strike'] >= min_strike) & (calls['strike'] <= max_strike)].copy()
+    puts = puts[(puts['strike'] >= min_strike) & (puts['strike'] <= max_strike)].copy()
+    
+    # Determine strike interval and aggregate by rounded strikes
+    all_strikes = list(calls['strike']) + list(puts['strike'])
+    if all_strikes:
+        strike_interval = get_strike_interval(all_strikes)
+        calls = aggregate_by_strike(calls, ['openInterest'], strike_interval)
+        puts = aggregate_by_strike(puts, ['openInterest'], strike_interval)
+    
+    # Create figure
+    fig = go.Figure()
+    
+    # Calculate max OI for normalization across all data
+    max_oi = 1.0
+    all_abs_vals = []
+    if not calls.empty:
+        all_abs_vals.extend(calls['openInterest'].abs().tolist())
+    if not puts.empty:
+        all_abs_vals.extend(puts['openInterest'].abs().tolist())
+    if all_abs_vals:
+        max_oi = max(all_abs_vals)
+    if max_oi == 0:
+        max_oi = 1.0
+    
+    # Add call OI bars
+    if show_calls and not calls.empty:
+        call_colors = get_colors(call_color, calls['openInterest'], max_oi, coloring_mode)
+            
+        if horizontal:
+            fig.add_trace(go.Bar(
+                y=calls['strike'].tolist(),
+                x=calls['openInterest'].tolist(),
+                name='Call',
+                marker_color=call_colors,
+                text=[format_large_number(v) for v in calls['openInterest']],
+                textposition='auto',
+                orientation='h',
+                hovertemplate='Strike: %{y}<br>OI: %{text}<extra></extra>',
+                marker_line_width=0
+            ))
+        else:
+            fig.add_trace(go.Bar(
+                x=calls['strike'].tolist(),
+                y=calls['openInterest'].tolist(),
+                name='Call',
+                marker_color=call_colors,
+                text=[format_large_number(v) for v in calls['openInterest']],
+                textposition='auto',
+                hovertemplate='Strike: %{x}<br>OI: %{text}<extra></extra>',
+                marker_line_width=0
+            ))
+    
+    # Add put OI bars (as negative values)
+    if show_puts and not puts.empty:
+        put_colors = get_colors(put_color, puts['openInterest'], max_oi, coloring_mode)
+            
+        if horizontal:
+            fig.add_trace(go.Bar(
+                y=puts['strike'].tolist(),
+                x=[-v for v in puts['openInterest'].tolist()],
+                name='Put',
+                marker_color=put_colors,
+                text=[format_large_number(v) for v in puts['openInterest']],
+                textposition='auto',
+                orientation='h',
+                hovertemplate='Strike: %{y}<br>OI: %{text}<extra></extra>',
+                marker_line_width=0
+            ))
+        else:
+            fig.add_trace(go.Bar(
+                x=puts['strike'].tolist(),
+                y=[-v for v in puts['openInterest'].tolist()],
+                name='Put',
+                marker_color=put_colors,
+                text=[format_large_number(v) for v in puts['openInterest']],
+                textposition='auto',
+                hovertemplate='Strike: %{x}<br>OI: %{text}<extra></extra>',
+                marker_line_width=0
+            ))
+    
+    # Add net OI bars if enabled
+    if show_net and not (calls.empty and puts.empty):
+        all_strikes_list = sorted(set(calls['strike'].tolist() + puts['strike'].tolist()))
+        net_oi = []
+        
+        for strike in all_strikes_list:
+            call_val = calls[calls['strike'] == strike]['openInterest'].sum() if not calls.empty else 0
+            put_val = puts[puts['strike'] == strike]['openInterest'].sum() if not puts.empty else 0
+            net_oi.append(call_val - put_val)
+        
+        max_net_oi = max(abs(min(net_oi)), abs(max(net_oi))) if net_oi else 1.0
+        if max_net_oi == 0:
+            max_net_oi = 1.0
+        
+        net_colors = get_net_colors(net_oi, max_net_oi, call_color, put_color, coloring_mode)
+        
+        if horizontal:
+            fig.add_trace(go.Bar(
+                y=all_strikes_list,
+                x=net_oi,
+                name='Net',
+                marker_color=net_colors,
+                text=[format_large_number(val) for val in net_oi],
+                textposition='auto',
+                orientation='h',
+                hovertemplate='Strike: %{y}<br>Net OI: %{text}<extra></extra>',
+                marker_line_width=0
+            ))
+        else:
+            fig.add_trace(go.Bar(
+                x=all_strikes_list,
+                y=net_oi,
+                name='Net',
+                marker_color=net_colors,
+                text=[format_large_number(val) for val in net_oi],
+                textposition='auto',
+                hovertemplate='Strike: %{x}<br>Net OI: %{text}<extra></extra>',
+                marker_line_width=0
+            ))
+    
+    if horizontal:
+        fig.add_hline(
+            y=S,
+            line_dash="dash",
+            line_color="white",
+            opacity=0.5,
+            annotation_text=f"{S:.2f}",
+            annotation_position="right",
+            annotation_font_color="white",
+            line_width=1
+        )
+    else:
+        fig.add_vline(
+            x=S,
+            line_dash="dash",
+            line_color="white",
+            opacity=0.5,
+            annotation_text=f"{S:.2f}",
+            annotation_position="top",
+            annotation_font_color="white",
+            line_width=1
+        )
+    
+    base_title = 'Open Interest by Strike'
+    chart_title = base_title
+    if selected_expiries and len(selected_expiries) > 1:
+        chart_title = f"{base_title} ({len(selected_expiries)} expiries)"
+    
+    xaxis_config = dict(
+        title='',
+        title_font=dict(color='#CCCCCC'),
+        tickfont=dict(color='#CCCCCC'),
+        gridcolor='#333333',
+        linecolor='#333333',
+        showgrid=False,
+        zeroline=True,
+        zerolinecolor='#333333',
+        automargin=True
+    )
+    
+    yaxis_config = dict(
+        title='',
+        title_font=dict(color='#CCCCCC'),
+        tickfont=dict(color='#CCCCCC'),
+        gridcolor='#333333',
+        linecolor='#333333',
+        showgrid=False,
+        zeroline=True,
+        zerolinecolor='#333333'
+    )
+    
+    if horizontal:
+         yaxis_config.update(dict(
+            range=[min_strike, max_strike],
+            autorange=False
+         ))
+    else:
+        xaxis_config.update(dict(
+            range=[min_strike, max_strike],
+            autorange=False,
+            tickangle=45,
+            tickformat='.0f',
+            showticklabels=True,
+            ticks='outside',
+            ticklen=5,
+            tickwidth=1,
+            tickcolor='#CCCCCC'
+        ))
+
+    fig.update_layout(
+        title=dict(
+            text=chart_title,
+            font=dict(color='#CCCCCC', size=16),
+            x=0.5,
+            xanchor='center'
+        ),
+        xaxis=xaxis_config,
+        yaxis=yaxis_config,
+        barmode='relative',
+        hovermode='y unified' if horizontal else 'x unified',
+        plot_bgcolor='#1E1E1E',
+        paper_bgcolor='#1E1E1E',
+        font=dict(color='#CCCCCC'),
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=0.95,
+            xanchor="right",
+            x=1,
+            font=dict(color='#CCCCCC'),
+            bgcolor='#1E1E1E'
+        ),
+        bargap=0.1,
+        bargroupgap=0.1,
+        margin=dict(l=50, r=50, t=50, b=100),
+        hoverlabel=dict(
+            bgcolor='#1E1E1E',
+            font_size=12,
+            font_family="Arial"
+        ),
+        spikedistance=1000,
+        hoverdistance=100,
+        showlegend=True,
+        height=500
+    )
+    
+    fig.update_xaxes(showspikes=True, spikecolor='#CCCCCC', spikethickness=1)
+    fig.update_yaxes(showspikes=True, spikecolor='#CCCCCC', spikethickness=1)
+    
+    if highlight_max_level:
+        try:
+            if max_level_mode == 'Net':
+                net_trace_idx = next((i for i, t in enumerate(fig.data) if t.type == 'bar' and t.name == 'Net'), None)
+                if net_trace_idx is not None:
+                    raw = fig.data[net_trace_idx].x if horizontal else fig.data[net_trace_idx].y
+                    if raw:
+                        vals = list(raw)
+                        total_net = sum(vals)
+                        if total_net >= 0:
+                            max_bar_idx = vals.index(max(vals))
+                        else:
+                            max_bar_idx = vals.index(min(vals))
+                        line_widths = [0] * len(vals)
+                        line_widths[max_bar_idx] = 5
+                        fig.data[net_trace_idx].update(marker=dict(
+                            line=dict(width=line_widths, color=max_level_color)
+                        ))
+            else:
+                max_abs_val = 0
+                max_trace_idx = -1
+                max_bar_idx = -1
+                for i, trace in enumerate(fig.data):
+                    if trace.type == 'bar':
+                        vals = trace.x if horizontal else trace.y
+                        if vals:
+                            abs_vals = [abs(v) for v in vals]
+                            if abs_vals:
+                                local_max = max(abs_vals)
+                                if local_max > max_abs_val:
+                                    max_abs_val = local_max
+                                    max_trace_idx = i
+                                    max_bar_idx = abs_vals.index(local_max)
+                if max_trace_idx != -1:
+                    vals = fig.data[max_trace_idx].x if horizontal else fig.data[max_trace_idx].y
+                    line_widths = [0] * len(vals)
+                    line_widths[max_bar_idx] = 5
+                    fig.data[max_trace_idx].update(marker=dict(
+                        line=dict(width=line_widths, color=max_level_color)
+                    ))
+        except Exception as e:
+            print(f"Error highlighting max level in open interest chart: {e}")
+
+    return fig.to_json()
+
+def create_premium_chart(calls, puts, S, strike_range=0.02, call_color='#00FF00', put_color='#FF0000', coloring_mode='Solid', show_calls=True, show_puts=True, show_net=True, selected_expiries=None, horizontal=False, highlight_max_level=False, max_level_color='#800080', max_level_mode='Absolute'):
     # Filter strikes within range
     min_strike = S * (1 - strike_range)
     max_strike = S * (1 + strike_range)
@@ -3256,32 +3507,44 @@ def create_premium_chart(calls, puts, S, strike_range=0.02, call_color='#00FF00'
     # Logic for Highlighting Max Level
     if highlight_max_level:
         try:
-            max_abs_val = 0
-            max_trace_idx = -1
-            max_bar_idx = -1
-            
-            for i, trace in enumerate(fig.data):
-                if trace.type == 'bar':
-                    vals = trace.x if horizontal else trace.y
-                    if vals:
-                        abs_vals = [abs(v) for v in vals]
-                        if abs_vals:
-                            local_max = max(abs_vals)
-                            if local_max > max_abs_val:
-                                max_abs_val = local_max
-                                max_trace_idx = i
-                                max_bar_idx = abs_vals.index(local_max)
-            
-            if max_trace_idx != -1:
-                vals = fig.data[max_trace_idx].x if horizontal else fig.data[max_trace_idx].y
-                line_widths = [0] * len(vals)
-                line_widths[max_bar_idx] = 5
-                fig.data[max_trace_idx].update(marker=dict(
-                    line=dict(
-                        width=line_widths,
-                        color=max_level_color
-                    )
-                ))
+            if max_level_mode == 'Net':
+                net_trace_idx = next((i for i, t in enumerate(fig.data) if t.type == 'bar' and t.name == 'Net'), None)
+                if net_trace_idx is not None:
+                    raw = fig.data[net_trace_idx].x if horizontal else fig.data[net_trace_idx].y
+                    if raw:
+                        vals = list(raw)
+                        total_net = sum(vals)
+                        if total_net >= 0:
+                            max_bar_idx = vals.index(max(vals))
+                        else:
+                            max_bar_idx = vals.index(min(vals))
+                        line_widths = [0] * len(vals)
+                        line_widths[max_bar_idx] = 5
+                        fig.data[net_trace_idx].update(marker=dict(
+                            line=dict(width=line_widths, color=max_level_color)
+                        ))
+            else:
+                max_abs_val = 0
+                max_trace_idx = -1
+                max_bar_idx = -1
+                for i, trace in enumerate(fig.data):
+                    if trace.type == 'bar':
+                        vals = trace.x if horizontal else trace.y
+                        if vals:
+                            abs_vals = [abs(v) for v in vals]
+                            if abs_vals:
+                                local_max = max(abs_vals)
+                                if local_max > max_abs_val:
+                                    max_abs_val = local_max
+                                    max_trace_idx = i
+                                    max_bar_idx = abs_vals.index(local_max)
+                if max_trace_idx != -1:
+                    vals = fig.data[max_trace_idx].x if horizontal else fig.data[max_trace_idx].y
+                    line_widths = [0] * len(vals)
+                    line_widths[max_bar_idx] = 5
+                    fig.data[max_trace_idx].update(marker=dict(
+                        line=dict(width=line_widths, color=max_level_color)
+                    ))
         except Exception as e:
             print(f"Error highlighting max level in premium chart: {e}")
 
@@ -4329,6 +4592,13 @@ def index():
                         <label for="highlight_max_level">Highlight Max Level</label>
                     </div>
                     <div class="control-group">
+                        <label for="max_level_mode">Max Level Mode:</label>
+                        <select id="max_level_mode" title="Absolute: highlights the single bar with the largest magnitude | Net: highlights the strike where the net (calls minus puts) is largest">
+                            <option value="Absolute" selected>Absolute</option>
+                            <option value="Net">Net</option>
+                        </select>
+                    </div>
+                    <div class="control-group">
                         <label for="max_level_color">Max Level Color:</label>
                         <input type="color" id="max_level_color" value="#800080">
                     </div>
@@ -4395,6 +4665,10 @@ def index():
             <div class="chart-checkbox">
                 <input type="checkbox" id="options_volume" checked>
                 <label for="options_volume">Options Volume</label>
+            </div>
+            <div class="chart-checkbox">
+                <input type="checkbox" id="open_interest">
+                <label for="open_interest">Open Interest</label>
             </div>
             <div class="chart-checkbox">
                 <input type="checkbox" id="volume" checked>
@@ -4672,6 +4946,7 @@ def index():
         });
 
         document.getElementById('highlight_max_level').addEventListener('change', updateData);
+        document.getElementById('max_level_mode').addEventListener('change', updateData);
         document.getElementById('gex_absolute').addEventListener('change', updateData);
         
         // Helper function to create rgba color with opacity
@@ -4756,6 +5031,7 @@ def index():
             const calculateInNotional = document.getElementById('calculate_in_notional').checked;
             const strikeRange = parseFloat(document.getElementById('strike_range').value) / 100;
             const highlightMaxLevel = document.getElementById('highlight_max_level').checked;
+            const maxLevelMode = document.getElementById('max_level_mode').value;
             
             // Get visible charts
             const gexAbsolute = document.getElementById('gex_absolute').checked;
@@ -4773,6 +5049,7 @@ def index():
                 show_vomma: document.getElementById('vomma').checked,
                 show_color: document.getElementById('color').checked,
                 show_options_volume: document.getElementById('options_volume').checked,
+                show_open_interest: document.getElementById('open_interest').checked,
                 show_volume: document.getElementById('volume').checked,
                 show_large_trades: document.getElementById('large_trades').checked,
                 show_premium: document.getElementById('premium').checked,
@@ -4807,6 +5084,7 @@ def index():
                     put_color: putColor,
                     highlight_max_level: highlightMaxLevel,
                     max_level_color: maxLevelColor,
+                    max_level_mode: maxLevelMode,
                     absolute_gex: gexAbsolute,
                     ...visibleCharts
                 })
@@ -4859,6 +5137,7 @@ def index():
                 vomma: document.getElementById('vomma').checked,
                 color: document.getElementById('color').checked,
                 options_volume: document.getElementById('options_volume').checked,
+                open_interest: document.getElementById('open_interest').checked,
                 volume: document.getElementById('volume').checked,
                 large_trades: document.getElementById('large_trades').checked,
                 premium: document.getElementById('premium').checked,
@@ -5390,6 +5669,7 @@ def index():
                 put_color: document.getElementById('put_color').value,
                 highlight_max_level: document.getElementById('highlight_max_level').checked,
                 max_level_color: document.getElementById('max_level_color').value,
+                max_level_mode: document.getElementById('max_level_mode').value,
                 // Chart visibility
                 charts: {
                     price: document.getElementById('price').checked,
@@ -5405,6 +5685,7 @@ def index():
                     vomma: document.getElementById('vomma').checked,
                     color: document.getElementById('color').checked,
                     options_volume: document.getElementById('options_volume').checked,
+                    open_interest: document.getElementById('open_interest').checked,
                     volume: document.getElementById('volume').checked,
                     large_trades: document.getElementById('large_trades').checked,
                     premium: document.getElementById('premium').checked,
@@ -5461,6 +5742,9 @@ def index():
             if (settings.max_level_color) {
                 document.getElementById('max_level_color').value = settings.max_level_color;
                 maxLevelColor = settings.max_level_color;
+            }
+            if (settings.max_level_mode) {
+                document.getElementById('max_level_mode').value = settings.max_level_mode;
             }
             // Chart visibility
             if (settings.charts) {
@@ -5703,6 +5987,7 @@ def update():
         abs_gex_opacity = float(data.get('abs_gex_opacity', 0.2))
         highlight_max_level = data.get('highlight_max_level', False)
         max_level_color = data.get('max_level_color', '#800080')
+        max_level_mode = data.get('max_level_mode', 'Absolute')
  
         
         response = {}
@@ -5738,34 +6023,37 @@ def update():
             response['charm_historical_bubble'] = create_historical_bubble_levels_chart(ticker, strike_range, call_color, put_color, 'charm', highlight_max_level=highlight_max_level, max_level_color=max_level_color)
         
         if data.get('show_gamma', True):
-            response['gamma'] = create_exposure_chart(calls, puts, "GEX", "Gamma Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, coloring_mode, call_color, put_color, expiry_dates, horizontal, show_abs_gex_area=show_abs_gex, abs_gex_opacity=abs_gex_opacity, highlight_max_level=highlight_max_level, max_level_color=max_level_color)
+            response['gamma'] = create_exposure_chart(calls, puts, "GEX", "Gamma Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, coloring_mode, call_color, put_color, expiry_dates, horizontal, show_abs_gex_area=show_abs_gex, abs_gex_opacity=abs_gex_opacity, highlight_max_level=highlight_max_level, max_level_color=max_level_color, max_level_mode=max_level_mode)
         
         if data.get('show_delta', True):
-            response['delta'] = create_exposure_chart(calls, puts, "DEX", "Delta Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, coloring_mode, call_color, put_color, expiry_dates, horizontal, highlight_max_level=highlight_max_level, max_level_color=max_level_color)
+            response['delta'] = create_exposure_chart(calls, puts, "DEX", "Delta Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, coloring_mode, call_color, put_color, expiry_dates, horizontal, highlight_max_level=highlight_max_level, max_level_color=max_level_color, max_level_mode=max_level_mode)
         
         if data.get('show_vanna', True):
-            response['vanna'] = create_exposure_chart(calls, puts, "VEX", "Vanna Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, coloring_mode, call_color, put_color, expiry_dates, horizontal, highlight_max_level=highlight_max_level, max_level_color=max_level_color)
+            response['vanna'] = create_exposure_chart(calls, puts, "VEX", "Vanna Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, coloring_mode, call_color, put_color, expiry_dates, horizontal, highlight_max_level=highlight_max_level, max_level_color=max_level_color, max_level_mode=max_level_mode)
         
         if data.get('show_charm', True):
-            response['charm'] = create_exposure_chart(calls, puts, "Charm", "Charm Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, coloring_mode, call_color, put_color, expiry_dates, horizontal, highlight_max_level=highlight_max_level, max_level_color=max_level_color)
+            response['charm'] = create_exposure_chart(calls, puts, "Charm", "Charm Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, coloring_mode, call_color, put_color, expiry_dates, horizontal, highlight_max_level=highlight_max_level, max_level_color=max_level_color, max_level_mode=max_level_mode)
         
         if data.get('show_speed', True):
-            response['speed'] = create_exposure_chart(calls, puts, "Speed", "Speed Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, coloring_mode, call_color, put_color, expiry_dates, horizontal, highlight_max_level=highlight_max_level, max_level_color=max_level_color)
+            response['speed'] = create_exposure_chart(calls, puts, "Speed", "Speed Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, coloring_mode, call_color, put_color, expiry_dates, horizontal, highlight_max_level=highlight_max_level, max_level_color=max_level_color, max_level_mode=max_level_mode)
         
         if data.get('show_vomma', True):
-            response['vomma'] = create_exposure_chart(calls, puts, "Vomma", "Vomma Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, coloring_mode, call_color, put_color, expiry_dates, horizontal, highlight_max_level=highlight_max_level, max_level_color=max_level_color)
+            response['vomma'] = create_exposure_chart(calls, puts, "Vomma", "Vomma Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, coloring_mode, call_color, put_color, expiry_dates, horizontal, highlight_max_level=highlight_max_level, max_level_color=max_level_color, max_level_mode=max_level_mode)
 
         if data.get('show_color', True):
-            response['color'] = create_exposure_chart(calls, puts, "Color", "Color Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, coloring_mode, call_color, put_color, expiry_dates, horizontal, highlight_max_level=highlight_max_level, max_level_color=max_level_color)
+            response['color'] = create_exposure_chart(calls, puts, "Color", "Color Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, coloring_mode, call_color, put_color, expiry_dates, horizontal, highlight_max_level=highlight_max_level, max_level_color=max_level_color, max_level_mode=max_level_mode)
         
         if data.get('show_volume', True):
             response['volume'] = create_volume_chart(call_volume, put_volume, use_range, call_color, put_color, expiry_dates)
         
         if data.get('show_options_volume', True):
-            response['options_volume'] = create_options_volume_chart(calls, puts, S, strike_range, call_color, put_color, coloring_mode, show_calls, show_puts, show_net, expiry_dates, horizontal, highlight_max_level=highlight_max_level, max_level_color=max_level_color)
+            response['options_volume'] = create_options_volume_chart(calls, puts, S, strike_range, call_color, put_color, coloring_mode, show_calls, show_puts, show_net, expiry_dates, horizontal, highlight_max_level=highlight_max_level, max_level_color=max_level_color, max_level_mode=max_level_mode)
+        
+        if data.get('show_open_interest', True):
+            response['open_interest'] = create_open_interest_chart(calls, puts, S, strike_range, call_color, put_color, coloring_mode, show_calls, show_puts, show_net, expiry_dates, horizontal, highlight_max_level=highlight_max_level, max_level_color=max_level_color, max_level_mode=max_level_mode)
         
         if data.get('show_premium', True):
-            response['premium'] = create_premium_chart(calls, puts, S, strike_range, call_color, put_color, coloring_mode, show_calls, show_puts, show_net, expiry_dates, horizontal, highlight_max_level=highlight_max_level, max_level_color=max_level_color)
+            response['premium'] = create_premium_chart(calls, puts, S, strike_range, call_color, put_color, coloring_mode, show_calls, show_puts, show_net, expiry_dates, horizontal, highlight_max_level=highlight_max_level, max_level_color=max_level_color, max_level_mode=max_level_mode)
         
         if data.get('show_large_trades', True):
             response['large_trades'] = create_large_trades_table(calls, puts, S, strike_range, call_color, put_color, expiry_dates)
