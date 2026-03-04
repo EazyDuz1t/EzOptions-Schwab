@@ -83,6 +83,16 @@ def init_db():
             ''')
             conn.commit()
 
+def is_market_hours():
+    """Return True if the current time is within regular market hours (9:30 AM - 4:00 PM ET, Mon-Fri)."""
+    est = pytz.timezone('US/Eastern')
+    now = datetime.now(est)
+    if now.weekday() >= 5:
+        return False
+    market_open = now.replace(hour=9, minute=30, second=0, microsecond=0)
+    market_close = now.replace(hour=16, minute=0, second=0, microsecond=0)
+    return market_open <= now <= market_close
+
 # Function to store centroid data
 def store_centroid_data(ticker, price, calls, puts):
     """Store call and put centroid data for 5-minute intervals during market hours only"""
@@ -187,6 +197,8 @@ def get_centroid_data(ticker, date=None):
 
 # Function to store interval data
 def store_interval_data(ticker, price, strike_range, calls, puts):
+    if not is_market_hours():
+        return
     current_time = int(time.time())
     current_date = datetime.now().strftime('%Y-%m-%d')
     
@@ -264,7 +276,25 @@ def get_interval_data(ticker, date=None):
                 WHERE ticker = ? AND date = ?
                 ORDER BY timestamp, strike
             ''', (ticker, date))
-            return cursor.fetchall()
+            all_data = cursor.fetchall()
+
+    est = pytz.timezone('US/Eastern')
+    filtered = []
+    for row in all_data:
+        dt = datetime.fromtimestamp(row[0], est)
+        market_open = dt.replace(hour=9, minute=30, second=0, microsecond=0)
+        market_close = dt.replace(hour=16, minute=0, second=0, microsecond=0)
+        if dt.weekday() < 5 and market_open <= dt <= market_close:
+            filtered.append(row)
+    return filtered
+
+def get_last_session_date(ticker, table='interval_data'):
+    """Return the most recent date that has data for ticker, or None."""
+    with closing(sqlite3.connect('options_data.db')) as conn:
+        with closing(conn.cursor()) as cursor:
+            cursor.execute(f'SELECT MAX(date) FROM {table} WHERE ticker = ?', (ticker,))
+            row = cursor.fetchone()
+            return row[0] if row and row[0] else None
 
 # Function to clear old data
 def clear_old_data():
@@ -480,7 +510,7 @@ def fetch_options_for_date(ticker, date, exposure_metric="Open Interest", delta_
         bucket_size = get_strike_interval(base_all_strikes) if base_all_strikes else 5.0
 
         if ticker == "MARKET":
-            component_tickers = ["$SPX", "SPY"]
+            component_tickers = ["$SPX", "QQQ"]
         else:
             component_tickers = ["SPY"]
         
@@ -535,7 +565,7 @@ def fetch_options_for_date(ticker, date, exposure_metric="Open Interest", delta_
         # Combined total ≈ N × base_total.
         #
         # Key stability property: a change in QQQ's or IWM's totals only
-        # affects that component's bars — SPX/SPY bars stay unchanged.
+        # affects that component's bars — SPX/QQQ bars stay unchanged.
         base_cd = next((cd for cd in component_data if cd['ticker'] == base_ticker), component_data[0])
         base_totals = base_cd['totals']
         
@@ -703,15 +733,9 @@ def fetch_options_for_date(ticker, date, exposure_metric="Open Interest", delta_
             for strike, options in strikes.items():
                 for option in options:
                     if any(option['symbol'].startswith(t) for t in display_tickers):
-                        # Calculate implied volatility using bid/ask prices
-                        bid = float(option['bid'])
-                        ask = float(option['ask'])
-                        
                         K = float(option['strikePrice'])
-                        vol = 0.2
-                        if bid > 0 or ask > 0:
-                            vol = calculate_implied_volatility(bid, ask, S, K, t, r, 'c', 0)
-                            if vol is None: vol = 0.2
+                        raw_vol = float(option.get('volatility', -999.0))
+                        vol = (raw_vol / 100) if raw_vol > 0 else 0.20
                         
                         # Calculate Greeks
                         if t > 0 and vol > 0 and K > 0:
@@ -745,15 +769,9 @@ def fetch_options_for_date(ticker, date, exposure_metric="Open Interest", delta_
             for strike, options in strikes.items():
                 for option in options:
                     if any(option['symbol'].startswith(t) for t in display_tickers):
-                        # Calculate implied volatility using bid/ask prices
-                        bid = float(option['bid'])
-                        ask = float(option['ask'])
-                        
                         K = float(option['strikePrice'])
-                        vol = 0.2
-                        if bid > 0 or ask > 0:
-                            vol = calculate_implied_volatility(bid, ask, S, K, t, r, 'p', 0)
-                            if vol is None: vol = 0.2
+                        raw_vol = float(option.get('volatility', -999.0))
+                        vol = (raw_vol / 100) if raw_vol > 0 else 0.20
                         
                         # Calculate Greeks
                         if t > 0 and vol > 0 and K > 0:
@@ -823,124 +841,6 @@ def fetch_options_for_date(ticker, date, exposure_metric="Open Interest", delta_
         print(msg)
         # Propagate so callers (API routes) can return the error to clients
         raise Exception(msg)
-
-def calculate_bs_price(flag, S, K, t, r, sigma, q=0):
-    """Calculate Black-Scholes option price with dividends."""
-    try:
-        d1 = (np.log(S / K) + (r - q + 0.5 * sigma**2) * t) / (sigma * np.sqrt(t))
-        d2 = d1 - sigma * np.sqrt(t)
-        
-        if flag == 'c':
-            price = S * np.exp(-q * t) * norm.cdf(d1) - K * np.exp(-r * t) * norm.cdf(d2)
-        else:
-            price = K * np.exp(-r * t) * norm.cdf(-d2) - S * np.exp(-q * t) * norm.cdf(-d1)
-        return price
-    except:
-        return 0.0
-
-def calculate_bs_vega(S, K, t, r, sigma, q=0):
-    """Calculate Black-Scholes Vega with dividends."""
-    try:
-        d1 = (np.log(S / K) + (r - q + 0.5 * sigma**2) * t) / (sigma * np.sqrt(t))
-        return S * np.exp(-q * t) * norm.pdf(d1) * np.sqrt(t)
-    except:
-        return 0.0
-
-def calculate_implied_volatility(bid, ask, S, K, t, r, flag, q=0):
-    """Calculate Implied Volatility using Newton-Raphson method with bid/ask prices.
-    
-    Uses the mid-price of bid/ask for the calculation. Falls back to bid or ask
-    if one is zero. Returns None if both are zero or invalid.
-    
-    Args:
-        bid: Bid price of the option
-        ask: Ask price of the option
-        S: Current underlying price
-        K: Strike price
-        t: Time to expiration in years
-        r: Risk-free rate
-        flag: 'c' for call, 'p' for put
-        q: Dividend yield (default 0)
-    
-    Returns:
-        Implied volatility or None if calculation fails
-    """
-    # Calculate mid-price from bid/ask
-    if bid > 0 and ask > 0:
-        price = (bid + ask) / 2
-    elif ask > 0:
-        price = ask
-    elif bid > 0:
-        price = bid
-    else:
-        return None
-    
-    # Validate inputs
-    if price <= 0 or S <= 0 or K <= 0 or t <= 0:
-        return None
-    
-    # Minimum IV floor for far ITM options (moneyness > 15% ITM)
-    MIN_IV = 0.05  # 5% minimum IV
-    moneyness = K / S
-    if flag == 'c':
-        is_far_itm = moneyness < 0.85  # Call is far ITM if strike << spot
-    else:
-        is_far_itm = moneyness > 1.15  # Put is far ITM if strike >> spot
-    
-    # Calculate intrinsic value
-    if flag == 'c':
-        intrinsic = max(S * np.exp(-q * t) - K * np.exp(-r * t), 0)
-    else:
-        intrinsic = max(K * np.exp(-r * t) - S * np.exp(-q * t), 0)
-    
-    # For far ITM options, check if time value is too small for reliable IV calc
-    time_value = price - intrinsic
-    if is_far_itm and time_value < 0.01:
-        return MIN_IV  # Return minimum IV for far ITM with negligible time value
-    
-    # If price is below intrinsic, use intrinsic as floor
-    if price < intrinsic:
-        price = intrinsic + 0.01
-    
-    # Initial guess using Brenner-Subrahmanyam approximation
-    sigma = np.sqrt(2 * np.pi / t) * price / S
-    sigma = max(0.01, min(sigma, 3.0))  # Bound initial guess
-    
-    # Newton-Raphson iteration with improved convergence
-    max_iterations = 100
-    tolerance = 1e-6
-    
-    for i in range(max_iterations):
-        bs_price = calculate_bs_price(flag, S, K, t, r, sigma, q)
-        if bs_price is None:
-            return None
-            
-        diff = price - bs_price
-        
-        # Check for convergence
-        if abs(diff) < tolerance:
-            return max(sigma, MIN_IV)  # Enforce minimum IV floor
-        
-        vega = calculate_bs_vega(S, K, t, r, sigma, q)
-        
-        # If vega is too small, use bisection step instead
-        if abs(vega) < 1e-10:
-            # Try bisection approach
-            if diff > 0:
-                sigma = sigma * 1.5
-            else:
-                sigma = sigma * 0.5
-        else:
-            # Newton-Raphson step with damping for stability
-            step = diff / vega
-            # Limit step size to prevent overshooting
-            step = max(-sigma * 0.5, min(step, sigma * 2.0))
-            sigma = sigma + step
-        
-        # Keep sigma in reasonable bounds
-        sigma = max(MIN_IV, min(sigma, 5.0))
-    
-    return max(sigma, MIN_IV)  # Return last sigma with minimum IV floor
 
 def calculate_greeks(flag, S, K, t, sigma, r=0.02, q=0):
     """Calculate delta, gamma, vega, vanna."""
@@ -1632,23 +1532,48 @@ def create_exposure_chart(calls, puts, exposure_type, title, S, strike_range=0.0
     if highlight_max_level:
         try:
             if max_level_mode == 'Net':
-                # Highlight the bar in the Net trace that best represents the overall chain net.
-                # Overall direction = sign of total net. Then find the bar most aligned with that direction.
-                net_trace_idx = next((i for i, t in enumerate(fig.data) if t.type == 'bar' and t.name == 'Net'), None)
-                if net_trace_idx is not None:
-                    raw = fig.data[net_trace_idx].x if horizontal else fig.data[net_trace_idx].y
-                    if raw:
-                        vals = list(raw)
-                        total_net = sum(vals)
-                        if total_net >= 0:
-                            max_bar_idx = vals.index(max(vals))
-                        else:
-                            max_bar_idx = vals.index(min(vals))
-                        line_widths = [0] * len(vals)
-                        line_widths[max_bar_idx] = 5
-                        fig.data[net_trace_idx].update(marker=dict(
-                            line=dict(width=line_widths, color=max_level_color)
-                        ))
+                # Compute net exposure for the entire chain (not just plotted range)
+                all_chain_strikes = sorted(set(calls['strike'].tolist() + puts['strike'].tolist()))
+                chain_net_exposure = []
+                for strike in all_chain_strikes:
+                    call_value = calls[calls['strike'] == strike][exposure_type].sum() if not calls.empty else 0
+                    put_value = puts[puts['strike'] == strike][exposure_type].sum() if not puts.empty else 0
+                    if exposure_type == 'GEX':
+                        net_value = call_value - put_value
+                    elif exposure_type == 'DEX':
+                        net_value = call_value + put_value
+                    else:
+                        net_value = call_value + put_value
+                    chain_net_exposure.append(net_value)
+
+                # Find the strike with the max absolute net exposure (or max/min depending on sign of total net)
+                if chain_net_exposure:
+                    total_chain_net = sum(chain_net_exposure)
+                    if total_chain_net >= 0:
+                        max_net_val = max(chain_net_exposure)
+                    else:
+                        max_net_val = min(chain_net_exposure)
+                    # Find the strike(s) with this value
+                    max_strikes = [s for s, v in zip(all_chain_strikes, chain_net_exposure) if v == max_net_val]
+                    # Now, highlight the bar in the plotted Net trace that matches this strike (if present)
+                    net_trace_idx = next((i for i, t in enumerate(fig.data) if t.type == 'bar' and t.name == 'Net'), None)
+                    if net_trace_idx is not None:
+                        plotted_strikes = fig.data[net_trace_idx].y if horizontal else fig.data[net_trace_idx].x
+                        # For horizontal, y is strikes; else, x is strikes
+                        if plotted_strikes:
+                            # Find the index of the strike in the plot that matches max_strikes
+                            highlight_idx = None
+                            for idx, s in enumerate(plotted_strikes):
+                                if s in max_strikes:
+                                    highlight_idx = idx
+                                    break
+                            if highlight_idx is not None:
+                                vals = fig.data[net_trace_idx].x if horizontal else fig.data[net_trace_idx].y
+                                line_widths = [0] * len(vals)
+                                line_widths[highlight_idx] = 5
+                                fig.data[net_trace_idx].update(marker=dict(
+                                    line=dict(width=line_widths, color=max_level_color)
+                                ))
             else:  # 'Absolute' - default behaviour
                 max_abs_val = 0
                 max_trace_idx = -1
@@ -2392,6 +2317,56 @@ def create_price_chart(price_data, calls=None, puts=None, exposure_levels_types=
         all_top_levels = [] # List of (strike, value, type_name, type_index)
         
         for i, exposure_levels_type in enumerate(exposure_levels_types):
+            # --- Expected Move Chart Level ---
+            if exposure_levels_type.lower() == 'expected move':
+                # --- Weighted Expected Move Calculation ---
+                # Find ATM strike (closest to current price)
+                strikes_sorted = sorted(calls['strike'].unique()) if not calls.empty else []
+                if not strikes_sorted:
+                    continue
+                atm_strike = min(strikes_sorted, key=lambda x: abs(x - current_price))
+                atm_idx = strikes_sorted.index(atm_strike)
+                # Helper to get mid price
+                def get_mid(df, strike):
+                    row = df.loc[df['strike'] == strike]
+                    if row is not None and not row.empty:
+                        bid = row['bid'].values[0]
+                        ask = row['ask'].values[0]
+                        if bid > 0 and ask > 0:
+                            return (bid + ask) / 2
+                        elif bid > 0:
+                            return bid
+                        elif ask > 0:
+                            return ask
+                    return None
+                # ATM Straddle
+                call_mid_atm = get_mid(calls, atm_strike)
+                put_mid_atm = get_mid(puts, atm_strike)
+                straddle = (call_mid_atm if call_mid_atm is not None else 0) + (put_mid_atm if put_mid_atm is not None else 0)
+                # Expected Move = ATM Straddle (most common market formula)
+                expected_move = straddle
+                if expected_move > 0:
+                    upper = current_price + expected_move
+                    lower = current_price - expected_move
+                    em_color = '#036bfc'
+                    # Plot dashed lines for expected move in #036bfc
+                    fig.add_hline(y=upper, line_dash='dash', line_color=em_color, line_width=2)
+                    fig.add_hline(y=lower, line_dash='dash', line_color=em_color, line_width=2)
+                    # Add consistent annotation with value
+                    fig.add_annotation(
+                        x=1, y=upper, xref="paper", yref="y",
+                        text=f"EM + {upper:.2f}", showarrow=False,
+                        font=dict(size=10, color=em_color),
+                        xanchor='left', yanchor='bottom', xshift=-105, yshift=-5
+                    )
+                    fig.add_annotation(
+                        x=1, y=lower, xref="paper", yref="y",
+                        text=f"EM - {lower:.2f}", showarrow=False,
+                        font=dict(size=10, color=em_color),
+                        xanchor='left', yanchor='top', xshift=-105, yshift=5
+                    )
+                continue
+
             # Determine column name based on type
             col_name = exposure_levels_type
             if exposure_levels_type == 'Vanna' or exposure_levels_type == 'VEX': col_name = 'VEX'
@@ -2673,9 +2648,16 @@ def create_historical_bubble_levels_chart(ticker, strike_range, call_color='#00F
     Supports optional highlighting of the max exposure bubble via highlight_max_level and max_level_color.
     If absolute is True and exposure_type == 'gamma', gamma exposures are plotted as absolute values (useful for absolute GEX charts).
     """
-    # Get interval data from database
+    # Get interval data; fall back to most recent session if today has no data
+    showing_last_session = False
     interval_data = get_interval_data(ticker)
-    
+
+    if not interval_data:
+        last_date = get_last_session_date(ticker, 'interval_data')
+        if last_date:
+            interval_data = get_interval_data(ticker, last_date)
+            showing_last_session = True
+
     if not interval_data:
         return None
     
@@ -2913,7 +2895,7 @@ def create_historical_bubble_levels_chart(ticker, strike_range, call_color='#00F
     # Update layout
     fig.update_layout(
         title=dict(
-            text=f'Historical Bubble Levels - {exposure_name}',
+            text=f'Historical Bubble Levels - {exposure_name}' + (' (Last Session)' if showing_last_session else ''),
             font=dict(color='#CCCCCC', size=16),
             x=0.5,
             xanchor='center'
@@ -3552,33 +3534,13 @@ def create_premium_chart(calls, puts, S, strike_range=0.02, call_color='#00FF00'
 
 def create_centroid_chart(ticker, call_color='#00FF00', put_color='#FF0000', selected_expiries=None):
     """Create a chart showing call and put centroids over time with price line"""
-    # Check if we're in market hours
     est = pytz.timezone('US/Eastern')
     current_time_est = datetime.now(est)
-    
-    # Get centroid data from database
-    centroid_data = get_centroid_data(ticker)
-    
-    if not centroid_data:
-        # Determine appropriate message based on time
-        if current_time_est.weekday() >= 5:  # Weekend
-            chart_title = 'Call vs Put Centroid Map (Market Closed - Weekend)'
-        elif current_time_est.hour < 9 or (current_time_est.hour == 9 and current_time_est.minute < 30):
-            chart_title = 'Call vs Put Centroid Map (Pre-Market)'
-        elif current_time_est.hour >= 16:
-            chart_title = 'Call vs Put Centroid Map (After Hours)'
-        else:
-            chart_title = 'Call vs Put Centroid Map (No Data)'
-        
-        # Return empty chart if no data
+
+    def _empty_centroid_chart(title):
         fig = go.Figure()
         fig.update_layout(
-            title=dict(
-                text=chart_title,
-                font=dict(color='#CCCCCC', size=16),
-                x=0.5,
-                xanchor='center'
-            ),
+            title=dict(text=title, font=dict(color='#CCCCCC', size=16), x=0.5, xanchor='center'),
             plot_bgcolor='#1E1E1E',
             paper_bgcolor='#1E1E1E',
             font=dict(color='#CCCCCC'),
@@ -3587,6 +3549,25 @@ def create_centroid_chart(ticker, call_color='#00FF00', put_color='#FF0000', sel
             autosize=True
         )
         return fig.to_json()
+
+    # Get centroid data; fall back to most recent session if today has no data
+    showing_last_session = False
+    centroid_data = get_centroid_data(ticker)
+
+    if not centroid_data:
+        last_date = get_last_session_date(ticker, 'centroid_data')
+        if last_date:
+            centroid_data = get_centroid_data(ticker, last_date)
+            showing_last_session = True
+
+    if not centroid_data:
+        if current_time_est.weekday() >= 5:
+            return _empty_centroid_chart('Call vs Put Centroid Map (Market Closed - Weekend)')
+        elif current_time_est.hour < 9 or (current_time_est.hour == 9 and current_time_est.minute < 30):
+            return _empty_centroid_chart('Call vs Put Centroid Map (Pre-Market)')
+        elif current_time_est.hour >= 16:
+            return _empty_centroid_chart('Call vs Put Centroid Map (After Hours)')
+        return _empty_centroid_chart('Call vs Put Centroid Map (No Data)')
     
     # Convert data to lists for plotting
     timestamps = []
@@ -3647,6 +3628,8 @@ def create_centroid_chart(ticker, call_color='#00FF00', put_color='#FF0000', sel
     chart_title = 'Call vs Put Centroid Map'
     if selected_expiries and len(selected_expiries) > 1:
         chart_title = f"Call vs Put Centroid Map ({len(selected_expiries)} expiries)"
+    if showing_last_session:
+        chart_title += ' (Last Session)'
     
     # Update layout to match interval map style
     fig.update_layout(
@@ -4551,6 +4534,7 @@ def index():
                                 <div class="levels-option"><input type="checkbox" value="Speed" id="lvl-Speed"><label for="lvl-Speed">Speed</label></div>
                                 <div class="levels-option"><input type="checkbox" value="Vomma" id="lvl-Vomma"><label for="lvl-Vomma">Vomma</label></div>
                                 <div class="levels-option"><input type="checkbox" value="Color" id="lvl-Color"><label for="lvl-Color">Color</label></div>
+                                <div class="levels-option"><input type="checkbox" value="Expected Move" id="lvl-ExpectedMove"><label for="lvl-ExpectedMove">Expected Move</label></div>
                             </div>
                         </div>
                     </div>
@@ -5278,14 +5262,28 @@ def index():
             } else {
                 // Efficiently update existing Plotly charts without rebuilding DOM
                 enabledBubbles.forEach(bubbleType => {
+                    const chartDiv = document.getElementById(bubbleType + '-chart');
+                    if (!chartDiv) return;
                     if (data[bubbleType]) {
-                        const chartDiv = document.getElementById(bubbleType + '-chart');
-                        if (chartDiv) {
-                            const chartData = JSON.parse(data[bubbleType]);
-                            chartData.layout.margin = getChartMargins(chartDiv.id, chartData.layout.margin || {l: 50, r: 50, t: 50, b: 20});
-                            Plotly.react(chartDiv, chartData.data, chartData.layout, bubbleConfig);
-                            charts[bubbleType] = true;
-                        }
+                        const chartData = JSON.parse(data[bubbleType]);
+                        chartData.layout.margin = getChartMargins(chartDiv.id, chartData.layout.margin || {l: 50, r: 50, t: 50, b: 20});
+                        Plotly.react(chartDiv, chartData.data, chartData.layout, bubbleConfig);
+                        charts[bubbleType] = true;
+                    } else {
+                        // No data for new ticker — clear to prevent stale previous ticker chart
+                        Plotly.react(chartDiv, [], {
+                            plot_bgcolor: '#1E1E1E',
+                            paper_bgcolor: '#1E1E1E',
+                            font: { color: '#CCCCCC' },
+                            annotations: [{
+                                text: 'No Data Available',
+                                x: 0.5, y: 0.5,
+                                xref: 'paper', yref: 'paper',
+                                showarrow: false,
+                                font: { color: '#CCCCCC', size: 14 }
+                            }]
+                        }, bubbleConfig);
+                        charts[bubbleType] = true;
                     }
                 });
             }
@@ -5450,15 +5448,37 @@ def index():
             const expiryText = selectedExpiries.length > 1 ? 
                 `${selectedExpiries.length} expiries selected` : 
                 selectedExpiries[0] || 'No expiry selected';
-            
+
+            let expectedMoveHtml = '';
+            if (info.expected_move_range && info.expected_move_range.lower && info.expected_move_range.upper) {
+                const lowPct  = info.expected_move_range.lower_pct != null ?
+                    `${info.expected_move_range.lower_pct >= 0 ? '+' : ''}${info.expected_move_range.lower_pct}%` : '';
+                const highPct = info.expected_move_range.upper_pct != null ?
+                    `${info.expected_move_range.upper_pct >= 0 ? '+' : ''}${info.expected_move_range.upper_pct}%` : '';
+                // lower bound is below spot -> use putColor, upper bound above spot -> callColor
+                const lowColor = putColor;
+                const highColor = callColor;
+                expectedMoveHtml = `<div>Expected Move: <span style="color:${lowColor}">$${info.expected_move_range.lower.toFixed(2)} ${lowPct}</span> - <span style="color:${highColor}">$${info.expected_move_range.upper.toFixed(2)} ${highPct}</span></div>`;
+            }
+
+            // high/low diff coloring (use call/put colors)
+            const highDiff = info.high_diff || 0;
+            const highDiffPct = info.high_diff_pct || 0;
+            const lowDiff = info.low_diff || 0;
+            const lowDiffPct = info.low_diff_pct || 0;
+            // positive movement uses callColor, negative uses putColor
+            const highColor = highDiff >= 0 ? callColor : putColor;
+            const lowColor = lowDiff >= 0 ? callColor : putColor;
+
             priceInfo.innerHTML = `
-                <div>Current Price: $${info.current_price}</div>
-                <div>High: $${info.high}</div>
-                <div>Low: $${info.low}</div>
+                <div>Current Price: $${info.current_price.toFixed(2)}</div>
+                <div>High: $${info.high.toFixed(2)} <span style="color:${highColor}">(${highDiffPct>=0?'+':''}${highDiffPct.toFixed(2)}%)</span></div>
+                <div>Low:  $${info.low.toFixed(2)}  <span style="color:${lowColor}">(${lowDiffPct>=0?'+':''}${lowDiffPct.toFixed(2)}%)</span></div>
                 <div class="${info.net_change >= 0 ? 'green' : 'red'}">
-                    ${info.net_change >= 0 ? '+' : ''}${info.net_change} (${info.net_percent >= 0 ? '+' : ''}${info.net_percent}%)
+                    <span style="color:white !important">Change:</span> ${info.net_change >= 0 ? '+' : ''}${info.net_change.toFixed(2)} (${info.net_percent >= 0 ? '+' : ''}${info.net_percent.toFixed(2)}%)
                 </div>
-                <div>Vol Ratio: <span style="color: ${callColor}">${info.call_percentage}%</span>/<span style="color: ${putColor}">${info.put_percentage}%</span></div>
+                <div>Vol Ratio: <span style="color: ${callColor}">${info.call_percentage.toFixed(2)}%</span>/<span style="color: ${putColor}">${info.put_percentage.toFixed(2)}%</span></div>
+                ${expectedMoveHtml}
                 <div>Expiries: ${expiryText}</div>
             `;
         }
@@ -5717,7 +5737,7 @@ def index():
             if (settings.levels_types) {
                 document.querySelectorAll('.levels-option input').forEach(cb => cb.checked = false);
                 settings.levels_types.forEach(type => {
-                    const cb = document.getElementById('lvl-' + type);
+                    const cb = document.getElementById('lvl-' + type.replace(/\s+/g, ''));
                     if (cb) cb.checked = true;
                 });
                 updateLevelsDisplay();
@@ -5726,7 +5746,8 @@ def index():
             if (settings.use_heikin_ashi !== undefined) document.getElementById('use_heikin_ashi').checked = settings.use_heikin_ashi;
             if (settings.horizontal_bars !== undefined) document.getElementById('horizontal_bars').checked = settings.horizontal_bars;
             if (settings.show_abs_gex !== undefined) document.getElementById('show_abs_gex').checked = settings.show_abs_gex;
-            if (settings.abs_gex_opacity) document.getElementById('abs_gex_opacity').value = settings.abs_gex_opacity;
+            if (settings.abs_gex_opacity !== undefined) document.getElementById('abs_gex_opacity').value = settings.abs_gex_opacity;
+            if (settings.gex_absolute !== undefined) document.getElementById('gex_absolute').checked = settings.gex_absolute;
             if (settings.use_range !== undefined) document.getElementById('use_range').checked = settings.use_range;
             if (settings.call_color) {
                 document.getElementById('call_color').value = settings.call_color;
@@ -6081,27 +6102,73 @@ def update():
                 quote_ticker = "SPY"
             else:
                 quote_ticker = ticker
-            
+
             quote_response = client.quote(quote_ticker)
             if not quote_response.ok:
                 raise Exception(f"Failed to fetch quote for display: {quote_response.status_code} {quote_response.reason}")
-            
+
+            # --- Always Calculate Expected Move Range (same as chart logic) ---
+            expected_move_range = None
+            strikes_sorted = sorted(calls['strike'].unique()) if not calls.empty else []
+            if strikes_sorted:
+                atm_strike = min(strikes_sorted, key=lambda x: abs(x - S))
+                atm_idx = strikes_sorted.index(atm_strike)
+                def get_mid(df, strike):
+                    row = df.loc[df['strike'] == strike]
+                    if row is not None and not row.empty:
+                        bid = row['bid'].values[0]
+                        ask = row['ask'].values[0]
+                        if bid > 0 and ask > 0:
+                            return (bid + ask) / 2
+                        elif bid > 0:
+                            return bid
+                        elif ask > 0:
+                            return ask
+                    return None
+                call_mid_atm = get_mid(calls, atm_strike)
+                put_mid_atm = get_mid(puts, atm_strike)
+                straddle = (call_mid_atm if call_mid_atm is not None else 0) + (put_mid_atm if put_mid_atm is not None else 0)
+                # Expected Move = ATM Straddle (most common market formula)
+                expected_move = straddle
+                if expected_move > 0:
+                    upper = S + expected_move
+                    lower = S - expected_move
+                    expected_move_range = {'lower': round(lower, 2), 'upper': round(upper, 2), 'move': round(expected_move, 2)}
+
             if quote_response.ok:
                 quote_data = quote_response.json()
                 ticker_data = quote_data.get(quote_ticker, {})
                 quote = ticker_data.get('quote', {})
-                
+
+                # compute high/low diffs relative to current price
+                high_price = quote.get('highPrice', S)
+                low_price  = quote.get('lowPrice', S)
+                high_diff = high_price - S
+                low_diff  = low_price - S
+                high_diff_pct = (high_diff / S * 100) if S else 0
+                low_diff_pct  = (low_diff  / S * 100) if S else 0
+
+                # add percentage of expected move boundaries if available (rounded to 2 decimals)
+                if expected_move_range:
+                    expected_move_range['lower_pct'] = round(((expected_move_range['lower'] - S) / S * 100), 2)
+                    expected_move_range['upper_pct'] = round(((expected_move_range['upper'] - S) / S * 100), 2)
+
                 response['price_info'] = {
                     'current_price': S,
-                    'high': quote.get('highPrice', S),
-                    'low': quote.get('lowPrice', S),
+                    'high': high_price,
+                    'low': low_price,
+                    'high_diff': round(high_diff, 2),
+                    'high_diff_pct': round(high_diff_pct, 2),
+                    'low_diff': round(low_diff, 2),
+                    'low_diff_pct': round(low_diff_pct, 2),
                     'net_change': quote.get('netChange', 0),
                     'net_percent': quote.get('netPercentChange', 0),
                     'call_volume': call_volume,
                     'put_volume': put_volume,
                     'total_volume': total_volume,
                     'call_percentage': call_percentage,
-                    'put_percentage': put_percentage
+                    'put_percentage': put_percentage,
+                    'expected_move_range': expected_move_range
                 }
         except Exception as e:
             print(f"Error fetching quote data: {e}")
@@ -6109,13 +6176,18 @@ def update():
                 'current_price': S,
                 'high': S,
                 'low': S,
+                'high_diff': 0,
+                'high_diff_pct': 0,
+                'low_diff': 0,
+                'low_diff_pct': 0,
                 'net_change': 0,
                 'net_percent': 0,
                 'call_volume': call_volume,
                 'put_volume': put_volume,
                 'total_volume': total_volume,
                 'call_percentage': call_percentage,
-                'put_percentage': put_percentage
+                'put_percentage': put_percentage,
+                'expected_move_range': None
             }
         
         return jsonify(response)
