@@ -2056,7 +2056,7 @@ def convert_to_heikin_ashi(candles):
     
     return ha_candles
 
-def create_price_chart(price_data, calls=None, puts=None, exposure_levels_types=[], exposure_levels_count=3, call_color='#00FF00', put_color='#FF0000', strike_range=0.02, use_heikin_ashi=False, highlight_max_level=False, max_level_color='#800080'):
+def create_price_chart(price_data, calls=None, puts=None, exposure_levels_types=[], exposure_levels_count=3, call_color='#00FF00', put_color='#FF0000', strike_range=0.02, use_heikin_ashi=False, highlight_max_level=False, max_level_color='#800080', coloring_mode='Linear Intensity'):
     # Handle backward compatibility or empty default
     if isinstance(exposure_levels_types, str):
         if exposure_levels_types == 'None':
@@ -2432,10 +2432,15 @@ def create_price_chart(price_data, calls=None, puts=None, exposure_levels_types=
                 # Determine color: Green for positive, Red for negative
                 color = call_color if val >= 0 else put_color
                 
-                # Calculate color intensity based on value within its OWN type
+                # Calculate color intensity based on coloring mode
                 type_max_val = max(abs(l[1]) for l in all_top_levels if l[2] == exposure_levels_type)
                 if type_max_val == 0: type_max_val = 1
-                intensity = max(0.1, min(1.0, abs(val) / type_max_val))
+                if coloring_mode == 'Solid':
+                    intensity = 1.0
+                elif coloring_mode == 'Ranked Intensity':
+                    intensity = 0.1 + 0.9 * ((abs(val) / type_max_val) ** 3)
+                else:  # Linear Intensity (default)
+                    intensity = 0.3 + 0.7 * (abs(val) / type_max_val)
             
             r = int(color[1:3], 16)
             g = int(color[3:5], 16)
@@ -2479,6 +2484,214 @@ def create_price_chart(price_data, calls=None, puts=None, exposure_levels_types=
             )
 
     return fig.to_json()
+
+
+def prepare_price_chart_data(price_data, calls=None, puts=None, exposure_levels_types=[],
+                              exposure_levels_count=3, call_color='#00FF00', put_color='#FF0000',
+                              strike_range=0.1, use_heikin_ashi=False,
+                              highlight_max_level=False, max_level_color='#800080',
+                              coloring_mode='Linear Intensity'):
+    """Return raw OHLCV + overlay data as JSON for TradingView Lightweight Charts rendering."""
+    import json as _json
+
+    # Handle backward compatibility
+    if isinstance(exposure_levels_types, str):
+        if exposure_levels_types == 'None':
+            exposure_levels_types = []
+        else:
+            exposure_levels_types = [exposure_levels_types]
+
+    if not price_data or 'candles' not in price_data or not price_data['candles']:
+        return _json.dumps({'error': 'No price data'})
+
+    candles = filter_market_hours(price_data['candles'])
+    if not candles:
+        return _json.dumps({'error': 'No market-hour candles'})
+
+    est = pytz.timezone('US/Eastern')
+    current_date = datetime.now(est).date()
+
+    # Deduplicate and sort
+    unique_candles = {}
+    for c in candles:
+        t = datetime.fromtimestamp(c['datetime'] / 1000, est)
+        unique_candles[t] = c
+    sorted_candles = [c for _, c in sorted(unique_candles.items(), key=lambda x: x[0])]
+
+    # Filter to current day
+    current_day_candles = [c for c in sorted_candles
+                           if datetime.fromtimestamp(c['datetime'] / 1000, est).date() == current_date]
+    if not current_day_candles:
+        most_recent_date = max(
+            datetime.fromtimestamp(c['datetime'] / 1000, est).date() for c in sorted_candles)
+        current_day_candles = [c for c in sorted_candles
+                               if datetime.fromtimestamp(c['datetime'] / 1000, est).date() == most_recent_date]
+
+    # Apply Heikin-Ashi using all candles as seed, then slice to current day
+    if use_heikin_ashi:
+        all_ha = convert_to_heikin_ashi(sorted_candles)
+        day_start_idx = len(sorted_candles) - len(current_day_candles)
+        display_candles = all_ha[day_start_idx:]
+    else:
+        display_candles = current_day_candles
+
+    # Previous day close
+    previous_day_close = None
+    for c in reversed(sorted_candles):
+        t = datetime.fromtimestamp(c['datetime'] / 1000, est)
+        if t.date() < current_date:
+            previous_day_close = c['close']
+            break
+
+    # Build Lightweight Charts candle data (time in seconds UTC)
+    lc_candles = []
+    lc_volume = []
+    for i, c in enumerate(display_candles):
+        ts = int(c['datetime'] / 1000)
+        lc_candles.append({'time': ts, 'open': c['open'], 'high': c['high'],
+                           'low': c['low'], 'close': c['close']})
+        is_up = c['close'] >= c['open'] if i == 0 else c['close'] >= display_candles[i - 1]['close']
+        lc_volume.append({'time': ts, 'value': c['volume'],
+                          'color': call_color if is_up else put_color})
+
+    current_price = display_candles[-1]['close'] if display_candles else 0
+    last_candle = display_candles[-1] if display_candles else None
+    last_candle_up = (last_candle['close'] >= last_candle['open']) if last_candle else True
+
+    # Compute exposure levels
+    exposure_levels = []
+    expected_moves = []
+
+    if exposure_levels_types and calls is not None and puts is not None:
+        min_strike = current_price * (1 - strike_range)
+        max_strike = current_price * (1 + strike_range)
+        range_calls = calls[(calls['strike'] >= min_strike) & (calls['strike'] <= max_strike)]
+        range_puts = puts[(puts['strike'] >= min_strike) & (puts['strike'] <= max_strike)]
+
+        dash_map = ['dashed', 'dotted', 'large_dashed', 'dotted', 'dashed']
+        all_top_levels = []
+
+        for i, etype in enumerate(exposure_levels_types):
+            if etype.lower() == 'expected move':
+                strikes_sorted = sorted(calls['strike'].unique()) if not calls.empty else []
+                if not strikes_sorted:
+                    continue
+                atm_strike = min(strikes_sorted, key=lambda x: abs(x - current_price))
+
+                def _get_mid(df, strike):
+                    row = df.loc[df['strike'] == strike]
+                    if row is not None and not row.empty:
+                        bid = row['bid'].values[0]
+                        ask = row['ask'].values[0]
+                        if bid > 0 and ask > 0:
+                            return (bid + ask) / 2
+                        elif bid > 0:
+                            return bid
+                        elif ask > 0:
+                            return ask
+                    return None
+
+                c_mid = _get_mid(calls, atm_strike)
+                p_mid = _get_mid(puts, atm_strike)
+                straddle = (c_mid or 0) + (p_mid or 0)
+                if straddle > 0:
+                    expected_moves.append({
+                        'upper': round(current_price + straddle, 2),
+                        'lower': round(current_price - straddle, 2)
+                    })
+                continue
+
+            col_name = etype
+            if etype in ('Vanna', 'VEX'):
+                col_name = 'VEX'
+            if etype == 'AbsGEX':
+                col_name = 'GEX'
+
+            if col_name in range_calls.columns and col_name in range_puts.columns:
+                call_ex = range_calls.groupby('strike')[col_name].sum().to_dict() if not range_calls.empty else {}
+                put_ex = range_puts.groupby('strike')[col_name].sum().to_dict() if not range_puts.empty else {}
+                all_strikes_set = set(call_ex.keys()) | set(put_ex.keys())
+                levels = {}
+                for strike in all_strikes_set:
+                    c_val = call_ex.get(strike, 0)
+                    p_val = put_ex.get(strike, 0)
+                    if etype == 'GEX':
+                        net_val = c_val - p_val
+                    elif etype == 'AbsGEX':
+                        net_val = abs(c_val) + abs(p_val)
+                    else:
+                        net_val = c_val + p_val
+                    levels[strike] = net_val
+
+                top = sorted(levels.items(), key=lambda x: abs(x[1]), reverse=True)[:exposure_levels_count]
+                for strike, val in top:
+                    all_top_levels.append((strike, val, etype, i))
+
+        # Max per type for highlight
+        max_abs_by_type = {}
+        if highlight_max_level:
+            for strike, val, etype, tidx in all_top_levels:
+                if etype not in max_abs_by_type or abs(val) > max_abs_by_type[etype]:
+                    max_abs_by_type[etype] = abs(val)
+
+        type_max_vals = {}
+        for strike, val, etype, tidx in all_top_levels:
+            if etype not in type_max_vals or abs(val) > type_max_vals[etype]:
+                type_max_vals[etype] = abs(val)
+
+        for strike, val, etype, type_index in all_top_levels:
+            type_max_val = type_max_vals.get(etype, 1) or 1
+            is_max = (highlight_max_level
+                      and max_abs_by_type.get(etype, 0) > 0
+                      and abs(val) == max_abs_by_type[etype])
+
+            if is_max:
+                intensity = 1.0
+            elif coloring_mode == 'Solid':
+                intensity = 1.0
+            elif coloring_mode == 'Ranked Intensity':
+                intensity = 0.1 + 0.9 * ((abs(val) / type_max_val) ** 3)
+            else:  # Linear Intensity (default)
+                intensity = 0.3 + 0.7 * (abs(val) / type_max_val)
+
+            color = max_level_color if is_max else (call_color if val >= 0 else put_color)
+            line_width = 2 if is_max else 1
+
+            r = int(color[1:3], 16)
+            g = int(color[3:5], 16)
+            b = int(color[5:7], 16)
+            rgba = f'rgba({r},{g},{b},{intensity:.2f})'
+
+            display_name = etype
+            if etype == 'VEX':
+                display_name = 'Vanna'
+            if etype == 'AbsGEX':
+                display_name = 'Abs GEX'
+
+            exposure_levels.append({
+                'price': float(strike),
+                'value': float(val),
+                'type': display_name,
+                'color': rgba,
+                'line_width': line_width,
+                'dash_style': dash_map[type_index % len(dash_map)],
+                'is_max': is_max,
+                'label': f"{display_name}: {format_large_number(val)}"
+            })
+
+    return _json.dumps({
+        'candles': lc_candles,
+        'volume': lc_volume,
+        'previous_day_close': previous_day_close,
+        'current_price': current_price,
+        'call_color': call_color,
+        'put_color': put_color,
+        'use_heikin_ashi': use_heikin_ashi,
+        'last_candle_up': last_candle_up,
+        'exposure_levels': exposure_levels,
+        'expected_moves': expected_moves,
+    })
+
 
 def create_large_trades_table(calls, puts, S, strike_range, call_color='#00FF00', put_color='#FF0000', selected_expiries=None):
     """Create a sortable options chain table showing all options within the strike range"""
@@ -3746,6 +3959,7 @@ def index():
     <meta name="apple-mobile-web-app-capable" content="yes">
     <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
     <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+    <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
     <style>
         body {
             background-color: #1E1E1E;
@@ -4004,8 +4218,7 @@ def index():
         }
         
         .price-chart-container {
-            grid-column: 1 / -1;
-            margin-bottom: 5px;
+            /* overridden below by TV chart styles */
         }
         
         .historical-bubbles-row {
@@ -4062,6 +4275,109 @@ def index():
             width: 100%;
             height: 100%;
         }
+
+        /* TradingView-style price chart overrides */
+        .price-chart-container {
+            background: #1a1a1a;
+            border-radius: 10px;
+            overflow: hidden;
+            margin-bottom: 5px;
+            grid-column: 1 / -1;
+        }
+        #price-chart {
+            padding: 0 !important;
+            background-color: #1E1E1E !important;
+            height: 680px !important;
+            border-radius: 0 0 0 0;
+            overflow: hidden;
+            /* override .chart-container defaults that conflict */
+            margin-bottom: 0 !important;
+        }
+        .tv-chart-title {
+            display: inline-block;
+            color: #CCCCCC;
+            font-size: 13px;
+            font-weight: bold;
+            padding: 2px 8px;
+            pointer-events: none;
+        }
+        /* Chart toolbar — sits ABOVE the canvas, normal document flow */
+        .tv-toolbar-container {
+            background: #1a1a1a;
+            border-bottom: 1px solid #333;
+            border-radius: 10px 10px 0 0;
+            padding: 4px 8px;
+            display: flex;
+            flex-wrap: wrap;
+            gap: 4px;
+            align-items: center;
+        }
+        .tv-toolbar {
+            display: contents; /* children flow directly into container */
+        }
+        .tv-toolbar-sep {
+            width: 1px;
+            height: 20px;
+            background: #444;
+            margin: 0 2px;
+        }
+        .tv-tb-btn {
+            background: #2a2a2a;
+            border: 1px solid #444;
+            color: #ccc;
+            border-radius: 4px;
+            padding: 3px 7px;
+            font-size: 11px;
+            cursor: pointer;
+            white-space: nowrap;
+            transition: background 0.15s;
+            user-select: none;
+        }
+        .tv-tb-btn:hover  { background: #3a3a3a; color: #fff; }
+        .tv-tb-btn.active { background: #1a5fac; border-color: #4b90e2; color: #fff; }
+        .tv-tb-btn.danger { background: #5c1a1a; border-color: #c0392b; color: #f88; }
+        /* Indicator legend — inside canvas, pointer-events none so it doesn't block */
+        .tv-indicator-legend {
+            position: absolute;
+            bottom: 8px;
+            left: 8px;
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+            z-index: 15;
+            pointer-events: none;
+        }
+        .tv-legend-item {
+            font-size: 10px;
+            color: #ccc;
+            display: flex;
+            align-items: center;
+            gap: 4px;
+        }
+        .tv-legend-swatch {
+            width: 14px;
+            height: 3px;
+            border-radius: 2px;
+        }
+        /* RSI / MACD sub-panes */
+        .tv-sub-pane {
+            background: #1E1E1E;
+            border-top: 1px solid #333;
+            position: relative;
+            overflow: hidden;
+        }
+        .tv-sub-pane-header {
+            position: absolute;
+            top: 4px;
+            left: 8px;
+            z-index: 5;
+            font-size: 10px;
+            color: #888;
+            font-weight: bold;
+            pointer-events: none;
+        }
+        /* Drawing mode cursor */
+        #price-chart.draw-mode > canvas { cursor: crosshair !important; }
         .price-info {
             display: flex;
             gap: 15px;
@@ -4674,7 +4990,16 @@ def index():
         
         <div class="chart-grid" id="chart-grid">
             <div class="price-chart-container">
+                <div class="tv-toolbar-container" id="tv-toolbar-container"></div>
                 <div class="chart-container" id="price-chart"></div>
+                <div class="tv-sub-pane" id="rsi-pane" style="display:none">
+                    <div class="tv-sub-pane-header">RSI 14</div>
+                    <div id="rsi-chart" style="height:110px"></div>
+                </div>
+                <div class="tv-sub-pane" id="macd-pane" style="display:none">
+                    <div class="tv-sub-pane-header">MACD (12,26,9)</div>
+                    <div id="macd-chart" style="height:120px"></div>
+                </div>
             </div>
             <div class="historical-bubbles-row" id="historical-bubbles-row">
                 <!-- Historical bubble levels will be dynamically inserted here -->
@@ -4694,6 +5019,75 @@ def index():
         let isStreaming = true;
         let savedScrollPosition = 0; // Track scroll position
         let chartContainerCache = {}; // Cache for chart containers to prevent recreation
+
+        // TradingView Lightweight Charts instances for the price chart
+        let tvPriceChart = null;
+        let tvCandleSeries = null;
+        let tvVolumeSeries = null;
+        let tvResizeObserver = null;
+        // Indicator series references
+        let tvIndicatorSeries = {};
+        // Sub-pane charts for RSI and MACD
+        let tvRsiChart = null, tvRsiSeries = null;
+        let tvMacdChart = null, tvMacdSeries = {};
+        // Persist active indicators across data refreshes
+        let tvActiveInds = new Set();
+        // Auto-range: when true, chart fits all data on every update; when false, zoom/pan is preserved
+        let tvAutoRange = false;
+        // Time-scale sync state
+        let tvSyncHandlers = [], tvSyncingTimeScale = false;
+        // Drawing state
+        let tvDrawMode = null;          // null | 'hline' | 'trendline' | 'rect' | 'text'
+        let tvDrawStart = null;         // {price, time, x, y} of first click
+        let tvDrawings = [];            // list of drawn series/line objects for undo/clear
+        let tvDrawingDefs = [];         // serializable drawing definitions — survive full re-renders
+        let tvLastCandles = [];         // cache of candle data for indicator calcs
+        let tvLastPriceData = null;     // cache of full priceData for redraw
+        // All overlay level prices (exposure, EM, drawn H-lines) — used by autoscaleInfoProvider
+        let tvAllLevelPrices = [];
+        // References to dynamically-added price lines (exposure levels, expected moves)
+        // kept so they can be removed without a full chart rebuild
+        let tvExposurePriceLines = [];
+        let tvExpectedMovePriceLines = [];
+        // Track the active ticker so we can reset chart state on ticker change
+        let tvLastTicker = null;
+        // When true, the next render will call fitContent() regardless of tvAutoRange
+        let tvForceFit = false;
+
+        // Apply (or re-apply) the autoscaleInfoProvider so the Y-axis always fits levels
+        function tvApplyAutoscale() {
+            if (!tvCandleSeries) return;
+            const levelPrices = tvAllLevelPrices.slice(); // snapshot
+            tvCandleSeries.applyOptions({
+                autoscaleInfoProvider: (original) => {
+                    const res = original();
+                    if (!res) return res;
+                    if (levelPrices.length === 0) return res;
+                    const pad = (res.priceRange.maxValue - res.priceRange.minValue) * 0.05;
+                    const minVal = Math.min(res.priceRange.minValue, ...levelPrices) - pad;
+                    const maxVal = Math.max(res.priceRange.maxValue, ...levelPrices) + pad;
+                    return { priceRange: { minValue: minVal, maxValue: maxVal }, margins: res.margins };
+                }
+            });
+        }
+
+        function tvFitAll() {
+            if (!tvPriceChart) return;
+            // Use setTimeout so this fires after LightweightCharts finishes its own internal layout pass
+            setTimeout(() => {
+                try {
+                    // Reset X-axis (time scale)
+                    tvPriceChart.timeScale().fitContent();
+                    // Reset Y-axis: re-enable auto-scaling (user dragging the price axis locks it to manual mode)
+                    tvPriceChart.priceScale('right').applyOptions({ autoScale: true });
+                    // Re-arm the autoscaleInfoProvider so level lines are included in the Y range
+                    tvApplyAutoscale();
+                    // Sub-pane charts also need their price axes reset
+                    if (tvRsiChart)  tvRsiChart.priceScale('right').applyOptions({ autoScale: true });
+                    if (tvMacdChart) tvMacdChart.priceScale('right').applyOptions({ autoScale: true });
+                } catch(e) {}
+            }, 50);
+        }
 
         // --- Fullscreen chart support ---
         const fsExpandSvg = '<svg viewBox="0 0 14 14" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M1 5V1h4M9 1h4v4M13 9v4H9M5 13H1V9"/></svg>';
@@ -4718,12 +5112,17 @@ def index():
                 document.body.style.overflow = '';
             }
 
-            // Let Plotly know about the size change
+            // Let Plotly know about the size change; also trigger TV chart resize
             requestAnimationFrame(() => {
                 document.querySelectorAll('.chart-container').forEach(el => {
                     const plot = el.querySelector('.js-plotly-plot');
                     if (plot) { try { Plotly.Plots.resize(plot); } catch(e) {} }
                 });
+                // Resize TradingView price chart
+                const tvContainer = document.getElementById('price-chart');
+                if (tvPriceChart && tvContainer) {
+                    tvPriceChart.applyOptions({ width: tvContainer.clientWidth });
+                }
             });
         }
 
@@ -4755,6 +5154,10 @@ def index():
                             const plot = el.querySelector('.js-plotly-plot');
                             if (plot) { try { Plotly.Plots.resize(plot); } catch(e) {} }
                         });
+                        const tvContainer = document.getElementById('price-chart');
+                        if (tvPriceChart && tvContainer) {
+                            tvPriceChart.applyOptions({ width: tvContainer.clientWidth });
+                        }
                     });
                 }
             }
@@ -4794,7 +5197,201 @@ def index():
                 return;
             }
 
-            popup.document.write(`<!DOCTYPE html>
+            // Price chart uses TradingView Lightweight Charts — needs a different template
+            if (chartId === 'price-chart') {
+                popup.document.write(`<!DOCTYPE html>
+<html><head><title>Price Chart - EzOptions</title>
+<script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"><\\/script>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { background:#1E1E1E; color:#ccc; font-family:Arial,sans-serif; display:flex; flex-direction:column; height:100vh; overflow:hidden; }
+  #popout-logo { position:fixed; top:6px; left:10px; z-index:200; font-size:11px; font-weight:bold; color:#800080; opacity:0.7; pointer-events:none; letter-spacing:0.5px; }
+  #toolbar { background:#1a1a1a; border-bottom:1px solid #333; padding:4px 8px; display:flex; flex-wrap:wrap; gap:4px; align-items:center; flex-shrink:0; z-index:100; }
+  .tv-tb-sep { width:1px; height:20px; background:#444; margin:0 2px; }
+  .tb-btn { background:#2a2a2a; border:1px solid #444; color:#ccc; border-radius:4px; padding:3px 7px; font-size:11px; cursor:pointer; white-space:nowrap; transition:background 0.15s; user-select:none; }
+  .tb-btn:hover  { background:#3a3a3a; color:#fff; }
+  .tb-btn.active { background:#1a5fac; border-color:#4b90e2; color:#fff; }
+  .tb-btn.danger { background:#5c1a1a; border-color:#c0392b; color:#f88; }
+  #chart-area { flex:1; display:flex; flex-direction:column; min-height:0; position:relative; }
+  #price-chart { flex:1; min-height:0; position:relative; }
+  .tv-sub-pane { background:#1E1E1E; border-top:1px solid #333; flex-shrink:0; position:relative; }
+  .tv-sub-pane-hdr { position:absolute; top:4px; left:8px; z-index:5; font-size:10px; color:#888; font-weight:bold; pointer-events:none; }
+  .ind-legend { position:absolute; bottom:8px; left:8px; display:flex; flex-wrap:wrap; gap:6px; z-index:15; pointer-events:none; }
+  .ind-item { font-size:10px; color:#ccc; display:flex; align-items:center; gap:4px; }
+  .ind-swatch { width:14px; height:3px; border-radius:2px; }
+  .title-el { display:inline-block; color:#ccc; font-size:13px; font-weight:bold; padding:2px 8px; pointer-events:none; }
+</style></head><body>
+<div id="popout-logo">EzDuz1t Options</div>
+<div id="toolbar">
+  <span class="title-el" id="chart-title">Price Chart</span>
+  <div class="tv-tb-sep"></div>
+</div>
+<div id="chart-area">
+  <div id="price-chart"></div>
+  <div class="tv-sub-pane" id="rsi-pane" style="display:none"><div class="tv-sub-pane-hdr">RSI 14</div><div id="rsi-chart" style="height:110px"></div></div>
+  <div class="tv-sub-pane" id="macd-pane" style="display:none"><div class="tv-sub-pane-hdr">MACD (12,26,9)</div><div id="macd-chart" style="height:120px"></div></div>
+</div>
+<script>
+  // ── State ──────────────────────────────────────────────────────────────────
+  var tvChart=null, tvCandle=null, tvVol=null;
+  var tvRsiChart=null, tvRsiSeries=null;
+  var tvMacdChart=null, tvMacdSeries={};
+  var tvIndSeries={};
+  var activeInds=new Set();
+  var tvPriceLines=[], tvDrawings=[], tvDrawingDefs=[];
+  var tvAllLevelPrices=[];
+  var tvLastCandles=[];
+  var tvDrawMode=null, tvDrawStart=null;
+  var tvAutoRange=false;
+  var tvSyncHandlers=[], tvSyncingTS=false;
+  var drawColor='#FFD700';
+  var lineStyleMap={};
+
+  // ── Math helpers ───────────────────────────────────────────────────────────
+  function calcSMA(c,p){return c.map(function(_,i){if(i<p-1)return null;var s=c.slice(i-p+1,i+1);return s.reduce(function(a,b){return a+b;},0)/p;});}
+  function calcEMA(c,p){var k=2/(p+1),r=[],e=null;for(var i=0;i<c.length;i++){if(i<p-1){r.push(null);continue;}if(e===null){e=c.slice(0,p).reduce(function(a,b){return a+b;},0)/p;}else{e=c[i]*k+e*(1-k);}r.push(e);}return r;}
+  function calcVWAP(cs){var cp=0,cv=0;return cs.map(function(c){var t=(c.high+c.low+c.close)/3;cp+=t*c.volume;cv+=c.volume;return cv>0?cp/cv:c.close;});}
+  function calcBB(c,p,m){p=p||20;m=m||2;var s=calcSMA(c,p);return s.map(function(mid,i){if(mid===null)return{upper:null,mid:null,lower:null};var sl=c.slice(Math.max(0,i-p+1),i+1),v=sl.reduce(function(a,b){return a+(b-mid)*(b-mid);},0)/sl.length,sd=Math.sqrt(v);return{upper:mid+m*sd,mid:mid,lower:mid-m*sd};});}
+  function calcRSI(c,p){p=p||14;var r=[];for(var i=0;i<c.length;i++){if(i<p){r.push(null);continue;}var g=0,l=0;for(var j=i-p+1;j<=i;j++){var d=c[j]-c[j-1];if(d>0)g+=d;else l-=d;}var ag=g/p,al=l/p;r.push(al===0?100:100-100/(1+ag/al));}return r;}
+  function calcMACD(c,fast,slow,sig){fast=fast||12;slow=slow||26;sig=sig||9;var ef=calcEMA(c,fast),es=calcEMA(c,slow);var ml=ef.map(function(v,i){return(v!==null&&es[i]!==null)?v-es[i]:null;});var sl=[],es2=null,vi=0,k=2/(sig+1);for(var i=0;i<ml.length;i++){if(ml[i]===null){sl.push(null);continue;}if(vi<sig-1){sl.push(null);vi++;continue;}if(es2===null){var piece=ml.filter(function(v){return v!==null;}).slice(0,sig);es2=piece.reduce(function(a,b){return a+b;},0)/sig;}else{es2=ml[i]*k+es2*(1-k);}sl.push(es2);vi++;}return{macd:ml,signal:sl,histogram:ml.map(function(v,i){return(v!==null&&sl[i]!==null)?v-sl[i]:null;})};}
+
+  // ── Sub-pane chart factory ─────────────────────────────────────────────────
+  function mkSubChart(el,h){return LightweightCharts.createChart(el,{autoSize:true,height:h,layout:{background:{color:'#1E1E1E'},textColor:'#CCCCCC',fontFamily:'Arial,sans-serif'},grid:{vertLines:{color:'#2A2A2A'},horzLines:{color:'#2A2A2A'}},crosshair:{mode:LightweightCharts.CrosshairMode.Normal,vertLine:{color:'#555',labelBackgroundColor:'#2D2D2D'},horzLine:{color:'#555',labelBackgroundColor:'#2D2D2D'}},rightPriceScale:{borderColor:'#333',scaleMargins:{top:0.1,bottom:0.1}},timeScale:{borderColor:'#333',timeVisible:false,secondsVisible:false,fixLeftEdge:true,fixRightEdge:false},handleScale:{mouseWheel:true,pinch:true,axisPressedMouseMove:true},handleScroll:{mouseWheel:true,pressedMouseMove:true,horzTouchDrag:true,vertTouchDrag:false}});}
+
+  // ── Time-scale sync ────────────────────────────────────────────────────────
+  function setupSync(){tvSyncHandlers.forEach(function(h){try{h.chart.timeScale().unsubscribeVisibleLogicalRangeChange(h.handler);}catch(e){}});tvSyncHandlers=[];var all=[tvChart,tvRsiChart,tvMacdChart].filter(Boolean);if(all.length<2)return;all.forEach(function(src){var others=all.filter(function(c){return c!==src;});var h=function(range){if(tvSyncingTS||!range)return;tvSyncingTS=true;others.forEach(function(c){try{c.timeScale().setVisibleLogicalRange(range);}catch(e){}});tvSyncingTS=false;};try{src.timeScale().subscribeVisibleLogicalRangeChange(h);}catch(e){}tvSyncHandlers.push({chart:src,handler:h});});if(tvChart){try{var r=tvChart.timeScale().getVisibleLogicalRange();if(r)[tvRsiChart,tvMacdChart].filter(Boolean).forEach(function(c){try{c.timeScale().setVisibleLogicalRange(r);}catch(e){}});}catch(e){}}}
+
+  // ── Indicators ─────────────────────────────────────────────────────────────
+  function applyIndicators(candles){
+    if(!tvChart||!tvCandle)return;
+    var times=candles.map(function(c){return c.time;}),closes=candles.map(function(c){return c.close;});
+    function mkLine(col,lw,title){return tvChart.addLineSeries({color:col,lineWidth:lw||1,priceScaleId:'right',lastValueVisible:true,priceLineVisible:false,title:title||''});}
+    // Remove deactivated
+    Object.keys(tvIndSeries).forEach(function(k){if(!activeInds.has(k)){var s=tvIndSeries[k];if(Array.isArray(s))s.forEach(function(x){try{tvChart.removeSeries(x);}catch(e){}});else{try{tvChart.removeSeries(s);}catch(e){};}delete tvIndSeries[k];}});
+    // Add activated
+    if(activeInds.has('sma20')&&!tvIndSeries['sma20']){var s=mkLine('#f0c040',1,'SMA20');s.setData(calcSMA(closes,20).map(function(v,i){return v!==null?{time:times[i],value:v}:null;}).filter(Boolean));tvIndSeries['sma20']=s;}
+    if(activeInds.has('sma50')&&!tvIndSeries['sma50']){var s=mkLine('#40a0f0',1,'SMA50');s.setData(calcSMA(closes,50).map(function(v,i){return v!==null?{time:times[i],value:v}:null;}).filter(Boolean));tvIndSeries['sma50']=s;}
+    if(activeInds.has('sma200')&&!tvIndSeries['sma200']){var s=mkLine('#e040fb',1,'SMA200');s.setData(calcSMA(closes,200).map(function(v,i){return v!==null?{time:times[i],value:v}:null;}).filter(Boolean));tvIndSeries['sma200']=s;}
+    if(activeInds.has('ema9')&&!tvIndSeries['ema9']){var s=mkLine('#ff9900',1,'EMA9');s.setData(calcEMA(closes,9).map(function(v,i){return v!==null?{time:times[i],value:v}:null;}).filter(Boolean));tvIndSeries['ema9']=s;}
+    if(activeInds.has('ema21')&&!tvIndSeries['ema21']){var s=mkLine('#00e5ff',1,'EMA21');s.setData(calcEMA(closes,21).map(function(v,i){return v!==null?{time:times[i],value:v}:null;}).filter(Boolean));tvIndSeries['ema21']=s;}
+    if(activeInds.has('vwap')&&!tvIndSeries['vwap']){var vv=calcVWAP(candles.map(function(c,i){return{high:candles[i].high,low:candles[i].low,close:candles[i].close,volume:c.volume||0};}));var s=mkLine('#ffffff',1,'VWAP');s.setData(vv.map(function(v,i){return{time:times[i],value:v};}));tvIndSeries['vwap']=s;}
+    if(activeInds.has('bb')&&!tvIndSeries['bb']){var bb=calcBB(closes);var u=mkLine('rgba(100,180,255,0.8)',1,'BB U'),m=mkLine('rgba(100,180,255,0.5)',1,'BB M'),l=mkLine('rgba(100,180,255,0.8)',1,'BB L');u.setData(bb.map(function(v,i){return v.upper!==null?{time:times[i],value:v.upper}:null;}).filter(Boolean));m.setData(bb.map(function(v,i){return v.mid!==null?{time:times[i],value:v.mid}:null;}).filter(Boolean));l.setData(bb.map(function(v,i){return v.lower!==null?{time:times[i],value:v.lower}:null;}).filter(Boolean));tvIndSeries['bb']=[u,m,l];}
+    if(activeInds.has('rsi'))applyRsiPane(candles,times);else destroyRsiPane();
+    if(activeInds.has('macd'))applyMacdPane(candles,times);else destroyMacdPane();
+    updateLegend();
+  }
+  function applyRsiPane(candles,times){
+    var pane=document.getElementById('rsi-pane');if(!pane)return;pane.style.display='block';
+    var rsiVals=calcRSI(candles.map(function(c){return c.close;}));
+    var rsiData=rsiVals.map(function(v,i){return v!==null?{time:times[i],value:v}:null;}).filter(Boolean);
+    if(!tvRsiChart){var el=document.getElementById('rsi-chart');if(!el)return;tvRsiChart=mkSubChart(el,110);tvRsiSeries=tvRsiChart.addLineSeries({color:'#e91e63',lineWidth:1.5,lastValueVisible:true,priceLineVisible:false,title:'RSI14'});tvRsiSeries.createPriceLine({price:70,color:'rgba(255,100,100,0.7)',lineWidth:1,lineStyle:LightweightCharts.LineStyle.Dashed,axisLabelVisible:true,title:'70'});tvRsiSeries.createPriceLine({price:30,color:'rgba(100,200,100,0.7)',lineWidth:1,lineStyle:LightweightCharts.LineStyle.Dashed,axisLabelVisible:true,title:'30'});}
+    if(rsiData.length)tvRsiSeries.setData(rsiData);
+    setupSync();
+  }
+  function destroyRsiPane(){var pane=document.getElementById('rsi-pane');if(pane)pane.style.display='none';if(tvRsiChart){tvSyncHandlers=tvSyncHandlers.filter(function(h){return h.chart!==tvRsiChart;});try{tvRsiChart.remove();}catch(e){}tvRsiChart=null;tvRsiSeries=null;}}
+  function applyMacdPane(candles,times){
+    var pane=document.getElementById('macd-pane');if(!pane)return;pane.style.display='block';
+    var md=calcMACD(candles.map(function(c){return c.close;}));
+    var hd=md.histogram.map(function(v,i){return v!==null?{time:times[i],value:v,color:v>=0?'rgba(76,175,80,0.8)':'rgba(244,67,54,0.8)'}:null;}).filter(Boolean);
+    var ld=md.macd.map(function(v,i){return v!==null?{time:times[i],value:v}:null;}).filter(Boolean);
+    var sd=md.signal.map(function(v,i){return v!==null?{time:times[i],value:v}:null;}).filter(Boolean);
+    if(!tvMacdChart){var el=document.getElementById('macd-chart');if(!el)return;tvMacdChart=mkSubChart(el,120);tvMacdSeries.hist=tvMacdChart.addHistogramSeries({lastValueVisible:false,priceLineVisible:false});tvMacdSeries.line=tvMacdChart.addLineSeries({color:'#2196f3',lineWidth:1.5,lastValueVisible:true,priceLineVisible:false,title:'MACD'});tvMacdSeries.signal=tvMacdChart.addLineSeries({color:'#ff9800',lineWidth:1,lastValueVisible:true,priceLineVisible:false,title:'Signal'});}
+    if(hd.length)tvMacdSeries.hist.setData(hd);if(ld.length)tvMacdSeries.line.setData(ld);if(sd.length)tvMacdSeries.signal.setData(sd);
+    setupSync();
+  }
+  function destroyMacdPane(){var pane=document.getElementById('macd-pane');if(pane)pane.style.display='none';if(tvMacdChart){tvSyncHandlers=tvSyncHandlers.filter(function(h){return h.chart!==tvMacdChart;});try{tvMacdChart.remove();}catch(e){}tvMacdChart=null;tvMacdSeries={};}}
+  function updateLegend(){
+    var cont=document.getElementById('price-chart');if(!cont)return;
+    var leg=cont.querySelector('.ind-legend');if(!leg){leg=document.createElement('div');leg.className='ind-legend';cont.appendChild(leg);}
+    var cols={sma20:'#f0c040',sma50:'#40a0f0',sma200:'#e040fb',ema9:'#ff9900',ema21:'#00e5ff',vwap:'#ffffff',bb:'rgba(100,180,255,0.8)',rsi:'#e91e63',macd:'#2196f3'};
+    var lbls={sma20:'SMA20',sma50:'SMA50',sma200:'SMA200',ema9:'EMA9',ema21:'EMA21',vwap:'VWAP',bb:'BB(20,2)',rsi:'RSI14',macd:'MACD'};
+    leg.innerHTML=Object.keys(tvIndSeries).map(function(k){return '<div class="ind-item"><div class="ind-swatch" style="background:'+( cols[k]||'#888')+'"></div>'+(lbls[k]||k)+'</div>';}).join('');
+  }
+
+  // ── Drawing tools ──────────────────────────────────────────────────────────
+  function setDrawMode(mode){tvDrawMode=(tvDrawMode===mode)?null:mode;tvDrawStart=null;document.querySelectorAll('.tb-btn[data-draw]').forEach(function(b){b.classList.toggle('active',b.dataset.draw===tvDrawMode);});}
+  function doUndo(){if(!tvChart||tvDrawings.length===0)return;var last=tvDrawings.pop();tvDrawingDefs.pop();if(Array.isArray(last))last.forEach(function(s){try{tvChart.removeSeries(s);}catch(e){}});else if(last&&last._isLine){try{tvCandle.removePriceLine(last);}catch(e){};}else{try{tvChart.removeSeries(last);}catch(e){}}}
+  function doClear(){if(!tvChart)return;while(tvDrawings.length>0){var last=tvDrawings.pop();if(Array.isArray(last))last.forEach(function(s){try{tvChart.removeSeries(s);}catch(e){}});else if(last&&last._isLine){try{tvCandle.removePriceLine(last);}catch(e){};}else{try{tvChart.removeSeries(last);}catch(e){}}}tvDrawingDefs=[];}
+  function handleClick(param){
+    if(!tvDrawMode||!param||!param.point)return;
+    var price=tvCandle?tvCandle.coordinateToPrice(param.point.y):null;
+    if(price===null||price===undefined)return;
+    var LS=LightweightCharts.LineStyle;
+    if(tvDrawMode==='hline'){var l=tvCandle.createPriceLine({price:price,color:drawColor,lineWidth:1,lineStyle:LS.Solid,axisLabelVisible:true,title:''});l._isLine=true;tvDrawings.push(l);tvDrawingDefs.push({type:'hline',price:price,color:drawColor});return;}
+    var clickTime=param.time;
+    if(!clickTime&&tvLastCandles.length){try{clickTime=tvChart.timeScale().coordinateToTime(param.point.x);}catch(e){}if(!clickTime){var idx=Math.max(0,Math.min(Math.round(param.logical!=null?param.logical:tvLastCandles.length-1),tvLastCandles.length-1));clickTime=tvLastCandles[idx].time;}}
+    if(tvDrawMode==='trendline'||tvDrawMode==='rect'){if(!clickTime)return;if(!tvDrawStart){tvDrawStart={price:price,time:clickTime};}else{if(tvDrawMode==='trendline'){var t1=tvDrawStart.time,p1=tvDrawStart.price,t2=clickTime,p2=price,tMin=Math.min(t1,t2),tMax=Math.max(t1,t2),vMin=t1<=t2?p1:p2,vMax=t1<=t2?p2:p1;var s=tvChart.addLineSeries({color:drawColor,lineWidth:1,priceScaleId:'right',lastValueVisible:false,priceLineVisible:false});s.setData([{time:tMin,value:vMin},{time:tMax,value:vMax}]);tvDrawings.push(s);tvDrawingDefs.push({type:'trendline',t1:t1,p1:p1,t2:t2,p2:p2,color:drawColor});}else{var top=Math.max(tvDrawStart.price,price),bot=Math.min(tvDrawStart.price,price);var tl=tvCandle.createPriceLine({price:top,color:drawColor,lineWidth:1,lineStyle:LS.Solid,axisLabelVisible:false,title:''});var bl=tvCandle.createPriceLine({price:bot,color:drawColor,lineWidth:1,lineStyle:LS.Solid,axisLabelVisible:false,title:''});tl._isLine=true;bl._isLine=true;tvDrawings.push([tl,bl]);tvDrawingDefs.push({type:'rect',top:top,bot:bot,color:drawColor});}tvDrawStart=null;}return;}
+    if(tvDrawMode==='text'){var txt=prompt('Enter label text:');if(!txt)return;var l=tvCandle.createPriceLine({price:price,color:drawColor,lineWidth:0,lineStyle:LS.Solid,axisLabelVisible:true,title:txt});l._isLine=true;tvDrawings.push(l);tvDrawingDefs.push({type:'text',price:price,text:txt,color:drawColor});}
+  }
+
+  // ── Toolbar ────────────────────────────────────────────────────────────────
+  function buildToolbar(candles,upColor,downColor){
+    var tb=document.getElementById('toolbar');
+    // Remove everything except the title and sep (first 2 children)
+    while(tb.children.length>2)tb.removeChild(tb.lastChild);
+    function btn(text,title,onClick,extra){var b=document.createElement('button');b.className='tb-btn'+(extra?' '+extra:'');b.textContent=text;b.title=title;b.addEventListener('click',onClick);return b;}
+    function sep(){var d=document.createElement('div');d.className='tv-tb-sep';return d;}
+    // Indicator toggles
+    var inds=[{k:'sma20',l:'SMA20',t:'SMA 20'},{k:'sma50',l:'SMA50',t:'SMA 50'},{k:'sma200',l:'SMA200',t:'SMA 200'},{k:'ema9',l:'EMA9',t:'EMA 9'},{k:'ema21',l:'EMA21',t:'EMA 21'},{k:'vwap',l:'VWAP',t:'VWAP'},{k:'bb',l:'BB',t:'Bollinger Bands (20,2)'},{k:'rsi',l:'RSI',t:'RSI 14 — sub-pane'},{k:'macd',l:'MACD',t:'MACD (12,26,9) — sub-pane'}];
+    inds.forEach(function(def){var b=btn(def.l,def.t,function(){if(activeInds.has(def.k))activeInds.delete(def.k);else activeInds.add(def.k);b.classList.toggle('active',activeInds.has(def.k));applyIndicators(tvLastCandles);});if(activeInds.has(def.k))b.classList.add('active');tb.appendChild(b);});
+    tb.appendChild(sep());
+    // Drawing tools
+    var draws=[{k:'hline',l:'— H-Line',t:'Horizontal price line'},{k:'trendline',l:'↗ Trend',t:'Trend line'},{k:'rect',l:'▭ Box',t:'Rectangle'},{k:'text',l:'T Label',t:'Price label'}];
+    draws.forEach(function(def){var b=btn(def.l,def.t,function(){setDrawMode(def.k);});b.dataset.draw=def.k;if(tvDrawMode===def.k)b.classList.add('active');tb.appendChild(b);});
+    // Color picker
+    var cw=document.createElement('span');cw.style.cssText='display:flex;align-items:center;gap:3px;';
+    var cp=document.createElement('input');cp.type='color';cp.value=drawColor;cp.style.cssText='width:24px;height:22px;border:none;background:none;cursor:pointer;padding:0;';cp.title='Drawing color';cp.addEventListener('input',function(){drawColor=cp.value;});
+    cw.appendChild(cp);tb.appendChild(cw);
+    tb.appendChild(sep());
+    tb.appendChild(btn('↩ Undo','Undo last drawing',doUndo));
+    tb.appendChild(btn('✕ Clear','Clear all drawings',doClear,'danger'));
+    var spacer=document.createElement('div');spacer.style.flex='1';tb.appendChild(spacer);
+    // Auto-range
+    var arBtn=btn(tvAutoRange?'⤢ AR ON':'⤢ AR OFF','Toggle auto-range',function(){tvAutoRange=!tvAutoRange;arBtn.textContent=tvAutoRange?'⤢ AR ON':'⤢ AR OFF';arBtn.classList.toggle('active',tvAutoRange);if(tvChart)fitAll();},tvAutoRange?'active':'');
+    tb.appendChild(arBtn);
+    tb.appendChild(btn('⟳ Reset','Fit all data',fitAll));
+    if(tvChart)tvChart.subscribeClick(handleClick);
+  }
+  function tvApplyAutoscale(){if(!tvCandle)return;var lp=tvAllLevelPrices.slice();tvCandle.applyOptions({autoscaleInfoProvider:function(original){var res=original();if(!res)return res;if(lp.length===0)return res;var pad=(res.priceRange.maxValue-res.priceRange.minValue)*0.05;var minV=Math.min.apply(null,[res.priceRange.minValue].concat(lp))-pad;var maxV=Math.max.apply(null,[res.priceRange.maxValue].concat(lp))+pad;return{priceRange:{minValue:minV,maxValue:maxV},margins:res.margins};}});}
+  function fitAll(){if(!tvChart)return;setTimeout(function(){try{tvChart.timeScale().fitContent();tvChart.priceScale('right').applyOptions({autoScale:true});tvApplyAutoscale();if(tvRsiChart)tvRsiChart.priceScale('right').applyOptions({autoScale:true});if(tvMacdChart)tvMacdChart.priceScale('right').applyOptions({autoScale:true});}catch(e){}},50);}
+
+  // ── Main renderer ──────────────────────────────────────────────────────────
+  var isFirstRender=true;
+  function renderPriceChart(priceData){
+    var candles=priceData.candles||[];
+    var upColor=priceData.call_color||'#00FF00',downColor=priceData.put_color||'#FF0000';
+    lineStyleMap={dashed:LightweightCharts.LineStyle.Dashed,dotted:LightweightCharts.LineStyle.Dotted,large_dashed:LightweightCharts.LineStyle.LargeDashed};
+    if(!tvChart){
+      var el=document.getElementById('price-chart');
+      tvChart=LightweightCharts.createChart(el,{autoSize:true,layout:{background:{color:'#1E1E1E'},textColor:'#CCCCCC',fontFamily:'Arial,sans-serif'},grid:{vertLines:{color:'#2A2A2A'},horzLines:{color:'#2A2A2A'}},crosshair:{mode:LightweightCharts.CrosshairMode.Normal,vertLine:{color:'#555',labelBackgroundColor:'#2D2D2D'},horzLine:{color:'#555',labelBackgroundColor:'#2D2D2D'}},rightPriceScale:{borderColor:'#333',scaleMargins:{top:0.04,bottom:0.15}},timeScale:{borderColor:'#333',timeVisible:true,secondsVisible:false,fixLeftEdge:false,fixRightEdge:false,tickMarkFormatter:function(time){var d=new Date(time*1000);return d.toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit',hour12:false,timeZone:'America/New_York'});}},handleScale:{mouseWheel:true,pinch:true,axisPressedMouseMove:true},handleScroll:{mouseWheel:true,pressedMouseMove:true,horzTouchDrag:true,vertTouchDrag:false}});
+      tvCandle=tvChart.addCandlestickSeries({upColor:upColor,downColor:downColor,borderVisible:false,wickUpColor:upColor,wickDownColor:downColor});
+      tvVol=tvChart.addHistogramSeries({priceFormat:{type:'volume'},priceScaleId:'volume',lastValueVisible:false,priceLineVisible:false});
+      tvChart.priceScale('volume').applyOptions({scaleMargins:{top:0.88,bottom:0}});
+      document.getElementById('chart-title').textContent=priceData.use_heikin_ashi?'Price Chart (Heikin-Ashi)':'Price Chart';
+      buildToolbar(candles,upColor,downColor);
+    } else {
+      tvCandle.applyOptions({upColor:upColor,downColor:downColor,wickUpColor:upColor,wickDownColor:downColor});
+    }
+    tvCandle.setData(candles);
+    tvVol.setData(priceData.volume||[]);
+    tvLastCandles=candles;
+    // Exposure & expected-move price lines
+    tvPriceLines.forEach(function(l){try{tvCandle.removePriceLine(l);}catch(e){}});tvPriceLines=[];tvAllLevelPrices=[];
+    (priceData.exposure_levels||[]).forEach(function(lv){tvAllLevelPrices.push(lv.price);tvPriceLines.push(tvCandle.createPriceLine({price:lv.price,color:lv.color,lineWidth:lv.line_width||1,lineStyle:lineStyleMap[lv.dash_style]||LightweightCharts.LineStyle.Dashed,axisLabelVisible:true,title:lv.label}));});
+    (priceData.expected_moves||[]).forEach(function(em){tvAllLevelPrices.push(em.upper,em.lower);tvPriceLines.push(tvCandle.createPriceLine({price:em.upper,color:'#036bfc',lineWidth:2,lineStyle:LightweightCharts.LineStyle.Dashed,axisLabelVisible:true,title:'EM+'}));tvPriceLines.push(tvCandle.createPriceLine({price:em.lower,color:'#036bfc',lineWidth:2,lineStyle:LightweightCharts.LineStyle.Dashed,axisLabelVisible:true,title:'EM-'}));});
+    tvApplyAutoscale();
+    if(activeInds.size>0)applyIndicators(candles);
+    if(isFirstRender||tvAutoRange){fitAll();isFirstRender=false;}
+  }
+
+  // ── Entry point called by parent page ─────────────────────────────────────
+  window.updatePopoutChart=function(priceDataJSON){
+    try{var priceData=typeof priceDataJSON==='string'?JSON.parse(priceDataJSON):priceDataJSON;if(!priceData||priceData.error)return;renderPriceChart(priceData);}catch(e){console.error('Popout price chart error:',e);}
+  };
+  window.addEventListener('resize',function(){if(tvChart&&tvAutoRange){try{tvChart.timeScale().fitContent();}catch(e){}}});
+<\\/script></body></html>`);
+            } else {
+                popup.document.write(`<!DOCTYPE html>
 <html><head><title>${displayName} - EzOptions</title>
 <script src="https://cdn.plot.ly/plotly-latest.min.js"><\\/script>
 <style>
@@ -4840,6 +5437,7 @@ def index():
     if (el && el.querySelector('.js-plotly-plot')) { try { Plotly.Plots.resize(el); } catch(e) {} }
   });
 <\\/script></body></html>`);
+            }
             popup.document.close();
 
             popoutWindows[chartId] = popup;
@@ -4990,6 +5588,18 @@ def index():
             updateInProgress = true;
             
             const ticker = document.getElementById('ticker').value;
+
+            // Reset chart state when the ticker changes
+            if (tvLastTicker !== null && ticker.toUpperCase() !== tvLastTicker.toUpperCase()) {
+                // Clear drawings
+                tvClearDrawings();
+                tvDrawingDefs = [];
+                // Reset zoom on the next render
+                tvLastCandles = [];
+                tvForceFit = true;
+            }
+            tvLastTicker = ticker;
+
             const selectedCheckboxes = document.querySelectorAll('.expiry-option input[type="checkbox"]:checked');
             const expiry = Array.from(selectedCheckboxes).map(checkbox => checkbox.value);
             
@@ -5102,7 +5712,745 @@ def index():
                 updateInProgress = false;
             });
         }
-        
+
+        // ── TradingView Lightweight Charts price chart renderer ───────────────
+
+        // ── Indicator math helpers ────────────────────────────────────────────
+        function calcSMA(closes, period) {
+            return closes.map((_, i) => {
+                if (i < period - 1) return null;
+                const slice = closes.slice(i - period + 1, i + 1);
+                return slice.reduce((a, b) => a + b, 0) / period;
+            });
+        }
+        function calcEMA(closes, period) {
+            const k = 2 / (period + 1);
+            const result = [];
+            let ema = null;
+            for (let i = 0; i < closes.length; i++) {
+                if (i < period - 1) { result.push(null); continue; }
+                if (ema === null) { ema = closes.slice(0, period).reduce((a,b)=>a+b,0)/period; }
+                else              { ema = closes[i] * k + ema * (1 - k); }
+                result.push(ema);
+            }
+            return result;
+        }
+        function calcVWAP(candles) {
+            let cumPV = 0, cumVol = 0;
+            return candles.map(c => {
+                const typical = (c.high + c.low + c.close) / 3;
+                cumPV  += typical * c.volume;
+                cumVol += c.volume;
+                return cumVol > 0 ? cumPV / cumVol : c.close;
+            });
+        }
+        function calcBB(closes, period=20, mult=2) {
+            const sma = calcSMA(closes, period);
+            return sma.map((mid, i) => {
+                if (mid === null) return { upper: null, mid: null, lower: null };
+                const slice = closes.slice(Math.max(0, i - period + 1), i + 1);
+                const variance = slice.reduce((a, b) => a + (b - mid) ** 2, 0) / slice.length;
+                const sd = Math.sqrt(variance);
+                return { upper: mid + mult * sd, mid, lower: mid - mult * sd };
+            });
+        }
+        function calcRSI(closes, period=14) {
+            const result = [];
+            for (let i = 0; i < closes.length; i++) {
+                if (i < period) { result.push(null); continue; }
+                let gains = 0, losses = 0;
+                for (let j = i - period + 1; j <= i; j++) {
+                    const diff = closes[j] - closes[j-1];
+                    if (diff > 0) gains  += diff;
+                    else          losses -= diff;
+                }
+                const avgGain = gains  / period;
+                const avgLoss = losses / period;
+                const rs = avgLoss === 0 ? 100 : avgGain / avgLoss;
+                result.push(100 - 100 / (1 + rs));
+            }
+            return result;
+        }
+        function calcMACD(closes, fast=12, slow=26, signal=9) {
+            const emaFast   = calcEMA(closes, fast);
+            const emaSlow   = calcEMA(closes, slow);
+            const macdLine  = emaFast.map((v, i) => (v !== null && emaSlow[i] !== null) ? v - emaSlow[i] : null);
+            const validMACD = macdLine.filter(v => v !== null);
+            const sigLine   = [];
+            let emaS = null;
+            let validIdx = 0;
+            const k = 2 / (signal + 1);
+            for (let i = 0; i < macdLine.length; i++) {
+                if (macdLine[i] === null) { sigLine.push(null); continue; }
+                if (validIdx < signal - 1) { sigLine.push(null); validIdx++; continue; }
+                if (emaS === null) {
+                    const slice = macdLine.filter(v=>v!==null).slice(0, signal);
+                    emaS = slice.reduce((a,b)=>a+b,0)/signal;
+                } else {
+                    emaS = macdLine[i] * k + emaS * (1 - k);
+                }
+                sigLine.push(emaS);
+                validIdx++;
+            }
+            return { macd: macdLine, signal: sigLine,
+                     histogram: macdLine.map((v,i) => (v!==null && sigLine[i]!==null) ? v-sigLine[i] : null) };
+        }
+
+        // ── Apply/remove indicators on existing chart ─────────────────────────
+        function applyIndicators(candles, activeInds) {
+            if (!tvPriceChart || !tvCandleSeries) return;
+            const times  = candles.map(c => c.time);
+            const closes = candles.map(c => c.close);
+            const highs  = candles.map(c => c.high);
+            const lows   = candles.map(c => c.low);
+
+            // Remove deactivated indicators
+            Object.keys(tvIndicatorSeries).forEach(key => {
+                if (!activeInds.has(key)) {
+                    const series = tvIndicatorSeries[key];
+                    if (Array.isArray(series)) series.forEach(s => { try { tvPriceChart.removeSeries(s); } catch(e){} });
+                    else                       { try { tvPriceChart.removeSeries(series); } catch(e){} }
+                    delete tvIndicatorSeries[key];
+                }
+            });
+
+            // Add activated indicators
+            function mkLineSeries(color, lineWidth=1, priceScaleId='right', title='') {
+                return tvPriceChart.addLineSeries({ color, lineWidth, priceScaleId,
+                    lastValueVisible: true, priceLineVisible: false, title });
+            }
+
+            if (activeInds.has('sma20') && !tvIndicatorSeries['sma20']) {
+                const s = mkLineSeries('#f0c040', 1, 'right', 'SMA20');
+                s.setData(calcSMA(closes, 20).map((v,i) => v!==null ? {time:times[i], value:v} : null).filter(Boolean));
+                tvIndicatorSeries['sma20'] = s;
+            }
+            if (activeInds.has('sma50') && !tvIndicatorSeries['sma50']) {
+                const s = mkLineSeries('#40a0f0', 1, 'right', 'SMA50');
+                s.setData(calcSMA(closes, 50).map((v,i) => v!==null ? {time:times[i], value:v} : null).filter(Boolean));
+                tvIndicatorSeries['sma50'] = s;
+            }
+            if (activeInds.has('sma200') && !tvIndicatorSeries['sma200']) {
+                const s = mkLineSeries('#e040fb', 1, 'right', 'SMA200');
+                s.setData(calcSMA(closes, 200).map((v,i) => v!==null ? {time:times[i], value:v} : null).filter(Boolean));
+                tvIndicatorSeries['sma200'] = s;
+            }
+            if (activeInds.has('ema9') && !tvIndicatorSeries['ema9']) {
+                const s = mkLineSeries('#ff9900', 1, 'right', 'EMA9');
+                s.setData(calcEMA(closes, 9).map((v,i) => v!==null ? {time:times[i], value:v} : null).filter(Boolean));
+                tvIndicatorSeries['ema9'] = s;
+            }
+            if (activeInds.has('ema21') && !tvIndicatorSeries['ema21']) {
+                const s = mkLineSeries('#00e5ff', 1, 'right', 'EMA21');
+                s.setData(calcEMA(closes, 21).map((v,i) => v!==null ? {time:times[i], value:v} : null).filter(Boolean));
+                tvIndicatorSeries['ema21'] = s;
+            }
+            if (activeInds.has('vwap') && !tvIndicatorSeries['vwap']) {
+                const full = candles.map((c, i) => ({
+                    time: times[i],
+                    high: highs[i], low: lows[i], close: closes[i], volume: c.volume || 0
+                }));
+                const vwapVals = calcVWAP(full);
+                const s = mkLineSeries('#ffffff', 1, 'right', 'VWAP');
+                s.setData(vwapVals.map((v,i) => ({time:times[i], value:v})));
+                tvIndicatorSeries['vwap'] = s;
+            }
+            if (activeInds.has('bb') && !tvIndicatorSeries['bb']) {
+                const bb = calcBB(closes);
+                const upperS = mkLineSeries('rgba(100,180,255,0.8)', 1, 'right', 'BB Upper');
+                const midS   = mkLineSeries('rgba(100,180,255,0.5)', 1, 'right', 'BB Mid');
+                const lowerS = mkLineSeries('rgba(100,180,255,0.8)', 1, 'right', 'BB Lower');
+                upperS.setData(bb.map((v,i) => v.upper!==null ? {time:times[i],value:v.upper} : null).filter(Boolean));
+                midS.setData(  bb.map((v,i) => v.mid  !==null ? {time:times[i],value:v.mid}   : null).filter(Boolean));
+                lowerS.setData(bb.map((v,i) => v.lower!==null ? {time:times[i],value:v.lower}  : null).filter(Boolean));
+                tvIndicatorSeries['bb'] = [upperS, midS, lowerS];
+            }
+
+            // RSI and MACD go into separate synchronized sub-panes
+            if (activeInds.has('rsi')) applyRsiPane(candles);
+            else                       destroyRsiPane();
+            if (activeInds.has('macd')) applyMacdPane(candles);
+            else                        destroyMacdPane();
+
+            // Update legend overlay
+            updateIndicatorLegend();
+        }
+
+        // ── Indicator legend ─────────────────────────────────────────────────
+        function updateIndicatorLegend() {
+            const container = document.getElementById('price-chart');
+            if (!container) return;
+            let legend = container.querySelector('.tv-indicator-legend');
+            if (!legend) {
+                legend = document.createElement('div');
+                legend.className = 'tv-indicator-legend';
+                container.appendChild(legend);
+            }
+            const items = {
+                sma20:'SMA20',sma50:'SMA50',sma200:'SMA200',
+                ema9:'EMA9',ema21:'EMA21',vwap:'VWAP',bb:'BB(20,2)',rsi:'RSI14',macd:'MACD'
+            };
+            const colors = {
+                sma20:'#f0c040',sma50:'#40a0f0',sma200:'#e040fb',
+                ema9:'#ff9900',ema21:'#00e5ff',vwap:'#ffffff',bb:'rgba(100,180,255,0.8)',
+                rsi:'#e91e63',macd:'#2196f3'
+            };
+            legend.innerHTML = Object.keys(tvIndicatorSeries).map(k => `
+                <div class="tv-legend-item">
+                    <div class="tv-legend-swatch" style="background:${colors[k]||'#888'}"></div>
+                    ${items[k]||k}
+                </div>`).join('');
+        }
+
+        // ── Sub-pane chart helper functions ──────────────────────────────────
+        function createSubPaneChart(element, height) {
+            if (!element) return null;
+            return LightweightCharts.createChart(element, {
+                autoSize: true,
+                height: height,
+                layout: { background: { color: '#1E1E1E' }, textColor: '#CCCCCC', fontFamily: 'Arial, sans-serif' },
+                grid: { vertLines: { color: '#2A2A2A' }, horzLines: { color: '#2A2A2A' } },
+                crosshair: {
+                    mode: LightweightCharts.CrosshairMode.Normal,
+                    vertLine: { color: '#555555', labelBackgroundColor: '#2D2D2D' },
+                    horzLine: { color: '#555555', labelBackgroundColor: '#2D2D2D' },
+                },
+                rightPriceScale: { borderColor: '#333333', scaleMargins: { top: 0.1, bottom: 0.1 } },
+                timeScale: {
+                    borderColor: '#333333', timeVisible: false, secondsVisible: false,
+                    fixLeftEdge: true, fixRightEdge: false,
+                },
+                handleScale: { mouseWheel: true, pinch: true, axisPressedMouseMove: true },
+                handleScroll: { mouseWheel: true, pressedMouseMove: true, horzTouchDrag: true, vertTouchDrag: false },
+            });
+        }
+
+        function setupTimeScaleSync() {
+            // Remove old subscriptions first
+            tvSyncHandlers.forEach(({chart, handler}) => {
+                try { chart.timeScale().unsubscribeVisibleLogicalRangeChange(handler); } catch(e){}
+            });
+            tvSyncHandlers = [];
+            const allCharts = [tvPriceChart, tvRsiChart, tvMacdChart].filter(Boolean);
+            if (allCharts.length < 2) return;
+            allCharts.forEach(srcChart => {
+                const others = allCharts.filter(c => c !== srcChart);
+                const handler = (range) => {
+                    if (tvSyncingTimeScale || !range) return;
+                    tvSyncingTimeScale = true;
+                    others.forEach(c => { try { c.timeScale().setVisibleLogicalRange(range); } catch(e){} });
+                    tvSyncingTimeScale = false;
+                };
+                try { srcChart.timeScale().subscribeVisibleLogicalRangeChange(handler); } catch(e){}
+                tvSyncHandlers.push({ chart: srcChart, handler });
+            });
+            // Immediately match current main chart range
+            if (tvPriceChart) {
+                try {
+                    const range = tvPriceChart.timeScale().getVisibleLogicalRange();
+                    if (range) [tvRsiChart, tvMacdChart].filter(Boolean).forEach(c => {
+                        try { c.timeScale().setVisibleLogicalRange(range); } catch(e){}
+                    });
+                } catch(e){}
+            }
+        }
+
+        function applyRsiPane(candles) {
+            const pane = document.getElementById('rsi-pane');
+            if (!pane) return;
+            pane.style.display = 'block';
+            const times   = candles.map(c => c.time);
+            const rsiVals = calcRSI(candles.map(c => c.close));
+            const rsiData = rsiVals.map((v,i) => v!==null ? {time:times[i],value:v} : null).filter(Boolean);
+            if (!tvRsiChart) {
+                const chartEl = document.getElementById('rsi-chart');
+                if (!chartEl) return;
+                tvRsiChart = createSubPaneChart(chartEl, 110);
+                tvRsiSeries = tvRsiChart.addLineSeries({
+                    color: '#e91e63', lineWidth: 1.5,
+                    lastValueVisible: true, priceLineVisible: false, title: 'RSI14'
+                });
+                tvRsiSeries.createPriceLine({ price: 70, color: 'rgba(255,100,100,0.7)', lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dashed, axisLabelVisible: true, title: '70' });
+                tvRsiSeries.createPriceLine({ price: 50, color: 'rgba(150,150,150,0.4)', lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dashed, axisLabelVisible: false, title: '' });
+                tvRsiSeries.createPriceLine({ price: 30, color: 'rgba(100,200,100,0.7)', lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dashed, axisLabelVisible: true, title: '30' });
+            }
+            if (rsiData.length) tvRsiSeries.setData(rsiData);
+            setupTimeScaleSync();
+        }
+
+        function destroyRsiPane() {
+            const pane = document.getElementById('rsi-pane');
+            if (pane) pane.style.display = 'none';
+            if (tvRsiChart) {
+                tvSyncHandlers = tvSyncHandlers.filter(h => h.chart !== tvRsiChart);
+                try { tvRsiChart.remove(); } catch(e){}
+                tvRsiChart = null; tvRsiSeries = null;
+            }
+        }
+
+        function applyMacdPane(candles) {
+            const pane = document.getElementById('macd-pane');
+            if (!pane) return;
+            pane.style.display = 'block';
+            const times    = candles.map(c => c.time);
+            const macdData = calcMACD(candles.map(c => c.close));
+            const histData = macdData.histogram.map((v,i) => v!==null ? {time:times[i],value:v,color:v>=0?'rgba(76,175,80,0.8)':'rgba(244,67,54,0.8)'} : null).filter(Boolean);
+            const lineData = macdData.macd.map((v,i)    => v!==null ? {time:times[i],value:v} : null).filter(Boolean);
+            const sigData  = macdData.signal.map((v,i)  => v!==null ? {time:times[i],value:v} : null).filter(Boolean);
+            if (!tvMacdChart) {
+                const chartEl = document.getElementById('macd-chart');
+                if (!chartEl) return;
+                tvMacdChart = createSubPaneChart(chartEl, 120);
+                tvMacdSeries.hist   = tvMacdChart.addHistogramSeries({ lastValueVisible: false, priceLineVisible: false });
+                tvMacdSeries.line   = tvMacdChart.addLineSeries({ color: '#2196f3', lineWidth: 1.5, lastValueVisible: true, priceLineVisible: false, title: 'MACD' });
+                tvMacdSeries.signal = tvMacdChart.addLineSeries({ color: '#ff9800', lineWidth: 1,   lastValueVisible: true, priceLineVisible: false, title: 'Signal' });
+                tvMacdSeries.line.createPriceLine({ price: 0, color: 'rgba(150,150,150,0.4)', lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Solid, axisLabelVisible: false, title: '' });
+            }
+            if (histData.length) tvMacdSeries.hist.setData(histData);
+            if (lineData.length) tvMacdSeries.line.setData(lineData);
+            if (sigData.length)  tvMacdSeries.signal.setData(sigData);
+            setupTimeScaleSync();
+        }
+
+        function destroyMacdPane() {
+            const pane = document.getElementById('macd-pane');
+            if (pane) pane.style.display = 'none';
+            if (tvMacdChart) {
+                tvSyncHandlers = tvSyncHandlers.filter(h => h.chart !== tvMacdChart);
+                try { tvMacdChart.remove(); } catch(e){}
+                tvMacdChart = null; tvMacdSeries = {};
+            }
+        }
+
+        // ── Drawing tools ─────────────────────────────────────────────────────
+        function setDrawMode(mode) {
+            tvDrawMode = (tvDrawMode === mode) ? null : mode;  // toggle
+            tvDrawStart = null;
+            const container = document.getElementById('price-chart');
+            if (!container) return;
+            // crosshair cursor applied via CSS on canvas child
+            Array.from(container.querySelectorAll('canvas')).forEach(c => {
+                c.style.cursor = tvDrawMode ? 'crosshair' : '';
+            });
+            // Sync button states
+            document.querySelectorAll('.tv-tb-btn[data-draw]').forEach(btn => {
+                btn.classList.toggle('active', btn.dataset.draw === tvDrawMode);
+            });
+        }
+
+        function tvUndoDrawing() {
+            if (!tvPriceChart || tvDrawings.length === 0) return;
+            const last = tvDrawings.pop();
+            tvDrawingDefs.pop(); // keep defs in sync
+            if (Array.isArray(last)) last.forEach(s => {
+                if (s && s._isLine) { try { tvCandleSeries.removePriceLine(s); } catch(e){} }
+                else                { try { tvPriceChart.removeSeries(s); }      catch(e){} }
+            });
+            else if (last && last._isLine) { try { tvCandleSeries.removePriceLine(last); } catch(e){} }
+            else                           { try { tvPriceChart.removeSeries(last); }     catch(e){} }
+        }
+
+        function tvClearDrawings() {
+            if (!tvPriceChart) return;
+            // Remove all series first, then clear both arrays together
+            while (tvDrawings.length > 0) {
+                const last = tvDrawings.pop();
+                if (Array.isArray(last)) last.forEach(s => {
+                    if (s && s._isLine) { try { tvCandleSeries.removePriceLine(s); } catch(e){} }
+                    else                { try { tvPriceChart.removeSeries(s); }      catch(e){} }
+                });
+                else if (last && last._isLine) { try { tvCandleSeries.removePriceLine(last); } catch(e){} }
+                else                           { try { tvPriceChart.removeSeries(last); }     catch(e){} }
+            }
+            tvDrawingDefs = [];
+        }
+
+        function tvRestoreDrawings() {
+            if (!tvPriceChart || !tvCandleSeries) return;
+            tvDrawings = [];
+            for (const def of tvDrawingDefs) {
+                if (def.type === 'hline') {
+                    const line = tvCandleSeries.createPriceLine({
+                        price: def.price, color: def.color, lineWidth: 1,
+                        lineStyle: LightweightCharts.LineStyle.Solid,
+                        axisLabelVisible: true, title: ''
+                    });
+                    line._isLine = true;
+                    tvDrawings.push(line);
+                    tvAllLevelPrices.push(def.price);
+                } else if (def.type === 'trendline') {
+                    const tMin = Math.min(def.t1, def.t2), tMax = Math.max(def.t1, def.t2);
+                    const vAtMin = def.t1 <= def.t2 ? def.p1 : def.p2;
+                    const vAtMax = def.t1 <= def.t2 ? def.p2 : def.p1;
+                    const s = tvPriceChart.addLineSeries({
+                        color: def.color, lineWidth: 1, priceScaleId: 'right',
+                        lastValueVisible: false, priceLineVisible: false
+                    });
+                    s.setData([{ time: tMin, value: vAtMin }, { time: tMax, value: vAtMax }]);
+                    tvDrawings.push(s);
+                } else if (def.type === 'rect') {
+                    const topL = tvCandleSeries.createPriceLine({ price: def.top, color: def.color, lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Solid, axisLabelVisible: false, title: '' });
+                    const botL = tvCandleSeries.createPriceLine({ price: def.bot, color: def.color, lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Solid, axisLabelVisible: false, title: '' });
+                    topL._isLine = true; botL._isLine = true;
+                    tvDrawings.push([topL, botL]);
+                } else if (def.type === 'text') {
+                    const line = tvCandleSeries.createPriceLine({
+                        price: def.price, color: def.color, lineWidth: 0,
+                        lineStyle: LightweightCharts.LineStyle.Solid,
+                        axisLabelVisible: true, title: def.text
+                    });
+                    line._isLine = true;
+                    tvDrawings.push(line);
+                }
+            }
+        }
+
+        function tvHandleChartClick(param) {
+            if (!tvDrawMode || !param || !param.point) return;
+            const price = tvCandleSeries ? tvCandleSeries.coordinateToPrice(param.point.y) : null;
+            if (price === null || price === undefined) return;
+
+            if (tvDrawMode === 'hline') {
+                // H-Line only needs the Y coordinate — no need for param.time
+                const drawColor = document.getElementById('tv-draw-color') ? document.getElementById('tv-draw-color').value : '#FFD700';
+                const line = tvCandleSeries.createPriceLine({
+                    price, color: drawColor, lineWidth: 1,
+                    lineStyle: LightweightCharts.LineStyle.Solid,
+                    axisLabelVisible: true, title: ''
+                });
+                line._isLine = true;
+                tvDrawings.push(line);
+                tvDrawingDefs.push({ type: 'hline', price, color: drawColor });
+                // Extend autoscale range to include this drawn level
+                tvAllLevelPrices.push(price);
+                tvApplyAutoscale();
+                return;
+            }
+
+            // Resolve time — use param.time if available, otherwise snap to nearest candle
+            let clickTime = param.time;
+            if (!clickTime && tvLastCandles && tvLastCandles.length) {
+                // coordinateToTime can be null in empty areas; fall back to snapping to nearest candle
+                try { clickTime = tvPriceChart.timeScale().coordinateToTime(param.point.x); } catch(e){}
+                if (!clickTime) {
+                    // snap to closest candle time by logical index
+                    const logical = param.logical != null ? param.logical : tvLastCandles.length - 1;
+                    const idx = Math.max(0, Math.min(Math.round(logical), tvLastCandles.length - 1));
+                    clickTime = tvLastCandles[idx].time;
+                }
+            }
+
+            if (tvDrawMode === 'trendline' || tvDrawMode === 'rect') {
+                if (!clickTime) return; // still no time — bail
+                if (!tvDrawStart) {
+                    tvDrawStart = { price, time: clickTime };
+                    // Show visual hint that first point is set
+                    const container = document.getElementById('price-chart');
+                    if (container) { container.title = 'Click second point to complete drawing'; }
+                } else {
+                    const drawColor = document.getElementById('tv-draw-color') ? document.getElementById('tv-draw-color').value : '#FFD700';
+                    if (tvDrawMode === 'trendline') {
+                        const t1 = tvDrawStart.time, p1 = tvDrawStart.price;
+                        const t2 = clickTime,        p2 = price;
+                        const tMin = Math.min(t1, t2), tMax = Math.max(t1, t2);
+                        const vAtMin = t1 <= t2 ? p1 : p2;
+                        const vAtMax = t1 <= t2 ? p2 : p1;
+                        const s = tvPriceChart.addLineSeries({
+                            color: drawColor, lineWidth: 1, priceScaleId: 'right',
+                            lastValueVisible: false, priceLineVisible: false
+                        });
+                        s.setData([{ time: tMin, value: vAtMin }, { time: tMax, value: vAtMax }]);
+                        tvDrawings.push(s);
+                        tvDrawingDefs.push({ type: 'trendline', t1, p1, t2, p2, color: drawColor });
+                    } else if (tvDrawMode === 'rect') {
+                        const top = Math.max(tvDrawStart.price, price);
+                        const bot = Math.min(tvDrawStart.price, price);
+                        const topL = tvCandleSeries.createPriceLine({ price: top, color: drawColor, lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Solid, axisLabelVisible: false, title: '' });
+                        const botL = tvCandleSeries.createPriceLine({ price: bot, color: drawColor, lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Solid, axisLabelVisible: false, title: '' });
+                        topL._isLine = true; botL._isLine = true;
+                        tvDrawings.push([topL, botL]);
+                        tvDrawingDefs.push({ type: 'rect', top, bot, color: drawColor });
+                    }
+                    tvDrawStart = null;
+                    const container = document.getElementById('price-chart');
+                    if (container) container.title = '';
+                }
+                return;
+            }
+
+            if (tvDrawMode === 'text') {
+                const userText = prompt('Enter label text:');
+                if (!userText) return;
+                const drawColor = document.getElementById('tv-draw-color') ? document.getElementById('tv-draw-color').value : '#FFD700';
+                const line = tvCandleSeries.createPriceLine({
+                    price, color: drawColor, lineWidth: 0,
+                    lineStyle: LightweightCharts.LineStyle.Solid,
+                    axisLabelVisible: true, title: userText
+                });
+                line._isLine = true;
+                tvDrawings.push(line);
+                tvDrawingDefs.push({ type: 'text', price, text: userText, color: drawColor });
+            }
+        }
+
+        // ── Build the chart toolbar ──────────────────────────────────────────
+        function buildTVToolbar(container, candles, upColor, downColor) {
+            // toolbar lives in tv-toolbar-container, NOT inside the chart canvas
+            const toolbarContainer = document.getElementById('tv-toolbar-container');
+            if (!toolbarContainer) return;
+            toolbarContainer.innerHTML = '';
+            const toolbar = toolbarContainer;
+            toolbar.className = 'tv-toolbar-container';
+
+            // Use the persistent global set so state survives data refreshes
+            // (tvActiveInds is declared at page level)
+
+            function btn(text, title, onClick, extraClass='') {
+                const b = document.createElement('button');
+                b.className = 'tv-tb-btn' + (extraClass ? ' ' + extraClass : '');
+                b.textContent = text;
+                b.title = title;
+                b.addEventListener('click', onClick);
+                return b;
+            }
+
+            // Indicator toggles
+            const indicatorDefs = [
+                { key:'sma20',  label:'SMA20',  title:'Simple Moving Average (20)' },
+                { key:'sma50',  label:'SMA50',  title:'Simple Moving Average (50)' },
+                { key:'sma200', label:'SMA200', title:'Simple Moving Average (200)' },
+                { key:'ema9',   label:'EMA9',   title:'Exponential Moving Average (9)' },
+                { key:'ema21',  label:'EMA21',  title:'Exponential Moving Average (21)' },
+                { key:'vwap',   label:'VWAP',   title:'Volume Weighted Average Price' },
+                { key:'bb',     label:'BB',     title:'Bollinger Bands (20, 2)' },
+                { key:'rsi',    label:'RSI',    title:'Relative Strength Index (14) — sub-pane' },
+                { key:'macd',   label:'MACD',   title:'MACD (12, 26, 9) — sub-pane' },
+            ];
+            indicatorDefs.forEach(def => {
+                const b = btn(def.label, def.title, () => {
+                    if (tvActiveInds.has(def.key)) tvActiveInds.delete(def.key);
+                    else                           tvActiveInds.add(def.key);
+                    b.classList.toggle('active', tvActiveInds.has(def.key));
+                    applyIndicators(candles, tvActiveInds);
+                });
+                if (tvActiveInds.has(def.key)) b.classList.add('active');
+                toolbar.appendChild(b);
+            });
+
+            // --- Separator ---
+            const sep2 = document.createElement('div'); sep2.className = 'tv-toolbar-sep'; toolbar.appendChild(sep2);
+
+            // Drawing tools
+            const drawDefs = [
+                { key:'hline',     label:'— H-Line', title:'Draw horizontal price line (single click)' },
+                { key:'trendline', label:'↗ Trend',  title:'Draw trend line (click start, click end)' },
+                { key:'rect',      label:'▭ Box',    title:'Draw rectangle between two prices (click two points)' },
+                { key:'text',      label:'T Label',  title:'Add price label (click to place)' },
+            ];
+            drawDefs.forEach(def => {
+                const b = btn(def.label, def.title, () => setDrawMode(def.key));
+                b.dataset.draw = def.key;
+                if (tvDrawMode === def.key) b.classList.add('active');
+                toolbar.appendChild(b);
+            });
+
+            // Draw color picker
+            const colorWrap = document.createElement('span');
+            colorWrap.style.cssText = 'display:flex;align-items:center;gap:3px;';
+            const colorLabel = document.createElement('span');
+            colorLabel.style.cssText = 'font-size:10px;color:#aaa;';
+            colorLabel.textContent = '🎨';
+            const colorPicker = document.createElement('input');
+            colorPicker.type = 'color';
+            colorPicker.id = 'tv-draw-color';
+            colorPicker.value = '#FFD700';
+            colorPicker.style.cssText = 'width:24px;height:22px;border:none;background:none;cursor:pointer;padding:0;';
+            colorPicker.title = 'Drawing color';
+            colorWrap.appendChild(colorLabel);
+            colorWrap.appendChild(colorPicker);
+            toolbar.appendChild(colorWrap);
+
+            // --- Separator ---
+            const sep3 = document.createElement('div'); sep3.className = 'tv-toolbar-sep'; toolbar.appendChild(sep3);
+
+            // Undo / Clear
+            toolbar.appendChild(btn('↩ Undo', 'Undo last drawing', tvUndoDrawing));
+            toolbar.appendChild(btn('✕ Clear', 'Clear all drawings', tvClearDrawings, 'danger'));
+
+            // Push Fit / Auto-Range to far right
+            const spacer = document.createElement('div');
+            spacer.style.cssText = 'flex:1';
+            toolbar.appendChild(spacer);
+
+            // Auto-Range toggle
+            const arBtn = document.createElement('button');
+            arBtn.className = 'tv-tb-btn' + (tvAutoRange ? ' active' : '');
+            arBtn.title = 'Auto-Range: when ON, the chart fits all candles on every data update. When OFF, your zoom & pan are preserved.';
+            arBtn.textContent = tvAutoRange ? '⤢ Auto-Range ON' : '⤢ Auto-Range OFF';
+            arBtn.addEventListener('click', () => {
+                tvAutoRange = !tvAutoRange;
+                arBtn.textContent = tvAutoRange ? '⤢ Auto-Range ON' : '⤢ Auto-Range OFF';
+                arBtn.classList.toggle('active', tvAutoRange);
+                if (tvPriceChart) tvFitAll();  // always fit immediately when toggling, ON or OFF
+            });
+            toolbar.appendChild(arBtn);
+
+            toolbar.appendChild(btn('⟳ Reset', 'Reset zoom and pan to fit all data', () => tvFitAll()));
+
+            // Wire up click handler for drawing
+            if (tvPriceChart) {
+                tvPriceChart.subscribeClick(tvHandleChartClick);
+            }
+        }
+
+        function renderTVPriceChart(priceData) {
+            const container = document.getElementById('price-chart');
+            if (!container) return;
+
+            tvLastPriceData = priceData;
+            const upColor   = priceData.call_color || '#00FF00';
+            const downColor = priceData.put_color  || '#FF0000';
+            const candles   = priceData.candles || [];
+
+            const lineStyleMap = {
+                dashed:       LightweightCharts.LineStyle.Dashed,
+                dotted:       LightweightCharts.LineStyle.Dotted,
+                large_dashed: LightweightCharts.LineStyle.LargeDashed,
+            };
+
+            // ── First render: create the chart and all series once ────────────
+            if (!tvPriceChart) {
+                // Remove any leftover overlays
+                container.querySelectorAll('.tv-chart-title, .tv-indicator-legend').forEach(el => el.remove());
+                const _tc = document.getElementById('tv-toolbar-container');
+                if (_tc) _tc.innerHTML = '';
+
+                tvPriceChart = LightweightCharts.createChart(container, {
+                    autoSize: true,
+                    layout: {
+                        background: { color: '#1E1E1E' },
+                        textColor:   '#CCCCCC',
+                        fontFamily:  'Arial, sans-serif',
+                    },
+                    grid: {
+                        vertLines: { color: '#2A2A2A' },
+                        horzLines: { color: '#2A2A2A' },
+                    },
+                    crosshair: {
+                        mode: LightweightCharts.CrosshairMode.Normal,
+                        vertLine: { color: '#555555', labelBackgroundColor: '#2D2D2D' },
+                        horzLine: { color: '#555555', labelBackgroundColor: '#2D2D2D' },
+                    },
+                    rightPriceScale: {
+                        borderColor:  '#333333',
+                        scaleMargins: { top: 0.04, bottom: 0.15 },
+                    },
+                    timeScale: {
+                        borderColor:      '#333333',
+                        timeVisible:      true,
+                        secondsVisible:   false,
+                        fixLeftEdge:      false,
+                        fixRightEdge:     false,
+                        tickMarkFormatter: (time) => {
+                            const d = new Date(time * 1000);
+                            return d.toLocaleTimeString('en-US', {
+                                hour: '2-digit', minute: '2-digit',
+                                hour12: false, timeZone: 'America/New_York'
+                            });
+                        }
+                    },
+                    handleScale:  { mouseWheel: true, pinch: true, axisPressedMouseMove: true },
+                    handleScroll: { mouseWheel: true, pressedMouseMove: true, horzTouchDrag: true, vertTouchDrag: false },
+                });
+
+                tvCandleSeries = tvPriceChart.addCandlestickSeries({
+                    upColor, downColor,
+                    borderVisible: false,
+                    wickUpColor:   upColor,
+                    wickDownColor: downColor,
+                });
+
+                tvVolumeSeries = tvPriceChart.addHistogramSeries({
+                    priceFormat:  { type: 'volume' },
+                    priceScaleId: 'volume',
+                    lastValueVisible: false,
+                    priceLineVisible: false,
+                });
+                tvPriceChart.priceScale('volume').applyOptions({
+                    scaleMargins: { top: 0.88, bottom: 0 },
+                });
+
+                // Toolbar + title (only built once)
+                buildTVToolbar(container, candles, upColor, downColor);
+                const _tc2 = document.getElementById('tv-toolbar-container');
+                if (_tc2) {
+                    const titleEl = document.createElement('div');
+                    titleEl.className = 'tv-chart-title';
+                    titleEl.textContent = priceData.use_heikin_ashi ? 'Price Chart (Heikin-Ashi)' : 'Price Chart';
+                    _tc2.insertBefore(titleEl, _tc2.firstChild);
+                }
+            }
+
+            // ── Every render: update data and overlays in place ───────────────
+
+            // Update candle colors in case they changed
+            tvCandleSeries.applyOptions({
+                upColor, downColor,
+                wickUpColor: upColor, wickDownColor: downColor,
+            });
+
+            const isFirstRender = !tvLastCandles.length;
+
+            tvCandleSeries.setData(candles);
+            tvLastCandles = candles;
+            tvVolumeSeries.setData(priceData.volume || []);
+
+            // Remove old dynamic price lines and re-add fresh ones
+            tvExposurePriceLines.forEach(l => { try { tvCandleSeries.removePriceLine(l); } catch(e){} });
+            tvExposurePriceLines = [];
+            tvExpectedMovePriceLines.forEach(l => { try { tvCandleSeries.removePriceLine(l); } catch(e){} });
+            tvExpectedMovePriceLines = [];
+
+            tvAllLevelPrices = [];
+            for (const level of (priceData.exposure_levels || [])) {
+                tvAllLevelPrices.push(level.price);
+                tvExposurePriceLines.push(tvCandleSeries.createPriceLine({
+                    price:            level.price,
+                    color:            level.color,
+                    lineWidth:        level.line_width || 1,
+                    lineStyle:        lineStyleMap[level.dash_style] || LightweightCharts.LineStyle.Dashed,
+                    axisLabelVisible: true,
+                    title:            level.label,
+                }));
+            }
+            for (const em of (priceData.expected_moves || [])) {
+                tvAllLevelPrices.push(em.upper, em.lower);
+                tvExpectedMovePriceLines.push(
+                    tvCandleSeries.createPriceLine({ price: em.upper, color: '#036bfc', lineWidth: 2, lineStyle: LightweightCharts.LineStyle.Dashed, axisLabelVisible: true, title: 'EM+' }),
+                    tvCandleSeries.createPriceLine({ price: em.lower, color: '#036bfc', lineWidth: 2, lineStyle: LightweightCharts.LineStyle.Dashed, axisLabelVisible: true, title: 'EM-' })
+                );
+            }
+
+            tvApplyAutoscale();
+            if (tvActiveInds.size > 0) applyIndicators(candles, tvActiveInds);
+
+            // fitContent on first render, when auto-range is ON, or when explicitly forced (ticker change)
+            if (tvAutoRange || isFirstRender || tvForceFit) {
+                const _chart = tvPriceChart;
+                setTimeout(() => {
+                    try {
+                        _chart.timeScale().fitContent();
+                        _chart.priceScale('right').applyOptions({ autoScale: true });
+                        tvApplyAutoscale();
+                        if (tvRsiChart)  tvRsiChart.priceScale('right').applyOptions({ autoScale: true });
+                        if (tvMacdChart) tvMacdChart.priceScale('right').applyOptions({ autoScale: true });
+                    } catch(e) {}
+                }, 50);
+                tvForceFit = false;
+            }
+        }
+        // ─────────────────────────────────────────────────────────────────────
+
         function updateCharts(data) {
             // Save scroll position before any DOM changes
             savedScrollPosition = window.scrollY || window.pageYOffset;
@@ -5128,67 +6476,56 @@ def index():
                 centroid: document.getElementById('centroid').checked
             };
             
-            // Handle price chart separately
+            // Handle price chart separately (TradingView Lightweight Charts)
             if (selectedCharts.price && data.price) {
                 let priceContainer = document.querySelector('.price-chart-container');
                 if (!priceContainer) {
                     priceContainer = document.createElement('div');
                     priceContainer.className = 'price-chart-container';
+                    const toolbarContainer = document.createElement('div');
+                    toolbarContainer.className = 'tv-toolbar-container';
+                    toolbarContainer.id = 'tv-toolbar-container';
                     const chartDiv = document.createElement('div');
                     chartDiv.className = 'chart-container';
                     chartDiv.id = 'price-chart';
+                    // RSI sub-pane
+                    const rsiPane = document.createElement('div');
+                    rsiPane.className = 'tv-sub-pane'; rsiPane.id = 'rsi-pane'; rsiPane.style.display = 'none';
+                    rsiPane.innerHTML = '<div class="tv-sub-pane-header">RSI 14</div><div id="rsi-chart" style="height:110px"></div>';
+                    // MACD sub-pane
+                    const macdPane = document.createElement('div');
+                    macdPane.className = 'tv-sub-pane'; macdPane.id = 'macd-pane'; macdPane.style.display = 'none';
+                    macdPane.innerHTML = '<div class="tv-sub-pane-header">MACD (12,26,9)</div><div id="macd-chart" style="height:120px"></div>';
+                    priceContainer.appendChild(toolbarContainer);
                     priceContainer.appendChild(chartDiv);
+                    priceContainer.appendChild(rsiPane);
+                    priceContainer.appendChild(macdPane);
                     document.getElementById('chart-grid').insertBefore(priceContainer, document.getElementById('chart-grid').firstChild);
                 }
                 priceContainer.style.display = 'block';
-                
-                const chartData = JSON.parse(data.price);
-                
-                // Configure chart sizing to fill container
-                chartData.layout.autosize = true;
-                chartData.layout.width = null;
-                chartData.layout.height = null;
-                chartData.layout.margin = getChartMargins('price-chart', {l: 50, r: 120, t: 30, b: 20});
-                
-                // Ensure axes auto-scale with new data
-                if (chartData.layout.xaxis) {
-                    chartData.layout.xaxis.autorange = true;
-                }
-                if (chartData.layout.yaxis) {
-                    chartData.layout.yaxis.autorange = true;
-                }
-                if (chartData.layout.yaxis2) {
-                    chartData.layout.yaxis2.autorange = true;
-                }
-                
-                // Update chart colors
-                if (chartData.data[0].type === 'candlestick') {
-                    chartData.data[0].increasing.line.color = callColor;
-                    chartData.data[0].increasing.fillcolor = callColor;
-                    chartData.data[0].decreasing.line.color = putColor;
-                    chartData.data[0].decreasing.fillcolor = putColor;
-                }
-                
-                const config = {
-                    responsive: true,
-                    displayModeBar: true,
-                    modeBarButtonsToRemove: ['lasso2d', 'select2d'],
-                    displaylogo: false,
-                    scrollZoom: true,
-                    useResizeHandler: true,
-                    style: {width: "100%", height: "100%"}
-                };
-                
-                if (charts.price) {
-                    Plotly.react('price-chart', chartData.data, chartData.layout, config);
-                } else {
-                    charts.price = Plotly.newPlot('price-chart', chartData.data, chartData.layout, config);
+
+                const priceData = typeof data.price === 'string' ? JSON.parse(data.price) : data.price;
+                if (!priceData.error) {
+                    renderTVPriceChart(priceData);
                 }
             } else if (!selectedCharts.price) {
                 const priceContainer = document.querySelector('.price-chart-container');
                 if (priceContainer) {
                     priceContainer.style.display = 'none';
-                    delete charts.price;
+                }
+                destroyRsiPane();
+                destroyMacdPane();
+                if (tvPriceChart) {
+                    try { tvPriceChart.unsubscribeClick(tvHandleChartClick); } catch(e){}
+                    tvPriceChart.remove();
+                    tvPriceChart = null;
+                    tvCandleSeries = null;
+                    tvVolumeSeries = null;
+                    tvIndicatorSeries = {};
+                }
+                if (tvResizeObserver) {
+                    tvResizeObserver.disconnect();
+                    tvResizeObserver = null;
                 }
             }
             
@@ -6015,7 +7352,7 @@ def update():
         
         # Create charts based on visibility settings
         if data.get('show_price', True):
-            response['price'] = create_price_chart(
+            response['price'] = prepare_price_chart_data(
                 price_data=price_data,
                 calls=calls,
                 puts=puts,
@@ -6026,7 +7363,8 @@ def update():
                 strike_range=strike_range,
                 use_heikin_ashi=use_heikin_ashi,
                 highlight_max_level=highlight_max_level,
-                max_level_color=max_level_color
+                max_level_color=max_level_color,
+                coloring_mode=coloring_mode
             )
         
         if data.get('show_gex_historical_bubble', True):
