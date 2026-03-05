@@ -5363,7 +5363,7 @@ def index():
     lineStyleMap={dashed:LightweightCharts.LineStyle.Dashed,dotted:LightweightCharts.LineStyle.Dotted,large_dashed:LightweightCharts.LineStyle.LargeDashed};
     if(!tvChart){
       var el=document.getElementById('price-chart');
-      tvChart=LightweightCharts.createChart(el,{autoSize:true,layout:{background:{color:'#1E1E1E'},textColor:'#CCCCCC',fontFamily:'Arial,sans-serif'},grid:{vertLines:{color:'#2A2A2A'},horzLines:{color:'#2A2A2A'}},crosshair:{mode:LightweightCharts.CrosshairMode.Normal,vertLine:{color:'#555',labelBackgroundColor:'#2D2D2D'},horzLine:{color:'#555',labelBackgroundColor:'#2D2D2D'}},rightPriceScale:{borderColor:'#333',scaleMargins:{top:0.04,bottom:0.15}},timeScale:{borderColor:'#333',timeVisible:true,secondsVisible:false,fixLeftEdge:false,fixRightEdge:false,tickMarkFormatter:function(time){var d=new Date(time*1000);return d.toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit',hour12:false,timeZone:'America/New_York'});}},handleScale:{mouseWheel:true,pinch:true,axisPressedMouseMove:true},handleScroll:{mouseWheel:true,pressedMouseMove:true,horzTouchDrag:true,vertTouchDrag:false}});
+      tvChart=LightweightCharts.createChart(el,{autoSize:true,layout:{background:{color:'#1E1E1E'},textColor:'#CCCCCC',fontFamily:'Arial,sans-serif'},grid:{vertLines:{color:'#2A2A2A'},horzLines:{color:'#2A2A2A'}},crosshair:{mode:LightweightCharts.CrosshairMode.Normal,vertLine:{color:'#555',labelBackgroundColor:'#2D2D2D'},horzLine:{color:'#555',labelBackgroundColor:'#2D2D2D'}},rightPriceScale:{borderColor:'#333',scaleMargins:{top:0.04,bottom:0.15}},localization:{timeFormatter:function(time){var d=new Date(time*1000);return d.toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit',hour12:false,timeZone:'America/New_York'});}},timeScale:{borderColor:'#333',timeVisible:true,secondsVisible:false,fixLeftEdge:false,fixRightEdge:false,tickMarkFormatter:function(time){var d=new Date(time*1000);return d.toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit',hour12:false,timeZone:'America/New_York'});}},handleScale:{mouseWheel:true,pinch:true,axisPressedMouseMove:true},handleScroll:{mouseWheel:true,pressedMouseMove:true,horzTouchDrag:true,vertTouchDrag:false}});
       tvCandle=tvChart.addCandlestickSeries({upColor:upColor,downColor:downColor,borderVisible:false,wickUpColor:upColor,wickDownColor:downColor});
       tvVol=tvChart.addHistogramSeries({priceFormat:{type:'volume'},priceScaleId:'volume',lastValueVisible:false,priceLineVisible:false});
       tvChart.priceScale('volume').applyOptions({scaleMargins:{top:0.88,bottom:0}});
@@ -6344,6 +6344,15 @@ def index():
                     rightPriceScale: {
                         borderColor:  '#333333',
                         scaleMargins: { top: 0.04, bottom: 0.15 },
+                    },
+                    localization: {
+                        timeFormatter: (time) => {
+                            const d = new Date(time * 1000);
+                            return d.toLocaleTimeString('en-US', {
+                                hour: '2-digit', minute: '2-digit',
+                                hour12: false, timeZone: 'America/New_York'
+                            });
+                        }
                     },
                     timeScale: {
                         borderColor:      '#333333',
