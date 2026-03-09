@@ -1,4 +1,4 @@
-﻿from flask import Flask, render_template_string, jsonify, request
+﻿from flask import Flask, render_template_string, jsonify, request, Response, stream_with_context
 import pandas as pd
 import plotly.graph_objects as go
 import numpy as np
@@ -14,6 +14,8 @@ from contextlib import closing
 from scipy.stats import norm
 import warnings
 import json
+import threading
+import queue
 
 
 # Load environment variables
@@ -364,6 +366,144 @@ try:
 except Exception as e:
     print(f"Error initializing Schwab client: {e}")
     client = None
+
+# ── Real-time Price Streamer ─────────────────────────────────────────────────
+class PriceStreamer:
+    """Manages a single schwabdev streaming websocket for real-time price data.
+    Feeds per-ticker queues that are consumed by the /price_stream SSE endpoint.
+    """
+    def __init__(self):
+        self._stream = None
+        self._lock = threading.Lock()
+        self._queues = {}       # ticker (upper) -> list[queue.Queue]
+        self._subscribed = set()  # tickers with active stream subscriptions
+        self._started = False
+
+    def _handler(self, message):
+        """Parse raw schwabdev stream message and push candle/quote data to queues."""
+        try:
+            data = json.loads(message) if isinstance(message, str) else message
+            if not isinstance(data, list):
+                data = [data]
+            for msg in data:
+                service = msg.get('service', '')
+                if service == 'CHART_EQUITY':
+                    for item in msg.get('content', []):
+                        ticker = item.get('key', '').upper()
+                        chart_time_ms = item.get('7')
+                        if not ticker or chart_time_ms is None:
+                            continue
+                        payload = json.dumps({
+                            'type': 'candle',
+                            'time': int(chart_time_ms) // 1000,
+                            'open':   item.get('1'),
+                            'high':   item.get('2'),
+                            'low':    item.get('3'),
+                            'close':  item.get('4'),
+                            'volume': item.get('5'),
+                        })
+                        self._push(ticker, payload)
+                elif service == 'CHART_FUTURES':
+                    for item in msg.get('content', []):
+                        ticker = item.get('key', '').upper()
+                        chart_time_ms = item.get('3')
+                        if not ticker or chart_time_ms is None:
+                            continue
+                        payload = json.dumps({
+                            'type': 'candle',
+                            'time': int(chart_time_ms) // 1000,
+                            'open':   item.get('4'),
+                            'high':   item.get('5'),
+                            'low':    item.get('6'),
+                            'close':  item.get('7'),
+                            'volume': item.get('8'),
+                        })
+                        self._push(ticker, payload)
+                elif service == 'LEVELONE_EQUITIES':
+                    for item in msg.get('content', []):
+                        ticker = item.get('key', '').upper()
+                        last = item.get('3')  # field 3 = last price
+                        if not ticker or last is None:
+                            continue
+                        payload = json.dumps({'type': 'quote', 'last': float(last)})
+                        self._push(ticker, payload)
+                elif service == 'LEVELONE_FUTURES':
+                    for item in msg.get('content', []):
+                        ticker = item.get('key', '').upper()
+                        last = item.get('3')  # field 3 = last price
+                        if not ticker or last is None:
+                            continue
+                        payload = json.dumps({'type': 'quote', 'last': float(last)})
+                        self._push(ticker, payload)
+        except Exception as e:
+            print(f"[PriceStreamer] handler error: {e}")
+
+    def _push(self, ticker, payload):
+        with self._lock:
+            qs = list(self._queues.get(ticker, []))
+        for q in qs:
+            try:
+                q.put_nowait(payload)
+            except queue.Full:
+                pass  # drop stale data rather than block
+
+    def _ensure_started(self):
+        with self._lock:
+            if self._started or client is None:
+                return
+            try:
+                self._stream = schwabdev.Stream(client)
+                self._stream.start(self._handler)
+                self._started = True
+                print("[PriceStreamer] Stream started.")
+            except Exception as e:
+                print(f"[PriceStreamer] Failed to start stream: {e}")
+
+    def subscribe(self, ticker, q):
+        """Register a client SSE queue and ensure ticker is subscribed on the stream."""
+        self._ensure_started()
+        needs_sub = False
+        with self._lock:
+            if ticker not in self._queues:
+                self._queues[ticker] = []
+            self._queues[ticker].append(q)
+            if ticker not in self._subscribed:
+                self._subscribed.add(ticker)
+                needs_sub = True
+        if needs_sub and self._started and self._stream:
+            try:
+                is_future = ticker.startswith('/')
+                if is_future:
+                    self._stream.send(self._stream.chart_futures(ticker, "0,1,2,3,4,5,6,7,8"))
+                    self._stream.send(self._stream.level_one_futures(ticker, "0,1,2,3"))
+                else:
+                    self._stream.send(self._stream.chart_equity(ticker, "0,1,2,3,4,5,6,7,8"))
+                    self._stream.send(self._stream.level_one_equities(ticker, "0,1,2,3"))
+                print(f"[PriceStreamer] Subscribed to {ticker}")
+            except Exception as e:
+                print(f"[PriceStreamer] Subscribe error for {ticker}: {e}")
+
+    def unsubscribe_queue(self, ticker, q):
+        """Remove a specific client queue (called on SSE disconnect)."""
+        with self._lock:
+            if ticker in self._queues:
+                try:
+                    self._queues[ticker].remove(q)
+                except ValueError:
+                    pass
+
+    def stop(self):
+        with self._lock:
+            if self._stream and self._started:
+                try:
+                    self._stream.stop()
+                except Exception:
+                    pass
+                self._stream = None
+                self._started = False
+
+
+price_streamer = PriceStreamer()
 
 # Helper Functions
 def format_ticker(ticker):
@@ -811,6 +951,9 @@ def fetch_options_for_date(ticker, date, exposure_metric="Open Interest", delta_
                 oi = option_data['openInterest']
                 vol = option_data['volume']
                 weight = max(oi, vol)
+            elif exposure_metric == 'OI + Volume':
+                # Use the sum of OI and volume as the weight
+                weight = option_data['openInterest'] + option_data['volume']
             else: # Open Interest
                 weight = option_data['openInterest']
                 
@@ -826,6 +969,9 @@ def fetch_options_for_date(ticker, date, exposure_metric="Open Interest", delta_
                 oi = option_data['openInterest']
                 vol = option_data['volume']
                 weight = max(oi, vol)
+            elif exposure_metric == 'OI + Volume':
+                # Use the sum of OI and volume as the weight
+                weight = option_data['openInterest'] + option_data['volume']
             else: # Open Interest
                 weight = option_data['openInterest']
                 
@@ -2554,6 +2700,14 @@ def prepare_price_chart_data(price_data, calls=None, puts=None, exposure_levels_
         lc_volume.append({'time': ts, 'value': c['volume'],
                           'color': call_color if is_up else put_color})
 
+    # Multi-day raw candles for indicator warmup (SMA200, EMA, etc. need prior-day history)
+    lc_indicator_candles = [
+        {'time': int(c['datetime'] / 1000), 'open': c['open'], 'high': c['high'],
+         'low': c['low'], 'close': c['close'], 'volume': c.get('volume', 0)}
+        for c in sorted_candles
+    ]
+    current_day_start_time = int(current_day_candles[0]['datetime'] / 1000) if current_day_candles else 0
+
     current_price = display_candles[-1]['close'] if display_candles else 0
     last_candle = display_candles[-1] if display_candles else None
     last_candle_up = (last_candle['close'] >= last_candle['open']) if last_candle else True
@@ -2690,6 +2844,8 @@ def prepare_price_chart_data(price_data, calls=None, puts=None, exposure_levels_
         'last_candle_up': last_candle_up,
         'exposure_levels': exposure_levels,
         'expected_moves': expected_moves,
+        'indicator_candles': lc_indicator_candles,
+        'current_day_start_time': current_day_start_time,
     })
 
 
@@ -4805,6 +4961,7 @@ def index():
                             <option value="Open Interest" selected>Open Interest</option>
                             <option value="Volume">Volume</option>
                             <option value="Max OI vs Volume">Max OI vs Volume</option>
+                            <option value="OI + Volume">OI + Volume</option>
                         </select>
                     </div>
                     <div class="control-group" title="When enabled, exposure formulas are adjusted by delta.">
@@ -5041,7 +5198,9 @@ def index():
         let tvDrawStart = null;         // {price, time, x, y} of first click
         let tvDrawings = [];            // list of drawn series/line objects for undo/clear
         let tvDrawingDefs = [];         // serializable drawing definitions — survive full re-renders
-        let tvLastCandles = [];         // cache of candle data for indicator calcs
+        let tvLastCandles = [];         // current-day display candles (for streaming OHLCV updates)
+        let tvIndicatorCandles = [];    // multi-day candles for indicator warmup (SMA200, EMA, etc.)
+        let tvCurrentDayStartTime = 0;  // unix seconds of current day's first candle (for daily VWAP)
         let tvLastPriceData = null;     // cache of full priceData for redraw
         // All overlay level prices (exposure, EM, drawn H-lines) — used by autoscaleInfoProvider
         let tvAllLevelPrices = [];
@@ -5053,6 +5212,84 @@ def index():
         let tvLastTicker = null;
         // When true, the next render will call fitContent() regardless of tvAutoRange
         let tvForceFit = false;
+        // EventSource for real-time price streaming from /price_stream/<ticker>
+        let priceEventSource = null;
+        let priceStreamTicker = null;
+        // Debounce timer for indicator refresh on intra-minute quote ticks
+        let tvIndicatorRefreshTimer = null;
+        // Live price from the streamer (null until first quote arrives)
+        let livePrice = null;
+        // Debounce timer for Plotly price-line updates (avoid flooding relayout calls)
+        let plotlyPriceUpdateTimer = null;
+
+        // List of Plotly chart div IDs that carry a current-price line shape
+        const PLOTLY_PRICE_LINE_CHARTS = [
+            'gamma-chart', 'delta-chart', 'vanna-chart', 'charm-chart',
+            'speed-chart', 'vomma-chart', 'color-chart',
+            'options_volume-chart', 'open_interest-chart', 'premium-chart'
+        ];
+
+        /**
+         * Update the current-price line (shape + annotation) on all visible Plotly charts
+         * and refresh the "Current Price" text in the price-info panel.
+         */
+        function updateAllPlotlyPriceLines(price) {
+            const priceStr = price.toFixed(2);
+
+            PLOTLY_PRICE_LINE_CHARTS.forEach(function(id) {
+                const div = document.getElementById(id);
+                if (!div || !div._fullLayout) return;
+
+                const shapes = div._fullLayout.shapes || [];
+                const annotations = div._fullLayout.annotations || [];
+                const update = {};
+
+                // Identify and update the price line shape.
+                // add_vline produces: xref='x', yref='paper', x0===x1
+                // add_hline produces: xref='paper', yref='y', y0===y1
+                for (let i = 0; i < shapes.length; i++) {
+                    const sh = shapes[i];
+                    if (sh.xref === 'x' && sh.yref === 'paper' && sh.x0 === sh.x1) {
+                        update['shapes[' + i + '].x0'] = price;
+                        update['shapes[' + i + '].x1'] = price;
+                        break;
+                    } else if (sh.xref === 'paper' && sh.yref === 'y' && sh.y0 === sh.y1) {
+                        update['shapes[' + i + '].y0'] = price;
+                        update['shapes[' + i + '].y1'] = price;
+                        break;
+                    }
+                }
+
+                // Identify and update the price line annotation.
+                // add_vline annotation: xref='x', yref='paper'
+                // add_hline annotation: xref='paper', yref='y'
+                for (let i = 0; i < annotations.length; i++) {
+                    const ann = annotations[i];
+                    if (ann.xref === 'x' && ann.yref === 'paper') {
+                        update['annotations[' + i + '].x'] = price;
+                        update['annotations[' + i + '].text'] = priceStr;
+                        break;
+                    } else if (ann.xref === 'paper' && ann.yref === 'y') {
+                        update['annotations[' + i + '].y'] = price;
+                        update['annotations[' + i + '].text'] = priceStr;
+                        break;
+                    }
+                }
+
+                if (Object.keys(update).length > 0) {
+                    try { Plotly.relayout(div, update); } catch(e) {}
+                }
+            });
+
+            // Live-update the "Current Price" line in the price-info panel
+            const priceInfo = document.getElementById('price-info');
+            if (priceInfo) {
+                const cpLine = priceInfo.querySelector('[data-live-price]');
+                if (cpLine) {
+                    cpLine.textContent = 'Current Price: $' + priceStr;
+                }
+            }
+        }
 
         // Apply (or re-apply) the autoscaleInfoProvider so the Y-axis always fits levels
         function tvApplyAutoscale() {
@@ -5087,6 +5324,117 @@ def index():
                     if (tvMacdChart) tvMacdChart.priceScale('right').applyOptions({ autoScale: true });
                 } catch(e) {}
             }, 50);
+        }
+
+        // ── Real-time price streaming via Server-Sent Events ─────────────────
+        function disconnectPriceStream() {
+            if (priceEventSource) {
+                priceEventSource.close();
+                priceEventSource = null;
+                priceStreamTicker = null;
+            }
+        }
+
+        function connectPriceStream(ticker) {
+            if (!ticker) return;
+            const upperTicker = ticker.toUpperCase();
+            // Already connected to the right ticker – nothing to do
+            if (priceEventSource && priceStreamTicker === upperTicker &&
+                priceEventSource.readyState !== EventSource.CLOSED) {
+                return;
+            }
+            // Disconnect any existing connection first
+            disconnectPriceStream();
+
+            priceEventSource = new EventSource('/price_stream/' + encodeURIComponent(upperTicker));
+            priceStreamTicker = upperTicker;
+
+            priceEventSource.onmessage = function(event) {
+                try {
+                    const msg = JSON.parse(event.data);
+                    if (!tvCandleSeries || !tvLastCandles.length) return;
+                    if (msg.type === 'quote' && typeof msg.last === 'number') {
+                        applyRealtimeQuote(msg.last);
+                    } else if (msg.type === 'candle' && msg.time) {
+                        applyRealtimeCandle(msg);
+                    }
+                } catch(e) {}
+            };
+
+            priceEventSource.onerror = function() {
+                // Browser will auto-reconnect on error; just log it quietly
+                console.debug('[PriceStream] Connection error – browser will retry.');
+            };
+        }
+
+        /**
+         * Update or extend the chart's current minute candle from a real-time last price.
+         * Uses UTC second-aligned minute boundaries to match the chart's time axis.
+         */
+        function applyRealtimeQuote(last) {
+            // Track live price and debounce Plotly chart updates
+            livePrice = last;
+            clearTimeout(plotlyPriceUpdateTimer);
+            plotlyPriceUpdateTimer = setTimeout(function() { updateAllPlotlyPriceLines(last); }, 500);
+
+            if (!tvCandleSeries || !tvLastCandles.length) return;
+            const nowSec = Math.floor(Date.now() / 1000);
+            const minuteStart = Math.floor(nowSec / 60) * 60;
+            const lastCandle = tvLastCandles[tvLastCandles.length - 1];
+
+            if (lastCandle.time === minuteStart) {
+                // Update the existing in-progress candle
+                const updated = {
+                    time:   lastCandle.time,
+                    open:   lastCandle.open,
+                    high:   Math.max(lastCandle.high, last),
+                    low:    Math.min(lastCandle.low,  last),
+                    close:  last,
+                    volume: lastCandle.volume || 0,
+                };
+                try { tvCandleSeries.update(updated); } catch(e) {}
+                tvLastCandles[tvLastCandles.length - 1] = updated;
+                // Keep multi-day indicator candles in sync
+                const icLast = tvIndicatorCandles[tvIndicatorCandles.length - 1];
+                if (icLast && icLast.time === updated.time) {
+                    tvIndicatorCandles[tvIndicatorCandles.length - 1] = updated;
+                }
+                // Debounce indicator refresh to at most once every 2 seconds on tick updates
+                if (tvActiveInds.size > 0) {
+                    clearTimeout(tvIndicatorRefreshTimer);
+                    tvIndicatorRefreshTimer = setTimeout(() => applyIndicators(tvIndicatorCandles, tvActiveInds), 2000);
+                }
+            } else if (minuteStart > lastCandle.time) {
+                // New minute – open a new candle and immediately refresh indicators
+                const newCandle = { time: minuteStart, open: last, high: last, low: last, close: last, volume: 0 };
+                try { tvCandleSeries.update(newCandle); } catch(e) {}
+                tvLastCandles.push(newCandle);
+                tvIndicatorCandles.push(newCandle);
+                if (tvActiveInds.size > 0) {
+                    clearTimeout(tvIndicatorRefreshTimer);
+                    applyIndicators(tvIndicatorCandles, tvActiveInds);
+                }
+            }
+        }
+
+        /**
+         * Apply a completed 1-minute candle from CHART_EQUITY streaming.
+         */
+        function applyRealtimeCandle(candle) {
+            if (!tvCandleSeries) return;
+            const c = { time: candle.time, open: candle.open, high: candle.high,
+                        low: candle.low, close: candle.close, volume: candle.volume || 0 };
+            try { tvCandleSeries.update(c); } catch(e) {}
+            // Update display candles (current-day)
+            const idx = tvLastCandles.findIndex(x => x.time === c.time);
+            if (idx >= 0) { tvLastCandles[idx] = c; }
+            else { tvLastCandles.push(c); tvLastCandles.sort((a, b) => a.time - b.time); }
+            // Update multi-day indicator candles
+            const icIdx = tvIndicatorCandles.findIndex(x => x.time === c.time);
+            if (icIdx >= 0) { tvIndicatorCandles[icIdx] = c; }
+            else { tvIndicatorCandles.push(c); tvIndicatorCandles.sort((a, b) => a.time - b.time); }
+            // Refresh indicators with the full multi-day history
+            if (tvActiveInds.size > 0) applyIndicators(tvIndicatorCandles, tvActiveInds);
         }
 
         // --- Fullscreen chart support ---
@@ -5253,6 +5601,7 @@ def index():
   function calcVWAP(cs){var cp=0,cv=0;return cs.map(function(c){var t=(c.high+c.low+c.close)/3;cp+=t*c.volume;cv+=c.volume;return cv>0?cp/cv:c.close;});}
   function calcBB(c,p,m){p=p||20;m=m||2;var s=calcSMA(c,p);return s.map(function(mid,i){if(mid===null)return{upper:null,mid:null,lower:null};var sl=c.slice(Math.max(0,i-p+1),i+1),v=sl.reduce(function(a,b){return a+(b-mid)*(b-mid);},0)/sl.length,sd=Math.sqrt(v);return{upper:mid+m*sd,mid:mid,lower:mid-m*sd};});}
   function calcRSI(c,p){p=p||14;var r=[];for(var i=0;i<c.length;i++){if(i<p){r.push(null);continue;}var g=0,l=0;for(var j=i-p+1;j<=i;j++){var d=c[j]-c[j-1];if(d>0)g+=d;else l-=d;}var ag=g/p,al=l/p;r.push(al===0?100:100-100/(1+ag/al));}return r;}
+  function calcATR(candles,p){p=p||14;var r=[];for(var i=0;i<candles.length;i++){var tr;if(i===0){tr=candles[i].high-candles[i].low;}else{tr=Math.max(candles[i].high-candles[i].low,Math.abs(candles[i].high-candles[i-1].close),Math.abs(candles[i].low-candles[i-1].close));}if(i<p-1){r.push(null);continue;}if(r.length===0||r[r.length-1]===null){var sum=0;for(var j=i-p+1;j<=i;j++){var t2;if(j===0){t2=candles[j].high-candles[j].low;}else{t2=Math.max(candles[j].high-candles[j].low,Math.abs(candles[j].high-candles[j-1].close),Math.abs(candles[j].low-candles[j-1].close));}sum+=t2;}r.push(sum/p);}else{r.push((r[r.length-1]*(p-1)+tr)/p);}}return r;}
   function calcMACD(c,fast,slow,sig){fast=fast||12;slow=slow||26;sig=sig||9;var ef=calcEMA(c,fast),es=calcEMA(c,slow);var ml=ef.map(function(v,i){return(v!==null&&es[i]!==null)?v-es[i]:null;});var sl=[],es2=null,vi=0,k=2/(sig+1);for(var i=0;i<ml.length;i++){if(ml[i]===null){sl.push(null);continue;}if(vi<sig-1){sl.push(null);vi++;continue;}if(es2===null){var piece=ml.filter(function(v){return v!==null;}).slice(0,sig);es2=piece.reduce(function(a,b){return a+b;},0)/sig;}else{es2=ml[i]*k+es2*(1-k);}sl.push(es2);vi++;}return{macd:ml,signal:sl,histogram:ml.map(function(v,i){return(v!==null&&sl[i]!==null)?v-sl[i]:null;})};}
 
   // ── Sub-pane chart factory ─────────────────────────────────────────────────
@@ -5276,6 +5625,7 @@ def index():
     if(activeInds.has('ema21')&&!tvIndSeries['ema21']){var s=mkLine('#00e5ff',1,'EMA21');s.setData(calcEMA(closes,21).map(function(v,i){return v!==null?{time:times[i],value:v}:null;}).filter(Boolean));tvIndSeries['ema21']=s;}
     if(activeInds.has('vwap')&&!tvIndSeries['vwap']){var vv=calcVWAP(candles.map(function(c,i){return{high:candles[i].high,low:candles[i].low,close:candles[i].close,volume:c.volume||0};}));var s=mkLine('#ffffff',1,'VWAP');s.setData(vv.map(function(v,i){return{time:times[i],value:v};}));tvIndSeries['vwap']=s;}
     if(activeInds.has('bb')&&!tvIndSeries['bb']){var bb=calcBB(closes);var u=mkLine('rgba(100,180,255,0.8)',1,'BB U'),m=mkLine('rgba(100,180,255,0.5)',1,'BB M'),l=mkLine('rgba(100,180,255,0.8)',1,'BB L');u.setData(bb.map(function(v,i){return v.upper!==null?{time:times[i],value:v.upper}:null;}).filter(Boolean));m.setData(bb.map(function(v,i){return v.mid!==null?{time:times[i],value:v.mid}:null;}).filter(Boolean));l.setData(bb.map(function(v,i){return v.lower!==null?{time:times[i],value:v.lower}:null;}).filter(Boolean));tvIndSeries['bb']=[u,m,l];}
+    if(activeInds.has('atr')&&!tvIndSeries['atr']){var atrV=calcATR(candles),e20=calcEMA(closes,20),mult=1.5;var au=mkLine('rgba(255,152,0,0.8)',1,'ATR U'),al=mkLine('rgba(255,152,0,0.8)',1,'ATR L');au.setData(e20.map(function(v,i){return(v!==null&&atrV[i]!==null)?{time:times[i],value:v+mult*atrV[i]}:null;}).filter(Boolean));al.setData(e20.map(function(v,i){return(v!==null&&atrV[i]!==null)?{time:times[i],value:v-mult*atrV[i]}:null;}).filter(Boolean));tvIndSeries['atr']=[au,al];}
     if(activeInds.has('rsi'))applyRsiPane(candles,times);else destroyRsiPane();
     if(activeInds.has('macd'))applyMacdPane(candles,times);else destroyMacdPane();
     updateLegend();
@@ -5299,12 +5649,13 @@ def index():
     if(hd.length)tvMacdSeries.hist.setData(hd);if(ld.length)tvMacdSeries.line.setData(ld);if(sd.length)tvMacdSeries.signal.setData(sd);
     setupSync();
   }
-  function destroyMacdPane(){var pane=document.getElementById('macd-pane');if(pane)pane.style.display='none';if(tvMacdChart){tvSyncHandlers=tvSyncHandlers.filter(function(h){return h.chart!==tvMacdChart;});try{tvMacdChart.remove();}catch(e){}tvMacdChart=null;tvMacdSeries={};}}
+  function destroyMacdPane(){var pane=document.getElementById('macd-pane');if(pane)pane.style.display='none';if(tvMacdChart){tvSyncHandlers=tvSyncHandlers.filter(function(h){return h.chart!==tvMacdChart;});try{tvMacdChart.remove();}catch(e){}tvMacdChart=null;tvMacdSeries={
+};}}
   function updateLegend(){
     var cont=document.getElementById('price-chart');if(!cont)return;
     var leg=cont.querySelector('.ind-legend');if(!leg){leg=document.createElement('div');leg.className='ind-legend';cont.appendChild(leg);}
-    var cols={sma20:'#f0c040',sma50:'#40a0f0',sma200:'#e040fb',ema9:'#ff9900',ema21:'#00e5ff',vwap:'#ffffff',bb:'rgba(100,180,255,0.8)',rsi:'#e91e63',macd:'#2196f3'};
-    var lbls={sma20:'SMA20',sma50:'SMA50',sma200:'SMA200',ema9:'EMA9',ema21:'EMA21',vwap:'VWAP',bb:'BB(20,2)',rsi:'RSI14',macd:'MACD'};
+    var cols={sma20:'#f0c040',sma50:'#40a0f0',sma200:'#e040fb',ema9:'#ff9900',ema21:'#00e5ff',vwap:'#ffffff',bb:'rgba(100,180,255,0.8)',rsi:'#e91e63',macd:'#2196f3',atr:'rgba(255,152,0,0.8)'};
+    var lbls={sma20:'SMA20',sma50:'SMA50',sma200:'SMA200',ema9:'EMA9',ema21:'EMA21',vwap:'VWAP',bb:'BB(20,2)',rsi:'RSI14',macd:'MACD',atr:'ATR Bands'};
     leg.innerHTML=Object.keys(tvIndSeries).map(function(k){return '<div class="ind-item"><div class="ind-swatch" style="background:'+( cols[k]||'#888')+'"></div>'+(lbls[k]||k)+'</div>';}).join('');
   }
 
@@ -5332,7 +5683,7 @@ def index():
     function btn(text,title,onClick,extra){var b=document.createElement('button');b.className='tb-btn'+(extra?' '+extra:'');b.textContent=text;b.title=title;b.addEventListener('click',onClick);return b;}
     function sep(){var d=document.createElement('div');d.className='tv-tb-sep';return d;}
     // Indicator toggles
-    var inds=[{k:'sma20',l:'SMA20',t:'SMA 20'},{k:'sma50',l:'SMA50',t:'SMA 50'},{k:'sma200',l:'SMA200',t:'SMA 200'},{k:'ema9',l:'EMA9',t:'EMA 9'},{k:'ema21',l:'EMA21',t:'EMA 21'},{k:'vwap',l:'VWAP',t:'VWAP'},{k:'bb',l:'BB',t:'Bollinger Bands (20,2)'},{k:'rsi',l:'RSI',t:'RSI 14 — sub-pane'},{k:'macd',l:'MACD',t:'MACD (12,26,9) — sub-pane'}];
+    var inds=[{k:'sma20',l:'SMA20',t:'SMA 20'},{k:'sma50',l:'SMA50',t:'SMA 50'},{k:'sma200',l:'SMA200',t:'SMA 200'},{k:'ema9',l:'EMA9',t:'EMA 9'},{k:'ema21',l:'EMA21',t:'EMA 21'},{k:'vwap',l:'VWAP',t:'VWAP'},{k:'bb',l:'BB',t:'Bollinger Bands (20,2)'},{k:'rsi',l:'RSI',t:'RSI 14 — sub-pane'},{k:'macd',l:'MACD',t:'MACD (12,26,9) — sub-pane'},{k:'atr',l:'ATR',t:'Average True Range 14 — sub-pane'}];
     inds.forEach(function(def){var b=btn(def.l,def.t,function(){if(activeInds.has(def.k))activeInds.delete(def.k);else activeInds.add(def.k);b.classList.toggle('active',activeInds.has(def.k));applyIndicators(tvLastCandles);});if(activeInds.has(def.k))b.classList.add('active');tb.appendChild(b);});
     tb.appendChild(sep());
     // Drawing tools
@@ -5596,7 +5947,11 @@ def index():
                 tvDrawingDefs = [];
                 // Reset zoom on the next render
                 tvLastCandles = [];
+                tvIndicatorCandles = [];
+                tvCurrentDayStartTime = 0;
                 tvForceFit = true;
+                // Disconnect the price stream so it reconnects on the new ticker
+                disconnectPriceStream();
             }
             tvLastTicker = ticker;
 
@@ -5796,6 +6151,37 @@ def index():
                      histogram: macdLine.map((v,i) => (v!==null && sigLine[i]!==null) ? v-sigLine[i] : null) };
         }
 
+        function calcATR(candles, period=14) {
+            const result = [];
+            for (let i = 0; i < candles.length; i++) {
+                const tr = i === 0
+                    ? candles[i].high - candles[i].low
+                    : Math.max(
+                        candles[i].high - candles[i].low,
+                        Math.abs(candles[i].high - candles[i-1].close),
+                        Math.abs(candles[i].low  - candles[i-1].close)
+                      );
+                if (i < period - 1) { result.push(null); continue; }
+                if (result.length === 0 || result[result.length-1] === null) {
+                    let sum = 0;
+                    for (let j = i - period + 1; j <= i; j++) {
+                        const t = j === 0
+                            ? candles[j].high - candles[j].low
+                            : Math.max(
+                                candles[j].high - candles[j].low,
+                                Math.abs(candles[j].high - candles[j-1].close),
+                                Math.abs(candles[j].low  - candles[j-1].close)
+                              );
+                        sum += t;
+                    }
+                    result.push(sum / period);
+                } else {
+                    result.push((result[result.length-1] * (period - 1) + tr) / period);
+                }
+            }
+            return result;
+        }
+
         // ── Apply/remove indicators on existing chart ─────────────────────────
         function applyIndicators(candles, activeInds) {
             if (!tvPriceChart || !tvCandleSeries) return;
@@ -5814,62 +6200,82 @@ def index():
                 }
             });
 
-            // Add activated indicators
+            // Create-or-update helper: always setData so streaming updates are reflected
             function mkLineSeries(color, lineWidth=1, priceScaleId='right', title='') {
                 return tvPriceChart.addLineSeries({ color, lineWidth, priceScaleId,
                     lastValueVisible: true, priceLineVisible: false, title });
             }
 
-            if (activeInds.has('sma20') && !tvIndicatorSeries['sma20']) {
-                const s = mkLineSeries('#f0c040', 1, 'right', 'SMA20');
-                s.setData(calcSMA(closes, 20).map((v,i) => v!==null ? {time:times[i], value:v} : null).filter(Boolean));
-                tvIndicatorSeries['sma20'] = s;
-            }
-            if (activeInds.has('sma50') && !tvIndicatorSeries['sma50']) {
-                const s = mkLineSeries('#40a0f0', 1, 'right', 'SMA50');
-                s.setData(calcSMA(closes, 50).map((v,i) => v!==null ? {time:times[i], value:v} : null).filter(Boolean));
-                tvIndicatorSeries['sma50'] = s;
-            }
-            if (activeInds.has('sma200') && !tvIndicatorSeries['sma200']) {
-                const s = mkLineSeries('#e040fb', 1, 'right', 'SMA200');
-                s.setData(calcSMA(closes, 200).map((v,i) => v!==null ? {time:times[i], value:v} : null).filter(Boolean));
-                tvIndicatorSeries['sma200'] = s;
-            }
-            if (activeInds.has('ema9') && !tvIndicatorSeries['ema9']) {
-                const s = mkLineSeries('#ff9900', 1, 'right', 'EMA9');
-                s.setData(calcEMA(closes, 9).map((v,i) => v!==null ? {time:times[i], value:v} : null).filter(Boolean));
-                tvIndicatorSeries['ema9'] = s;
-            }
-            if (activeInds.has('ema21') && !tvIndicatorSeries['ema21']) {
-                const s = mkLineSeries('#00e5ff', 1, 'right', 'EMA21');
-                s.setData(calcEMA(closes, 21).map((v,i) => v!==null ? {time:times[i], value:v} : null).filter(Boolean));
-                tvIndicatorSeries['ema21'] = s;
-            }
-            if (activeInds.has('vwap') && !tvIndicatorSeries['vwap']) {
-                const full = candles.map((c, i) => ({
-                    time: times[i],
-                    high: highs[i], low: lows[i], close: closes[i], volume: c.volume || 0
-                }));
-                const vwapVals = calcVWAP(full);
-                const s = mkLineSeries('#ffffff', 1, 'right', 'VWAP');
-                s.setData(vwapVals.map((v,i) => ({time:times[i], value:v})));
-                tvIndicatorSeries['vwap'] = s;
-            }
-            if (activeInds.has('bb') && !tvIndicatorSeries['bb']) {
-                const bb = calcBB(closes);
-                const upperS = mkLineSeries('rgba(100,180,255,0.8)', 1, 'right', 'BB Upper');
-                const midS   = mkLineSeries('rgba(100,180,255,0.5)', 1, 'right', 'BB Mid');
-                const lowerS = mkLineSeries('rgba(100,180,255,0.8)', 1, 'right', 'BB Lower');
-                upperS.setData(bb.map((v,i) => v.upper!==null ? {time:times[i],value:v.upper} : null).filter(Boolean));
-                midS.setData(  bb.map((v,i) => v.mid  !==null ? {time:times[i],value:v.mid}   : null).filter(Boolean));
-                lowerS.setData(bb.map((v,i) => v.lower!==null ? {time:times[i],value:v.lower}  : null).filter(Boolean));
-                tvIndicatorSeries['bb'] = [upperS, midS, lowerS];
+            // Helper: filter computed (time, value) pairs to today only.
+            // candles may span multiple days (for warmup); we only plot current-day values.
+            const dayStart = tvCurrentDayStartTime || 0;
+            function todayOnly(pairs) {
+                return pairs.filter(p => p !== null && p.time >= dayStart);
             }
 
-            // RSI and MACD go into separate synchronized sub-panes
-            if (activeInds.has('rsi')) applyRsiPane(candles);
+            if (activeInds.has('sma20')) {
+                if (!tvIndicatorSeries['sma20']) tvIndicatorSeries['sma20'] = mkLineSeries('#f0c040', 1, 'right', 'SMA20');
+                tvIndicatorSeries['sma20'].setData(todayOnly(calcSMA(closes, 20).map((v,i) => v!==null ? {time:times[i], value:v} : null)));
+            }
+            if (activeInds.has('sma50')) {
+                if (!tvIndicatorSeries['sma50']) tvIndicatorSeries['sma50'] = mkLineSeries('#40a0f0', 1, 'right', 'SMA50');
+                tvIndicatorSeries['sma50'].setData(todayOnly(calcSMA(closes, 50).map((v,i) => v!==null ? {time:times[i], value:v} : null)));
+            }
+            if (activeInds.has('sma200')) {
+                if (!tvIndicatorSeries['sma200']) tvIndicatorSeries['sma200'] = mkLineSeries('#e040fb', 1, 'right', 'SMA200');
+                tvIndicatorSeries['sma200'].setData(todayOnly(calcSMA(closes, 200).map((v,i) => v!==null ? {time:times[i], value:v} : null)));
+            }
+            if (activeInds.has('ema9')) {
+                if (!tvIndicatorSeries['ema9']) tvIndicatorSeries['ema9'] = mkLineSeries('#ff9900', 1, 'right', 'EMA9');
+                tvIndicatorSeries['ema9'].setData(todayOnly(calcEMA(closes, 9).map((v,i) => v!==null ? {time:times[i], value:v} : null)));
+            }
+            if (activeInds.has('ema21')) {
+                if (!tvIndicatorSeries['ema21']) tvIndicatorSeries['ema21'] = mkLineSeries('#00e5ff', 1, 'right', 'EMA21');
+                tvIndicatorSeries['ema21'].setData(todayOnly(calcEMA(closes, 21).map((v,i) => v!==null ? {time:times[i], value:v} : null)));
+            }
+            if (activeInds.has('vwap')) {
+                // VWAP resets daily — always compute from today's candles only
+                const todayCandles = dayStart > 0 ? candles.filter(c => c.time >= dayStart) : candles;
+                const vwapVals = calcVWAP(todayCandles.map(c => ({
+                    time: c.time, high: c.high, low: c.low, close: c.close, volume: c.volume || 0
+                })));
+                if (!tvIndicatorSeries['vwap']) tvIndicatorSeries['vwap'] = mkLineSeries('#ffffff', 1, 'right', 'VWAP');
+                tvIndicatorSeries['vwap'].setData(vwapVals.map((v, i) => ({time: todayCandles[i].time, value: v})));
+            }
+            if (activeInds.has('bb')) {
+                const bb = calcBB(closes);
+                if (!tvIndicatorSeries['bb']) {
+                    tvIndicatorSeries['bb'] = [
+                        mkLineSeries('rgba(100,180,255,0.8)', 1, 'right', 'BB Upper'),
+                        mkLineSeries('rgba(100,180,255,0.5)', 1, 'right', 'BB Mid'),
+                        mkLineSeries('rgba(100,180,255,0.8)', 1, 'right', 'BB Lower'),
+                    ];
+                }
+                const [upperS, midS, lowerS] = tvIndicatorSeries['bb'];
+                upperS.setData(todayOnly(bb.map((v,i) => v.upper!==null ? {time:times[i],value:v.upper} : null)));
+                midS.setData(  todayOnly(bb.map((v,i) => v.mid  !==null ? {time:times[i],value:v.mid}   : null)));
+                lowerS.setData(todayOnly(bb.map((v,i) => v.lower!==null ? {time:times[i],value:v.lower}  : null)));
+            }
+            if (activeInds.has('atr')) {
+                const atrVals = calcATR(candles);
+                const ema20   = calcEMA(closes, 20);
+                const mult    = 1.5;
+                if (!tvIndicatorSeries['atr']) {
+                    tvIndicatorSeries['atr'] = [
+                        mkLineSeries('rgba(255,152,0,0.8)', 1, 'right', 'ATR Upper'),
+                        mkLineSeries('rgba(255,152,0,0.8)', 1, 'right', 'ATR Lower'),
+                    ];
+                }
+                const [atrUpper, atrLower] = tvIndicatorSeries['atr'];
+                atrUpper.setData(todayOnly(ema20.map((v,i) => (v!==null && atrVals[i]!==null) ? {time:times[i], value:v + mult*atrVals[i]} : null)));
+                atrLower.setData(todayOnly(ema20.map((v,i) => (v!==null && atrVals[i]!==null) ? {time:times[i], value:v - mult*atrVals[i]} : null)));
+            }
+
+            // RSI and MACD sub-panes: compute with full history but display today only
+            const todayCandles = dayStart > 0 ? candles.filter(c => c.time >= dayStart) : candles;
+            if (activeInds.has('rsi')) applyRsiPane(candles, todayCandles);
             else                       destroyRsiPane();
-            if (activeInds.has('macd')) applyMacdPane(candles);
+            if (activeInds.has('macd')) applyMacdPane(candles, todayCandles);
             else                        destroyMacdPane();
 
             // Update legend overlay
@@ -5888,12 +6294,12 @@ def index():
             }
             const items = {
                 sma20:'SMA20',sma50:'SMA50',sma200:'SMA200',
-                ema9:'EMA9',ema21:'EMA21',vwap:'VWAP',bb:'BB(20,2)',rsi:'RSI14',macd:'MACD'
+                ema9:'EMA9',ema21:'EMA21',vwap:'VWAP',bb:'BB(20,2)',rsi:'RSI14',macd:'MACD',atr:'ATR Bands'
             };
             const colors = {
                 sma20:'#f0c040',sma50:'#40a0f0',sma200:'#e040fb',
                 ema9:'#ff9900',ema21:'#00e5ff',vwap:'#ffffff',bb:'rgba(100,180,255,0.8)',
-                rsi:'#e91e63',macd:'#2196f3'
+                rsi:'#e91e63',macd:'#2196f3',atr:'rgba(255,152,0,0.8)'
             };
             legend.innerHTML = Object.keys(tvIndicatorSeries).map(k => `
                 <div class="tv-legend-item">
@@ -5955,13 +6361,17 @@ def index():
             }
         }
 
-        function applyRsiPane(candles) {
+        function applyRsiPane(allCandles, todayCandles) {
             const pane = document.getElementById('rsi-pane');
             if (!pane) return;
             pane.style.display = 'block';
-            const times   = candles.map(c => c.time);
-            const rsiVals = calcRSI(candles.map(c => c.close));
-            const rsiData = rsiVals.map((v,i) => v!==null ? {time:times[i],value:v} : null).filter(Boolean);
+            // Compute RSI using full history for warmup, then filter to today for display
+            const allTimes   = allCandles.map(c => c.time);
+            const rsiVals    = calcRSI(allCandles.map(c => c.close));
+            const dayStart   = tvCurrentDayStartTime || 0;
+            const rsiData    = rsiVals
+                .map((v,i) => v!==null ? {time:allTimes[i],value:v} : null)
+                .filter(p => p !== null && p.time >= dayStart);
             if (!tvRsiChart) {
                 const chartEl = document.getElementById('rsi-chart');
                 if (!chartEl) return;
@@ -5988,15 +6398,18 @@ def index():
             }
         }
 
-        function applyMacdPane(candles) {
+        function applyMacdPane(allCandles, todayCandles) {
             const pane = document.getElementById('macd-pane');
             if (!pane) return;
             pane.style.display = 'block';
-            const times    = candles.map(c => c.time);
-            const macdData = calcMACD(candles.map(c => c.close));
-            const histData = macdData.histogram.map((v,i) => v!==null ? {time:times[i],value:v,color:v>=0?'rgba(76,175,80,0.8)':'rgba(244,67,54,0.8)'} : null).filter(Boolean);
-            const lineData = macdData.macd.map((v,i)    => v!==null ? {time:times[i],value:v} : null).filter(Boolean);
-            const sigData  = macdData.signal.map((v,i)  => v!==null ? {time:times[i],value:v} : null).filter(Boolean);
+            // Compute MACD using full history for warmup, then filter to today for display
+            const allTimes = allCandles.map(c => c.time);
+            const macdData = calcMACD(allCandles.map(c => c.close));
+            const dayStart = tvCurrentDayStartTime || 0;
+            function todayOnly(pairs) { return pairs.filter(p => p !== null && p.time >= dayStart); }
+            const histData = todayOnly(macdData.histogram.map((v,i) => v!==null ? {time:allTimes[i],value:v,color:v>=0?'rgba(76,175,80,0.8)':'rgba(244,67,54,0.8)'} : null));
+            const lineData = todayOnly(macdData.macd.map((v,i)    => v!==null ? {time:allTimes[i],value:v} : null));
+            const sigData  = todayOnly(macdData.signal.map((v,i)  => v!==null ? {time:allTimes[i],value:v} : null));
             if (!tvMacdChart) {
                 const chartEl = document.getElementById('macd-chart');
                 if (!chartEl) return;
@@ -6225,13 +6638,14 @@ def index():
                 { key:'bb',     label:'BB',     title:'Bollinger Bands (20, 2)' },
                 { key:'rsi',    label:'RSI',    title:'Relative Strength Index (14) — sub-pane' },
                 { key:'macd',   label:'MACD',   title:'MACD (12, 26, 9) — sub-pane' },
+                { key:'atr',    label:'ATR',    title:'Average True Range (14) — sub-pane' },
             ];
             indicatorDefs.forEach(def => {
                 const b = btn(def.label, def.title, () => {
                     if (tvActiveInds.has(def.key)) tvActiveInds.delete(def.key);
                     else                           tvActiveInds.add(def.key);
                     b.classList.toggle('active', tvActiveInds.has(def.key));
-                    applyIndicators(candles, tvActiveInds);
+                    applyIndicators(tvIndicatorCandles, tvActiveInds);
                 });
                 if (tvActiveInds.has(def.key)) b.classList.add('active');
                 toolbar.appendChild(b);
@@ -6413,6 +6827,16 @@ def index():
             tvCandleSeries.setData(candles);
             tvLastCandles = candles;
             tvVolumeSeries.setData(priceData.volume || []);
+            // Use multi-day candles for indicator warmup so SMA200, EMA200, etc. start from day open
+            tvIndicatorCandles = (priceData.indicator_candles && priceData.indicator_candles.length > 0)
+                ? priceData.indicator_candles : candles;
+            tvCurrentDayStartTime = priceData.current_day_start_time || 0;
+
+            // Start/maintain real-time streaming for the current ticker
+            const streamTicker = (document.getElementById('ticker').value || '').trim();
+            if (streamTicker && isStreaming) {
+                connectPriceStream(streamTicker);
+            }
 
             // Remove old dynamic price lines and re-add fresh ones
             tvExposurePriceLines.forEach(l => { try { tvCandleSeries.removePriceLine(l); } catch(e){} });
@@ -6441,7 +6865,7 @@ def index():
             }
 
             tvApplyAutoscale();
-            if (tvActiveInds.size > 0) applyIndicators(candles, tvActiveInds);
+            if (tvActiveInds.size > 0) applyIndicators(tvIndicatorCandles, tvActiveInds);
 
             // fitContent on first render, when auto-range is ON, or when explicitly forced (ticker change)
             if (tvAutoRange || isFirstRender || tvForceFit) {
@@ -6816,8 +7240,10 @@ def index():
             const highColor = highDiff >= 0 ? callColor : putColor;
             const lowColor = lowDiff >= 0 ? callColor : putColor;
 
+            // Use the live streamer price if available, otherwise use the fetched price
+            const displayPrice = (livePrice !== null) ? livePrice : info.current_price;
             priceInfo.innerHTML = `
-                <div>Current Price: $${info.current_price.toFixed(2)}</div>
+                <div data-live-price>Current Price: $${displayPrice.toFixed(2)}</div>
                 <div>High: $${info.high.toFixed(2)} <span style="color:${highColor}">(${highDiffPct>=0?'+':''}${highDiffPct.toFixed(2)}%)</span></div>
                 <div>Low:  $${info.low.toFixed(2)}  <span style="color:${lowColor}">(${lowDiffPct>=0?'+':''}${lowDiffPct.toFixed(2)}%)</span></div>
                 <div class="${info.net_change >= 0 ? 'green' : 'red'}">
@@ -6990,6 +7416,7 @@ def index():
         // Cleanup on page unload
         window.addEventListener('beforeunload', () => {
             clearInterval(updateInterval);
+            disconnectPriceStream();
             Object.values(charts).forEach(chart => {
                 Plotly.purge(chart);
             });
@@ -7003,8 +7430,13 @@ def index():
             
             if (isStreaming) {
                 updateInterval = setInterval(updateData, 1000);
+                // Reconnect real-time price stream when resuming
+                const tickerVal = (document.getElementById('ticker').value || '').trim();
+                if (tickerVal) connectPriceStream(tickerVal);
             } else {
                 clearInterval(updateInterval);
+                // Disconnect real-time price stream when pausing
+                disconnectPriceStream();
             }
         }
         
@@ -7566,5 +7998,45 @@ def load_settings():
     except Exception as e:
         return jsonify({'error': str(e)})
 
+
+@app.route('/price_stream/<path:ticker>')
+def price_stream(ticker):
+    """Server-Sent Events endpoint for real-time price candle/quote updates.
+
+    The frontend connects here via EventSource; the backend pushes CHART_EQUITY
+    (completed 1-min candles) and LEVELONE_EQUITIES (real-time last price) data
+    from the schwabdev websocket stream.
+    """
+    ticker = format_ticker(ticker)
+    client_queue = queue.Queue(maxsize=300)
+    price_streamer.subscribe(ticker, client_queue)
+
+    def generate():
+        try:
+            # Initial connection confirmation
+            yield 'data: {"type":"connected"}\n\n'
+            while True:
+                try:
+                    payload = client_queue.get(timeout=20)
+                    yield f'data: {payload}\n\n'
+                except queue.Empty:
+                    # Heartbeat keeps the connection alive through proxies/browsers
+                    yield 'data: {"type":"heartbeat"}\n\n'
+        except GeneratorExit:
+            pass
+        finally:
+            price_streamer.unsubscribe_queue(ticker, client_queue)
+
+    return Response(
+        stream_with_context(generate()),
+        mimetype='text/event-stream',
+        headers={
+            'Cache-Control': 'no-cache',
+            'X-Accel-Buffering': 'no',   # disable Nginx buffering if behind a proxy
+            'Connection': 'keep-alive',
+        }
+    )
+
+
 if __name__ == '__main__':
-    app.run(debug=True, port=5001)
+    app.run(debug=True, port=5001, threaded=True)
