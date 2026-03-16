@@ -4140,9 +4140,9 @@ def index():
             display: inline-block;
             flex-shrink: 0;
         }
-        .tm-ok   { background: #00e676; }
+        .tm-ok   { background: #4CAF50; }
         .tm-warn { background: #ffb300; }
-        .tm-err  { background: #ff5252; }
+        .tm-err  { background: #ff4444; }
         .tm-neutral { background: #555; }
         .tm-stats {
             font-size: 11px;
@@ -4975,7 +4975,9 @@ def index():
                     <div id="token-monitor">
                         <span class="tm-dot tm-neutral" id="tm-dot"></span>
                         <span class="tm-stats" style="color:#666;font-size:10px;">SCHWAB API</span>
-                        <span class="tm-stats" id="tm-stats" title="">checking…</span>
+                        <span class="tm-stats" id="tm-access-stat" title="">…</span>
+                        <span class="tm-stats" style="color:#444;">·</span>
+                        <span class="tm-stats" id="tm-refresh-stat" title="">…</span>
                         <div class="tm-btn-group">
                             <button class="tm-btn" onclick="fetchTokenHealth()" title="Refresh token status">&#8635;</button>
                             <button class="tm-btn tm-btn-del" onclick="forceDeleteToken()" title="Clear stored tokens">&#128465; reset</button>
@@ -7817,16 +7819,29 @@ def index():
 
                 const atMins = d.access_token_age_minutes !== null ? d.access_token_age_minutes.toFixed(1) + 'm' : '?';
                 const rtDays = d.refresh_token_age_days   !== null ? d.refresh_token_age_days.toFixed(2)   + 'd' : '?';
-                const apiTxt = apiOk ? 'API ✓' : 'API ✗';
 
-                stats.textContent = `access ${atMins}  ·  refresh ${rtDays}  ·  ${apiTxt}`;
-                stats.title = d.api_message || '';
+                const atEl = document.getElementById('tm-access-stat');
+                const rtEl = document.getElementById('tm-refresh-stat');
+
+                atEl.textContent = 'access ' + atMins;
+                atEl.title = d.access_token_valid
+                    ? `Access token is ${atMins} old. Valid for ${(30 - d.access_token_age_minutes).toFixed(1)}m more (expires at 30 min).`
+                    : `Access token is ${atMins} old — EXPIRED. Run the token getter script to refresh.`;
+                atEl.style.color = d.access_token_valid ? '' : '#ff5252';
+
+                rtEl.textContent = 'refresh ' + rtDays;
+                const rtRemain = d.refresh_token_age_days !== null ? (7 - d.refresh_token_age_days).toFixed(2) : '?';
+                rtEl.title = d.refresh_token_valid
+                    ? `Refresh token is ${rtDays} old. Valid for ${rtRemain}d more (expires at 7 days). `
+                      + (d.refresh_token_age_days > 5 ? 'Re-authenticate soon!' : 'Good.')
+                    : `Refresh token is ${rtDays} old — EXPIRED. Full browser re-authentication required.`;
+                rtEl.style.color = !d.refresh_token_valid ? '#ff5252' : (d.refresh_token_age_days > 5 ? '#ffb300' : '');
             })
             .catch(() => {
                 const dot = document.getElementById('tm-dot');
                 if (dot) { dot.className = 'tm-dot tm-err'; }
-                const stats = document.getElementById('tm-stats');
-                if (stats) { stats.textContent = 'unreachable'; }
+                const atEl = document.getElementById('tm-access-stat');
+                if (atEl) { atEl.textContent = 'unreachable'; }
             });
     }
 
