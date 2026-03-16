@@ -4126,6 +4126,51 @@ def index():
             width: 100%;
             overflow-x: hidden;
         }
+        /* Token Monitor */
+        #token-monitor {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-top: 4px;
+        }
+        .tm-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            display: inline-block;
+            flex-shrink: 0;
+        }
+        .tm-ok   { background: #00e676; }
+        .tm-warn { background: #ffb300; }
+        .tm-err  { background: #ff5252; }
+        .tm-neutral { background: #555; }
+        .tm-stats {
+            font-size: 11px;
+            color: #888;
+            font-family: monospace;
+            letter-spacing: 0.02em;
+        }
+        .tm-stats span { color: #ccc; }
+        .tm-btn-group {
+            display: flex;
+            gap: 5px;
+        }
+        .tm-btn {
+            background: none;
+            border: 1px solid #444;
+            color: #777;
+            border-radius: 4px;
+            padding: 2px 7px;
+            font-size: 10px;
+            cursor: pointer;
+            transition: color 0.15s, border-color 0.15s;
+        }
+        .tm-btn:hover { color: #ccc; border-color: #777; }
+        .tm-btn-del {
+            border-color: #444;
+            color: #666;
+        }
+        .tm-btn-del:hover { background: #2a1010; border-color: #883333; color: #cc4444; }
         .container {
             width: 95%;
             max-width: none;
@@ -4234,23 +4279,40 @@ def index():
             accent-color: #00FF00;
         }
         .expiry-buttons {
-            padding: 8px;
+            padding: 6px 8px;
             border-top: 1px solid #444;
             display: flex;
-            gap: 8px;
+            flex-wrap: wrap;
+            gap: 5px;
         }
         .expiry-buttons button {
-            padding: 4px 8px;
-            font-size: 11px;
+            padding: 4px 6px;
+            font-size: 10px;
             border-radius: 4px;
             border: 1px solid #555;
             background-color: #444;
             color: white;
             cursor: pointer;
             flex: 1;
+            min-width: 40px;
         }
         .expiry-buttons button:hover {
             background-color: #555;
+        }
+        .expiry-buttons .expiry-range-btns {
+            display: flex;
+            gap: 5px;
+            width: 100%;
+            flex-wrap: wrap;
+        }
+        .expiry-buttons .expiry-range-btns button {
+            flex: 1;
+            min-width: 38px;
+            background-color: #3a3a5e;
+            border-color: #5555aa;
+        }
+        .expiry-buttons .expiry-range-btns button:hover {
+            background-color: #4a4a7e;
         }
         .levels-dropdown {
             position: relative;
@@ -4908,7 +4970,18 @@ def index():
     <div class="container">
         <div class="header">
             <div class="header-top">
-                <div class="title">EzDuz1t Options</div>
+                <div>
+                    <div class="title">EzDuz1t Options</div>
+                    <div id="token-monitor">
+                        <span class="tm-dot tm-neutral" id="tm-dot"></span>
+                        <span class="tm-stats" style="color:#666;font-size:10px;">SCHWAB API</span>
+                        <span class="tm-stats" id="tm-stats" title="">checking…</span>
+                        <div class="tm-btn-group">
+                            <button class="tm-btn" onclick="fetchTokenHealth()" title="Refresh token status">&#8635;</button>
+                            <button class="tm-btn tm-btn-del" onclick="forceDeleteToken()" title="Clear stored tokens">&#128465; reset</button>
+                        </div>
+                    </div>
+                </div>
                 <div class="controls">
                     <div class="control-group">
                         <label for="ticker">Ticker:</label>
@@ -4933,6 +5006,13 @@ def index():
                             <div class="expiry-options" id="expiry-options">
                                 <!-- Options will be populated here -->
                                 <div class="expiry-buttons">
+                                    <div class="expiry-range-btns">
+                                        <button type="button" id="expiryToday">Today</button>
+                                        <button type="button" id="expiryThisWk">This Wk</button>
+                                        <button type="button" id="expiry2Wks">+1 Wk</button>
+                                        <button type="button" id="expiry4Wks">+2 Wks</button>
+                                        <button type="button" id="expiry1Mo">+1 Mo</button>
+                                    </div>
                                     <button type="button" id="selectAllExpiry">All</button>
                                     <button type="button" id="clearAllExpiry">Clear</button>
                                 </div>
@@ -7305,8 +7385,8 @@ def index():
                         optionsContainer.appendChild(optionDiv);
                     });
                     
-                    // Re-add the buttons at the end
-                    optionsContainer.appendChild(buttons);
+                    // Re-add the buttons at the top
+                    optionsContainer.insertBefore(buttons, optionsContainer.firstChild);
                     
                     // If no previous selections or none match, select the first option
                     const checkedBoxes = document.querySelectorAll('.expiry-option input[type="checkbox"]:checked');
@@ -7395,6 +7475,73 @@ def index():
             }
             updateExpiryDisplay();
             updateData();
+        });
+
+        function selectExpiriesUpTo(cutoffDate) {
+            const checkboxes = document.querySelectorAll('.expiry-option input[type="checkbox"]');
+            let anyChecked = false;
+            checkboxes.forEach(checkbox => {
+                // Parse as local date to avoid UTC offset issues
+                const parts = checkbox.value.split('-');
+                const d = new Date(parseInt(parts[0]), parseInt(parts[1]) - 1, parseInt(parts[2]));
+                checkbox.checked = d <= cutoffDate;
+                if (checkbox.checked) anyChecked = true;
+            });
+            if (!anyChecked && checkboxes.length > 0) {
+                checkboxes[0].checked = true;
+            }
+            updateExpiryDisplay();
+            updateData();
+        }
+
+        function getFriday(weeksAhead) {
+            const today = new Date();
+            today.setHours(0, 0, 0, 0);
+            const dow = today.getDay(); // 0=Sun,1=Mon,...,5=Fri,6=Sat
+            const daysToFriday = (5 - dow + 7) % 7;
+            const cutoff = new Date(today);
+            cutoff.setDate(today.getDate() + daysToFriday + weeksAhead * 7);
+            return cutoff;
+        }
+
+        document.getElementById('expiryToday').addEventListener('click', function(e) {
+            e.stopPropagation();
+            const today = new Date();
+            today.setHours(0, 0, 0, 0);
+            selectExpiriesUpTo(today);
+        });
+
+        document.getElementById('expiryThisWk').addEventListener('click', function(e) {
+            e.stopPropagation();
+            selectExpiriesUpTo(getFriday(0));
+        });
+
+        function selectFirstNExpiries(n) {
+            const checkboxes = document.querySelectorAll('.expiry-option input[type="checkbox"]');
+            checkboxes.forEach((checkbox, i) => {
+                checkbox.checked = i < n;
+            });
+            if (checkboxes.length > 0 && n === 0) checkboxes[0].checked = true;
+            updateExpiryDisplay();
+            updateData();
+        }
+
+        document.getElementById('expiry2Wks').addEventListener('click', function(e) {
+            e.stopPropagation();
+            selectFirstNExpiries(7);
+        });
+
+        document.getElementById('expiry4Wks').addEventListener('click', function(e) {
+            e.stopPropagation();
+            selectFirstNExpiries(14);
+        });
+
+        document.getElementById('expiry1Mo').addEventListener('click', function(e) {
+            e.stopPropagation();
+            const cutoff = new Date();
+            cutoff.setHours(0, 0, 0, 0);
+            cutoff.setDate(cutoff.getDate() + 30);
+            selectExpiriesUpTo(cutoff);
         });
 
         // Initial load - automatically load saved settings, or use defaults
@@ -7638,6 +7785,69 @@ def index():
                 updateData();
             }
         });
+
+    // ── Token Monitor ──────────────────────────────────────────────────────
+    function fetchTokenHealth() {
+        fetch('/token_health')
+            .then(r => r.json())
+            .then(d => {
+                const dot   = document.getElementById('tm-dot');
+                const stats = document.getElementById('tm-stats');
+
+                if (!d.db_exists || d.error) {
+                    dot.className = 'tm-dot tm-err';
+                    stats.textContent = d.error || 'DB missing';
+                    stats.title = d.db_path || '';
+                    return;
+                }
+
+                // Determine overall health
+                const apiOk = d.api_ok === true;
+                const atOk  = d.access_token_valid === true;
+                const rtOk  = d.refresh_token_valid === true;
+                const rtWarn = d.refresh_token_age_days !== null && d.refresh_token_age_days > 5;
+
+                if (!atOk || !rtOk || !apiOk) {
+                    dot.className = 'tm-dot tm-err';
+                } else if (rtWarn) {
+                    dot.className = 'tm-dot tm-warn';
+                } else {
+                    dot.className = 'tm-dot tm-ok';
+                }
+
+                const atMins = d.access_token_age_minutes !== null ? d.access_token_age_minutes.toFixed(1) + 'm' : '?';
+                const rtDays = d.refresh_token_age_days   !== null ? d.refresh_token_age_days.toFixed(2)   + 'd' : '?';
+                const apiTxt = apiOk ? 'API ✓' : 'API ✗';
+
+                stats.textContent = `access ${atMins}  ·  refresh ${rtDays}  ·  ${apiTxt}`;
+                stats.title = d.api_message || '';
+            })
+            .catch(() => {
+                const dot = document.getElementById('tm-dot');
+                if (dot) { dot.className = 'tm-dot tm-err'; }
+                const stats = document.getElementById('tm-stats');
+                if (stats) { stats.textContent = 'unreachable'; }
+            });
+    }
+
+    function forceDeleteToken() {
+        if (!confirm('Delete the Schwab token file? You will need to restart the server to re-authenticate.')) return;
+        fetch('/token_delete', { method: 'POST' })
+            .then(r => r.json())
+            .then(d => {
+                if (d.success) {
+                    alert('Tokens cleared from: ' + d.db + '\\n\\n' + d.message);
+                    fetchTokenHealth();
+                } else {
+                    alert('Delete failed: ' + d.error);
+                }
+            })
+            .catch(err => alert('Request failed: ' + err));
+    }
+
+    // Fetch on load, then every 2 minutes
+    fetchTokenHealth();
+    setInterval(fetchTokenHealth, 120000);
     </script>
 </body>
 </html>
@@ -8036,6 +8246,114 @@ def price_stream(ticker):
             'Connection': 'keep-alive',
         }
     )
+
+
+def _get_token_db_path():
+    """Return the path to the TokenManager SQLite database."""
+    return os.path.expanduser(os.getenv('SCHWAB_TOKENS_DB', '~/.schwabdev/tokens.db'))
+
+
+def _read_token_db(db_path):
+    """Read token row from the SQLite DB. Returns dict or None."""
+    if not os.path.exists(db_path):
+        return None
+    with closing(sqlite3.connect(db_path)) as conn:
+        cur = conn.cursor()
+        row = cur.execute(
+            "SELECT access_token_issued, refresh_token_issued, access_token FROM schwabdev"
+        ).fetchone()
+    if not row:
+        return None
+    return {'access_token_issued': row[0], 'refresh_token_issued': row[1], 'access_token': row[2]}
+
+
+@app.route('/token_health')
+def token_health():
+    """Return Schwab token status and API connectivity check as JSON."""
+    import datetime as _dt
+    import requests as _requests
+
+    db_path = _get_token_db_path()
+    result = {
+        'db_path': db_path,
+        'db_exists': os.path.exists(db_path),
+        'access_token_age_minutes': None,
+        'access_token_valid': None,
+        'refresh_token_age_days': None,
+        'refresh_token_valid': None,
+        'api_ok': None,
+        'api_message': None,
+        'error': None,
+    }
+
+    try:
+        row = _read_token_db(db_path)
+        if row is None:
+            result['error'] = 'No token row found in DB'
+            return jsonify(result), 200
+
+        now = _dt.datetime.now(_dt.timezone.utc)
+        at_issued = _dt.datetime.fromisoformat(row['access_token_issued'])
+        rt_issued = _dt.datetime.fromisoformat(row['refresh_token_issued'])
+        if at_issued.tzinfo is None:
+            at_issued = at_issued.replace(tzinfo=_dt.timezone.utc)
+        if rt_issued.tzinfo is None:
+            rt_issued = rt_issued.replace(tzinfo=_dt.timezone.utc)
+
+        at_age_min = (now - at_issued).total_seconds() / 60
+        rt_age_days = (now - rt_issued).total_seconds() / 86400
+
+        result['access_token_age_minutes'] = round(at_age_min, 2)
+        result['access_token_valid'] = at_age_min < 30
+        result['refresh_token_age_days'] = round(rt_age_days, 4)
+        result['refresh_token_valid'] = rt_age_days < 7
+
+        # Live API test using the stored access token
+        access_token = row.get('access_token', '')
+        if access_token:
+            try:
+                resp = _requests.get(
+                    'https://api.schwabapi.com/trader/v1/accounts/accountNumbers',
+                    headers={'Authorization': f'Bearer {access_token}'},
+                    timeout=10,
+                )
+                if resp.ok:
+                    result['api_ok'] = True
+                    result['api_message'] = f'API OK ({resp.status_code})'
+                else:
+                    result['api_ok'] = False
+                    result['api_message'] = f'API {resp.status_code}: {resp.text[:120]}'
+            except Exception as api_err:
+                result['api_ok'] = False
+                result['api_message'] = f'API error: {str(api_err)[:120]}'
+        else:
+            result['api_ok'] = False
+            result['api_message'] = 'No access token stored'
+
+    except Exception as e:
+        result['error'] = str(e)
+        return jsonify(result), 500
+
+    return jsonify(result)
+
+
+@app.route('/token_delete', methods=['POST'])
+def token_delete():
+    """Clear all rows from the token DB so the next TokenManager run re-authenticates."""
+    db_path = _get_token_db_path()
+    if not os.path.exists(db_path):
+        return jsonify({'success': False, 'error': f'Token DB not found: {db_path}'})
+    try:
+        with closing(sqlite3.connect(db_path)) as conn:
+            conn.execute("DELETE FROM schwabdev")
+            conn.commit()
+        return jsonify({
+            'success': True,
+            'db': db_path,
+            'message': 'Token rows cleared. Run your token getter script to re-authenticate.'
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 
 if __name__ == '__main__':
