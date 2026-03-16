@@ -8354,7 +8354,7 @@ def token_health():
 
 @app.route('/token_delete', methods=['POST'])
 def token_delete():
-    """Clear all rows from the token DB so the next TokenManager run re-authenticates."""
+    """Clear all rows from the token DB and null out in-memory client tokens (logout)."""
     db_path = _get_token_db_path()
     if not os.path.exists(db_path):
         return jsonify({'success': False, 'error': f'Token DB not found: {db_path}'})
@@ -8362,10 +8362,20 @@ def token_delete():
         with closing(sqlite3.connect(db_path)) as conn:
             conn.execute("DELETE FROM schwabdev")
             conn.commit()
+
+        # Null out in-memory tokens on the schwabdev client so it can't make API calls
+        if client is not None:
+            import datetime as _dt
+            client.tokens.access_token = None
+            client.tokens.refresh_token = None
+            client.tokens.id_token = None
+            client.tokens._access_token_issued = _dt.datetime.min.replace(tzinfo=_dt.timezone.utc)
+            client.tokens._refresh_token_issued = _dt.datetime.min.replace(tzinfo=_dt.timezone.utc)
+
         return jsonify({
             'success': True,
             'db': db_path,
-            'message': 'Token rows cleared. Run your token getter script to re-authenticate.'
+            'message': 'Logged out. Run your token getter script to re-authenticate.'
         })
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
