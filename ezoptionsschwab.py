@@ -356,6 +356,10 @@ UPDATE_INTERVAL = 1  # seconds
 current_ticker = None
 current_expiry = None
 
+# Cache for last fetched options data per ticker — used by /update_price
+# so the price chart can refresh independently without re-fetching the full chain.
+_options_cache = {}  # ticker -> {'calls': DataFrame, 'puts': DataFrame, 'S': float}
+
 # Initialize Schwab client
 try:
     client = schwabdev.Client(
@@ -383,6 +387,13 @@ class PriceStreamer:
         """Parse raw schwabdev stream message and push candle/quote data to queues."""
         try:
             data = json.loads(message) if isinstance(message, str) else message
+            # Schwab wraps every data message in {"data": [...]}; unwrap it so
+            # we can iterate over individual service messages directly.
+            if isinstance(data, dict):
+                if 'data' in data:
+                    data = data['data']
+                else:
+                    return  # login/response/notify envelope – nothing to forward
             if not isinstance(data, list):
                 data = [data]
             for msg in data:
@@ -5254,6 +5265,7 @@ def index():
         let putColor = '#FF0000';
         let maxLevelColor = '#800080';
         let lastData = {}; // Store last received data
+        let lastPriceData = null; // Price chart data stored separately (fetched via /update_price)
         let updateInProgress = false;
         let isStreaming = true;
         let savedScrollPosition = 0; // Track scroll position
@@ -5817,11 +5829,132 @@ def index():
     if(isFirstRender||tvAutoRange){fitAll();isFirstRender=false;}
   }
 
-  // ── Entry point called by parent page ─────────────────────────────────────
+  // ── Real-time quote / candle application ─────────────────────────────────
+  function applyRealtimeQuote(last){
+    if(!tvCandle||!tvLastCandles.length)return;
+    var nowSec=Math.floor(Date.now()/1000);
+    var minuteStart=Math.floor(nowSec/60)*60;
+    var lc=tvLastCandles[tvLastCandles.length-1];
+    if(lc.time===minuteStart){
+      var updated={time:lc.time,open:lc.open,high:Math.max(lc.high,last),low:Math.min(lc.low,last),close:last,volume:lc.volume||0};
+      try{tvCandle.update(updated);}catch(e){}
+      tvLastCandles[tvLastCandles.length-1]=updated;
+    }else if(minuteStart>lc.time){
+      var newC={time:minuteStart,open:last,high:last,low:last,close:last,volume:0};
+      try{tvCandle.update(newC);}catch(e){}
+      tvLastCandles.push(newC);
+    }
+  }
+  function applyRealtimeCandle(candle){
+    if(!tvCandle)return;
+    var c={time:candle.time,open:candle.open,high:candle.high,low:candle.low,close:candle.close,volume:candle.volume||0};
+    try{tvCandle.update(c);}catch(e){}
+    var idx=tvLastCandles.findIndex(function(x){return x.time===c.time;});
+    if(idx>=0){tvLastCandles[idx]=c;}else{tvLastCandles.push(c);tvLastCandles.sort(function(a,b){return a.time-b.time;});}
+    if(activeInds.size>0)applyIndicators(tvLastCandles);
+  }
+
+  // ── SSE price stream ───────────────────────────────────────────────────────
+  var popoutEvtSource=null,popoutSseTicker=null;
+  function connectPopoutStream(ticker){
+    if(!ticker)return;
+    var upper=ticker.toUpperCase();
+    if(popoutEvtSource&&popoutSseTicker===upper&&popoutEvtSource.readyState!==2)return;
+    if(popoutEvtSource){try{popoutEvtSource.close();}catch(e){}}
+    popoutEvtSource=new EventSource('/price_stream/'+encodeURIComponent(upper));
+    popoutSseTicker=upper;
+    popoutEvtSource.onmessage=function(ev){
+      try{
+        var msg=JSON.parse(ev.data);
+        if(msg.type==='quote'&&typeof msg.last==='number'){applyRealtimeQuote(msg.last);}
+        else if(msg.type==='candle'&&msg.time){applyRealtimeCandle(msg);}
+      }catch(e){}
+    };
+    popoutEvtSource.onerror=function(){console.debug('[Popout] SSE error – browser will retry.');};
+  }
+
+  // ── Initial candle load + settings helpers ────────────────────────────────
+  var popoutFetching=false,popoutCurrentTicker=null;
+  function getSettingsFromOpener(){
+    try{
+      var op=window.opener;if(!op||op.closed)return null;
+      var d=op.document;
+      function val(id){var el=d.getElementById(id);return el?el.value:null;}
+      function chk(id){var el=d.getElementById(id);return el?el.checked:false;}
+      var ticker=val('ticker');if(!ticker)return null;
+      var levelsTypes=[];
+      try{levelsTypes=Array.from(d.querySelectorAll('.levels-option input:checked')).map(function(cb){return cb.value;});}catch(e){}
+      return{ticker:ticker,timeframe:val('timeframe')||'1',call_color:val('call_color')||'#00ff00',put_color:val('put_color')||'#ff0000',levels_types:levelsTypes,levels_count:parseInt(val('levels_count'))||3,use_heikin_ashi:chk('use_heikin_ashi'),strike_range:parseFloat(val('strike_range'))/100||0.1,highlight_max_level:chk('highlight_max_level'),max_level_color:val('max_level_color')||'#800080',coloring_mode:val('coloring_mode')||'Linear Intensity'};
+    }catch(e){return null;}
+  }
+  function loadInitialData(){
+    if(popoutFetching)return;
+    var settings=getSettingsFromOpener();
+    if(!settings||!settings.ticker)return;
+    popoutFetching=true;
+    fetch('/update_price',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(settings)})
+      .then(function(r){return r.json();})
+      .then(function(data){
+        if(!data.error&&data.price){
+          renderPriceChart(typeof data.price==='string'?JSON.parse(data.price):data.price);
+        }
+        // Connect SSE after we have the initial candle history
+        connectPopoutStream(settings.ticker);
+      })
+      .catch(function(e){console.warn('Popout initial load error:',e);connectPopoutStream(settings.ticker);})
+      .finally(function(){popoutFetching=false;});
+  }
+
+  // ── Ticker-change watcher (lightweight DOM read only) ─────────────────────
+  // Reconnects SSE and reloads candle history whenever the ticker changes.
+  // Exposure levels are refreshed periodically since options data changes.
+  var popoutExpLevelTimer=null;
+  function tickerWatchLoop(){
+    var settings=getSettingsFromOpener();
+    var ticker=settings?settings.ticker:null;
+    if(ticker&&ticker!==popoutCurrentTicker){
+      popoutCurrentTicker=ticker;
+      loadInitialData();
+    }
+  }
+  // Refresh exposure levels every 60 s (options cache updated by main /update cycle)
+  function refreshExposureLevels(){
+    if(popoutFetching||!popoutCurrentTicker)return;
+    var settings=getSettingsFromOpener();
+    if(!settings)return;
+    popoutFetching=true;
+    fetch('/update_price',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(settings)})
+      .then(function(r){return r.json();})
+      .then(function(data){
+        if(!data.error&&data.price){
+          var pd=typeof data.price==='string'?JSON.parse(data.price):data.price;
+          // Only refresh price lines (exposure levels + expected moves), not candles
+          if(tvCandle){
+            tvPriceLines.forEach(function(l){try{tvCandle.removePriceLine(l);}catch(e){}});
+            tvPriceLines=[];tvAllLevelPrices=[];
+            (pd.exposure_levels||[]).forEach(function(lv){tvAllLevelPrices.push(lv.price);tvPriceLines.push(tvCandle.createPriceLine({price:lv.price,color:lv.color,lineWidth:lv.line_width||1,lineStyle:lineStyleMap[lv.dash_style]||LightweightCharts.LineStyle.Dashed,axisLabelVisible:true,title:lv.label}));});
+            (pd.expected_moves||[]).forEach(function(em){tvAllLevelPrices.push(em.upper,em.lower);tvPriceLines.push(tvCandle.createPriceLine({price:em.upper,color:'#036bfc',lineWidth:2,lineStyle:LightweightCharts.LineStyle.Dashed,axisLabelVisible:true,title:'EM+'}));tvPriceLines.push(tvCandle.createPriceLine({price:em.lower,color:'#036bfc',lineWidth:2,lineStyle:LightweightCharts.LineStyle.Dashed,axisLabelVisible:true,title:'EM-'}));});
+            tvApplyAutoscale();
+          }
+        }
+      })
+      .catch(function(e){console.warn('Popout exposure refresh error:',e);})
+      .finally(function(){popoutFetching=false;});
+  }
+
+  // Kick off: initial load then watch for ticker changes every 3 s
+  setTimeout(function(){
+    loadInitialData();
+    setInterval(tickerWatchLoop,3000);
+    setInterval(refreshExposureLevels,60000);
+  },300);
+
+  // Entry point kept for compatibility with pushDataToPopout
   window.updatePopoutChart=function(priceDataJSON){
     try{var priceData=typeof priceDataJSON==='string'?JSON.parse(priceDataJSON):priceDataJSON;if(!priceData||priceData.error)return;renderPriceChart(priceData);}catch(e){console.error('Popout price chart error:',e);}
   };
   window.addEventListener('resize',function(){if(tvChart&&tvAutoRange){try{tvChart.timeScale().fitContent();}catch(e){}}});
+  window.addEventListener('beforeunload',function(){if(popoutEvtSource){try{popoutEvtSource.close();}catch(e){}}});
 <\\/script></body></html>`);
             } else {
                 popup.document.write(`<!DOCTYPE html>
@@ -5894,7 +6027,8 @@ def index():
 
             // Determine the data key from chart id  (e.g. 'gamma-chart' -> 'gamma', 'price-chart' -> 'price')
             const dataKey = chartId.replace('-chart', '');
-            const chartPayload = lastData[dataKey];
+            // Price data is stored separately since it's fetched via /update_price
+            const chartPayload = (dataKey === 'price') ? lastPriceData : lastData[dataKey];
             if (!chartPayload) return;
 
             const isHtml = (dataKey === 'large_trades');
@@ -6021,9 +6155,10 @@ def index():
             updateInProgress = true;
             
             const ticker = document.getElementById('ticker').value;
+            const tickerChanged = tvLastTicker !== null && ticker.toUpperCase() !== tvLastTicker.toUpperCase();
 
             // Reset chart state when the ticker changes
-            if (tvLastTicker !== null && ticker.toUpperCase() !== tvLastTicker.toUpperCase()) {
+            if (tickerChanged) {
                 // Clear drawings
                 tvClearDrawings();
                 tvDrawingDefs = [];
@@ -6086,6 +6221,27 @@ def index():
                 show_premium: document.getElementById('premium').checked,
                 show_centroid: document.getElementById('centroid').checked
             };
+
+            // Common payload fields shared by both requests
+            const sharedPayload = {
+                ticker,
+                timeframe: document.getElementById('timeframe').value,
+                call_color: callColor,
+                put_color: putColor,
+                levels_types: levelsTypes,
+                levels_count: levelsCount,
+                use_heikin_ashi: useHeikinAshi,
+                strike_range: strikeRange,
+                highlight_max_level: highlightMaxLevel,
+                max_level_color: maxLevelColor,
+                coloring_mode: coloringMode
+            };
+
+            // Fetch price history: immediate on ticker/settings change, throttled to 30s otherwise.
+            // Real-time candle ticks come from SSE (connectPriceStream), not from polling.
+            if (visibleCharts.show_price) {
+                fetchPriceHistory(tickerChanged || !tvLastCandles.length);
+            }
             
             fetch('/update', {
                 method: 'POST',
@@ -6117,6 +6273,7 @@ def index():
                     max_level_color: maxLevelColor,
                     max_level_mode: maxLevelMode,
                     absolute_gex: gexAbsolute,
+                    show_price: false,  // price is fetched independently via /update_price
                     ...visibleCharts
                 })
             })
@@ -6136,6 +6293,13 @@ def index():
                     lastData = data;  // Update before rendering so popout windows get fresh data
                     updateCharts(data);
                     updatePriceInfo(data.price_info);
+                }
+                // Options cache is now populated — refresh price levels immediately.
+                // This fixes the delay where levels were missing right after a ticker change
+                // because /update_price fired before the options chain was cached.
+                if (document.getElementById('price').checked) {
+                    _priceHistoryLastKey = ''; // force cache-miss so fetchPriceHistory re-fetches
+                    fetchPriceHistory(true);
                 }
             })
             .catch(error => {
@@ -6965,6 +7129,90 @@ def index():
             }
         }
         // ─────────────────────────────────────────────────────────────────────
+
+        // Standalone price chart renderer — called by /update_price without touching other charts.
+        function applyPriceData(priceJson) {
+            if (!document.getElementById('price').checked) return;
+            lastPriceData = priceJson; // keep for popout push
+            let priceContainer = document.querySelector('.price-chart-container');
+            if (!priceContainer) {
+                priceContainer = document.createElement('div');
+                priceContainer.className = 'price-chart-container';
+                const toolbarContainer = document.createElement('div');
+                toolbarContainer.className = 'tv-toolbar-container';
+                toolbarContainer.id = 'tv-toolbar-container';
+                const chartDiv = document.createElement('div');
+                chartDiv.className = 'chart-container';
+                chartDiv.id = 'price-chart';
+                const rsiPane = document.createElement('div');
+                rsiPane.className = 'tv-sub-pane'; rsiPane.id = 'rsi-pane'; rsiPane.style.display = 'none';
+                rsiPane.innerHTML = '<div class="tv-sub-pane-header">RSI 14</div><div id="rsi-chart" style="height:110px"></div>';
+                const macdPane = document.createElement('div');
+                macdPane.className = 'tv-sub-pane'; macdPane.id = 'macd-pane'; macdPane.style.display = 'none';
+                macdPane.innerHTML = '<div class="tv-sub-pane-header">MACD (12,26,9)</div><div id="macd-chart" style="height:120px"></div>';
+                priceContainer.appendChild(toolbarContainer);
+                priceContainer.appendChild(chartDiv);
+                priceContainer.appendChild(rsiPane);
+                priceContainer.appendChild(macdPane);
+                document.getElementById('chart-grid').insertBefore(priceContainer, document.getElementById('chart-grid').firstChild);
+            }
+            priceContainer.style.display = 'block';
+            const parsed = typeof priceJson === 'string' ? JSON.parse(priceJson) : priceJson;
+            if (!parsed.error) {
+                renderTVPriceChart(parsed);
+            }
+        }
+
+        // ── Throttled price history fetcher ───────────────────────────────────
+        // Fetches candle history + exposure levels from /update_price.
+        // Real-time ticks come from SSE; this only handles the historical snapshot
+        // and exposure level overlays, so it runs at most every 30 seconds unless
+        // forced (ticker change or visible settings change).
+        let _priceHistoryLastMs = 0;
+        let _priceHistoryLastKey = '';
+        let _priceHistoryInFlight = false;
+
+        function buildPricePayload() {
+            return {
+                ticker: document.getElementById('ticker').value,
+                timeframe: document.getElementById('timeframe').value,
+                call_color: callColor,
+                put_color: putColor,
+                levels_types: Array.from(document.querySelectorAll('.levels-option input:checked')).map(cb => cb.value),
+                levels_count: parseInt(document.getElementById('levels_count').value),
+                use_heikin_ashi: document.getElementById('use_heikin_ashi').checked,
+                strike_range: parseFloat(document.getElementById('strike_range').value) / 100,
+                highlight_max_level: document.getElementById('highlight_max_level').checked,
+                max_level_color: maxLevelColor,
+                coloring_mode: document.getElementById('coloring_mode').value,
+            };
+        }
+
+        function fetchPriceHistory(force) {
+            if (!document.getElementById('price').checked) return;
+            if (_priceHistoryInFlight) return;
+            const payload = buildPricePayload();
+            const key = JSON.stringify(payload);
+            const now = Date.now();
+            // Skip if nothing changed and it's been less than 30 seconds
+            if (!force && key === _priceHistoryLastKey && now - _priceHistoryLastMs < 30000) return;
+            _priceHistoryLastMs = now;
+            _priceHistoryLastKey = key;
+            _priceHistoryInFlight = true;
+            fetch('/update_price', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: key
+            })
+            .then(r => r.json())
+            .then(priceResp => {
+                if (!priceResp.error && priceResp.price) {
+                    applyPriceData(priceResp.price);
+                }
+            })
+            .catch(err => console.error('Error fetching price chart:', err))
+            .finally(() => { _priceHistoryInFlight = false; });
+        }
 
         function updateCharts(data) {
             // Save scroll position before any DOM changes
@@ -7917,6 +8165,9 @@ def update():
         S = get_current_price(ticker)
         if S is None:
             return jsonify({'error': 'Could not fetch current price'})
+
+        # Cache options data so /update_price can use it without re-fetching
+        _options_cache[ticker] = {'calls': calls.copy(), 'puts': puts.copy(), 'S': S}
         
         # Get strike range
         strike_range = float(data.get('strike_range', 0.1))
@@ -7962,9 +8213,8 @@ def update():
         # Get timeframe from request
         timeframe = int(data.get('timeframe', 1))
 
-        # Get fresh price data
-        price_data = get_price_history(ticker, timeframe=timeframe)
-        
+        # NOTE: price chart is handled separately by /update_price
+
         # Calculate volumes and other metrics
         use_range = data.get('use_range', False)  # Rename to use_range for clarity
         strike_range = float(data.get('strike_range', 0.1))
@@ -8017,22 +8267,8 @@ def update():
         response = {}
         
         # Create charts based on visibility settings
-        if data.get('show_price', True):
-            response['price'] = prepare_price_chart_data(
-                price_data=price_data,
-                calls=calls,
-                puts=puts,
-                exposure_levels_types=exposure_levels_types,
-                exposure_levels_count=exposure_levels_count,
-                call_color=call_color,
-                put_color=put_color,
-                strike_range=strike_range,
-                use_heikin_ashi=use_heikin_ashi,
-                highlight_max_level=highlight_max_level,
-                max_level_color=max_level_color,
-                coloring_mode=coloring_mode
-            )
-        
+        # NOTE: price chart is handled by /update_price (separate concurrent request)
+
         if data.get('show_gex_historical_bubble', True):
             # Accept either 'gex_absolute' (old key) or 'absolute_gex' (JS payload) for compatibility
             absolute_gex = bool(data.get('gex_absolute', data.get('absolute_gex', False)))
@@ -8200,6 +8436,59 @@ def update():
         import traceback
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
+
+@app.route('/update_price', methods=['POST'])
+def update_price():
+    """Lightweight endpoint that returns only the price chart data.
+    Runs concurrently with /update so the price chart is never blocked
+    by the heavier options-chain computations.
+    """
+    data = request.get_json()
+    ticker = data.get('ticker')
+    ticker = format_ticker(ticker)
+    if not ticker:
+        return jsonify({'error': 'Missing ticker'}), 400
+    try:
+        timeframe = int(data.get('timeframe', 1))
+        call_color = data.get('call_color', '#00ff00')
+        put_color = data.get('put_color', '#ff0000')
+        exposure_levels_types = data.get('levels_types', [])
+        exposure_levels_count = int(data.get('levels_count', 3))
+        strike_range = float(data.get('strike_range', 0.1))
+        use_heikin_ashi = data.get('use_heikin_ashi', False)
+        highlight_max_level = data.get('highlight_max_level', False)
+        max_level_color = data.get('max_level_color', '#800080')
+        coloring_mode = data.get('coloring_mode', 'Linear Intensity')
+
+        price_data = get_price_history(ticker, timeframe=timeframe)
+
+        # Use the most recently cached options data for exposure overlays.
+        # If no cache exists yet the chart renders without overlays and
+        # will gain them after the first /update completes.
+        cached = _options_cache.get(ticker, {})
+        calls = cached.get('calls')
+        puts = cached.get('puts')
+
+        price_chart = prepare_price_chart_data(
+            price_data=price_data,
+            calls=calls,
+            puts=puts,
+            exposure_levels_types=exposure_levels_types,
+            exposure_levels_count=exposure_levels_count,
+            call_color=call_color,
+            put_color=put_color,
+            strike_range=strike_range,
+            use_heikin_ashi=use_heikin_ashi,
+            highlight_max_level=highlight_max_level,
+            max_level_color=max_level_color,
+            coloring_mode=coloring_mode
+        )
+        return jsonify({'price': price_chart})
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
 
 @app.route('/save_settings', methods=['POST'])
 def save_settings():
