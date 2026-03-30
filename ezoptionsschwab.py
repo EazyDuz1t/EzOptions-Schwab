@@ -2095,6 +2095,29 @@ def update_options_chain(ticker, expiration_date=None):
     except Exception as e:
         print(f"Error updating options chain: {e}")
 
+def aggregate_to_hourly(candles):
+    """Aggregate sub-hourly candles to 1-hour candles aligned to ET hour boundaries."""
+    tz = pytz.timezone('US/Eastern')
+    hourly = {}
+    for candle in candles:
+        et = datetime.fromtimestamp(candle['datetime'] / 1000, tz)
+        hour_key = et.replace(minute=0, second=0, microsecond=0)
+        if hour_key not in hourly:
+            hourly[hour_key] = []
+        hourly[hour_key].append(candle)
+    result = []
+    for hour_key in sorted(hourly.keys()):
+        group = hourly[hour_key]
+        result.append({
+            'datetime': group[0]['datetime'],
+            'open': group[0]['open'],
+            'high': max(c['high'] for c in group),
+            'low': min(c['low'] for c in group),
+            'close': group[-1]['close'],
+            'volume': sum(c.get('volume', 0) for c in group)
+        })
+    return result
+
 def get_price_history(ticker, timeframe=1):
     if ticker == "MARKET":
         ticker = "$SPX"
@@ -2109,13 +2132,17 @@ def get_price_history(ticker, timeframe=1):
         start_date = datetime.combine(current_date - timedelta(days=5), datetime.min.time())
         end_date = datetime.combine(current_date + timedelta(days=1), datetime.min.time())
         
+        # Schwab API only supports minute frequencies: 1, 5, 10, 15, 30.
+        # For 60-min (hourly), fetch 30-min candles and aggregate after.
+        api_frequency = 30 if timeframe == 60 else timeframe
+
         # Convert dates to milliseconds since epoch
         response = client.price_history(
             symbol=ticker,
             periodType="day",
             period=5,  # Get 5 days of data
             frequencyType="minute",
-            frequency=timeframe,
+            frequency=api_frequency,
             startDate=int(start_date.timestamp() * 1000),
             endDate=int(end_date.timestamp() * 1000),
             needExtendedHoursData=True
@@ -2135,6 +2162,10 @@ def get_price_history(ticker, timeframe=1):
 
         # Sort candles by timestamp
         candles.sort(key=lambda x: x['datetime'])
+
+        # Aggregate to hourly candles if requested
+        if timeframe == 60:
+            candles = aggregate_to_hourly(candles)
 
         # Get previous trading day's close
         prev_day_candles = []
@@ -4607,6 +4638,27 @@ def index():
         }
         /* Drawing mode cursor */
         #price-chart.draw-mode > canvas { cursor: crosshair !important; }
+        /* OHLC hover tooltip */
+        .tv-ohlc-tooltip {
+            position: absolute;
+            top: 8px;
+            left: 8px;
+            z-index: 50;
+            font-size: 11px;
+            font-family: 'Courier New', monospace;
+            color: #ccc;
+            pointer-events: none;
+            white-space: nowrap;
+            width: auto !important;
+            height: auto !important;
+            max-width: none !important;
+            flex: none !important;
+            display: none;
+            line-height: 1.6;
+        }
+        .tv-ohlc-tooltip .tt-time { color: #aaa; font-size: 10px; margin-bottom: 2px; }
+        .tv-ohlc-tooltip .tt-up   { color: #00FF00; }
+        .tv-ohlc-tooltip .tt-dn   { color: #FF4444; }
         /* Candle close timer */
         .candle-close-timer {
             font-size: 11px;
@@ -5678,6 +5730,10 @@ def index():
   .ind-swatch { width:14px; height:3px; border-radius:2px; }
   .title-el { display:inline-block; color:#ccc; font-size:13px; font-weight:bold; padding:2px 8px; pointer-events:none; }
   .candle-close-timer { font-size:11px; font-family:'Courier New',monospace; padding:3px 7px; border-radius:4px; background:#2a2a2a; border:1px solid #444; color:#ccc; white-space:nowrap; user-select:none; letter-spacing:0.5px; }
+  .tv-ohlc-tooltip { position:absolute; top:8px; left:8px; z-index:50; font-size:11px; font-family:'Courier New',monospace; color:#ccc; pointer-events:none; white-space:nowrap; width:max-content; display:none; line-height:1.6; }
+  .tv-ohlc-tooltip .tt-time { color:#aaa; font-size:10px; margin-bottom:2px; }
+  .tv-ohlc-tooltip .tt-up { color:#00FF00; }
+  .tv-ohlc-tooltip .tt-dn { color:#FF4444; }
 </style></head><body>
 <div id="popout-logo">EzDuz1t Options</div>
 <div id="toolbar">
@@ -5855,6 +5911,23 @@ def index():
       tvChart.priceScale('volume').applyOptions({scaleMargins:{top:0.88,bottom:0}});
       document.getElementById('chart-title').textContent=priceData.use_heikin_ashi?'Price Chart (Heikin-Ashi)':'Price Chart';
       buildToolbar(candles,upColor,downColor);
+      // ── OHLC hover tooltip ──────────────────────────────────────────────
+      var _ptip=document.createElement('div');_ptip.className='tv-ohlc-tooltip';_ptip.id='tv-ohlc-tooltip';el.appendChild(_ptip);
+      tvChart.subscribeCrosshairMove(function(param){
+        var tip=document.getElementById('tv-ohlc-tooltip');if(!tip)return;
+        if(!param||!param.time||!param.seriesData){tip.style.display='none';return;}
+        var bar=param.seriesData.get(tvCandle);if(!bar){tip.style.display='none';return;}
+        var d=new Date(param.time*1000);
+        var ts=d.toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit',hour12:false,timeZone:'America/New_York'})+' ET';
+        var cls=bar.close>=bar.open?'tt-up':'tt-dn';
+        var chg=bar.open!==0?((bar.close-bar.open)/bar.open*100).toFixed(2):'0.00';
+        var fmt=function(v){return v!=null?v.toFixed(2):'--';};
+        var fv=function(v){return v>=1e6?(v/1e6).toFixed(2)+'M':v>=1e3?(v/1e3).toFixed(0)+'K':(v||0).toString();};
+        tip.innerHTML='<div class="tt-time">'+ts+'</div>'
+          +'<span class="'+cls+'">O <b>'+fmt(bar.open)+'</b>  H <b>'+fmt(bar.high)+'</b>  L <b>'+fmt(bar.low)+'</b>  C <b>'+fmt(bar.close)+'</b>  '+(chg>=0?'+':'')+chg+'%</span>'
+          +'<br><span style="color:#888">Vol <b>'+fv(bar.volume)+'</b></span>';
+        tip.style.display='block';
+      });
     } else {
       tvCandle.applyOptions({upColor:upColor,downColor:downColor,wickUpColor:upColor,wickDownColor:downColor});
     }
@@ -7143,6 +7216,40 @@ def index():
                     titleEl.textContent = priceData.use_heikin_ashi ? 'Price Chart (Heikin-Ashi)' : 'Price Chart';
                     _tc2.insertBefore(titleEl, _tc2.firstChild);
                 }
+
+                // ── OHLC hover tooltip ────────────────────────────────────
+                const _tip = document.createElement('div');
+                _tip.className = 'tv-ohlc-tooltip';
+                _tip.id = 'tv-ohlc-tooltip';
+                container.appendChild(_tip);
+
+                tvPriceChart.subscribeCrosshairMove(function(param) {
+                    const tip = document.getElementById('tv-ohlc-tooltip');
+                    if (!tip) return;
+                    if (!param || !param.time || !param.seriesData) {
+                        tip.style.display = 'none'; return;
+                    }
+                    const bar = param.seriesData.get(tvCandleSeries);
+                    if (!bar) { tip.style.display = 'none'; return; }
+                    const d = new Date(param.time * 1000);
+                    const timeStr = d.toLocaleTimeString('en-US', {hour:'2-digit',minute:'2-digit',hour12:false,timeZone:'America/New_York'}) + ' ET';
+                    const isUp = bar.close >= bar.open;
+                    const cls = isUp ? 'tt-up' : 'tt-dn';
+                    const chg = bar.open !== 0 ? ((bar.close - bar.open) / bar.open * 100).toFixed(2) : '0.00';
+                    const fmt = v => v != null ? v.toFixed(2) : '--';
+                    const fmtVol = v => v >= 1e6 ? (v/1e6).toFixed(2)+'M' : v >= 1e3 ? (v/1e3).toFixed(0)+'K' : (v||0).toString();
+                    tip.innerHTML =
+                        '<div class="tt-time">'+timeStr+'</div>'
+                        +'<span class="'+cls+'">'
+                        +'O <b>'+fmt(bar.open)+'</b>  '
+                        +'H <b>'+fmt(bar.high)+'</b>  '
+                        +'L <b>'+fmt(bar.low)+'</b>  '
+                        +'C <b>'+fmt(bar.close)+'</b>  '
+                        +(chg>=0?'+':'')+chg+'%'
+                        +'</span>'
+                        +'<br><span style="color:#888">Vol <b>'+fmtVol(bar.volume)+'</b></span>';
+                    tip.style.display = 'block';
+                });
             }
 
             // ── Every render: update data and overlays in place ───────────────
