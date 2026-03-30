@@ -4607,6 +4607,19 @@ def index():
         }
         /* Drawing mode cursor */
         #price-chart.draw-mode > canvas { cursor: crosshair !important; }
+        /* Candle close timer */
+        .candle-close-timer {
+            font-size: 11px;
+            font-family: 'Courier New', monospace;
+            padding: 3px 7px;
+            border-radius: 4px;
+            background: #2a2a2a;
+            border: 1px solid #444;
+            color: #ccc;
+            white-space: nowrap;
+            user-select: none;
+            letter-spacing: 0.5px;
+        }
         .price-info {
             display: flex;
             gap: 15px;
@@ -5311,6 +5324,8 @@ def index():
         let priceStreamTicker = null;
         // Debounce timer for indicator refresh on intra-minute quote ticks
         let tvIndicatorRefreshTimer = null;
+        // Candle close countdown timer
+        let candleCloseTimerInterval = null;
         // Live price from the streamer (null until first quote arrives)
         let livePrice = null;
         // Debounce timer for Plotly price-line updates (avoid flooding relayout calls)
@@ -5662,6 +5677,7 @@ def index():
   .ind-item { font-size:10px; color:#ccc; display:flex; align-items:center; gap:4px; }
   .ind-swatch { width:14px; height:3px; border-radius:2px; }
   .title-el { display:inline-block; color:#ccc; font-size:13px; font-weight:bold; padding:2px 8px; pointer-events:none; }
+  .candle-close-timer { font-size:11px; font-family:'Courier New',monospace; padding:3px 7px; border-radius:4px; background:#2a2a2a; border:1px solid #444; color:#ccc; white-space:nowrap; user-select:none; letter-spacing:0.5px; }
 </style></head><body>
 <div id="popout-logo">EzDuz1t Options</div>
 <div id="toolbar">
@@ -5688,6 +5704,28 @@ def index():
   var tvSyncHandlers=[], tvSyncingTS=false;
   var drawColor='#FFD700';
   var lineStyleMap={};
+  var popoutTimeframe=1;
+  var popoutCandleTimerInterval=null;
+
+  // ── Candle close timer (popout) ────────────────────────────────────────────
+  function startCandleCloseTimer(){
+    if(popoutCandleTimerInterval)clearInterval(popoutCandleTimerInterval);
+    function upd(){
+      var el=document.getElementById('candle-close-timer');if(!el){clearInterval(popoutCandleTimerInterval);return;}
+      var tfSecs=popoutTimeframe*60;
+      var now=new Date();
+      var fmt=new Intl.DateTimeFormat('en-US',{timeZone:'America/New_York',hour:'numeric',minute:'numeric',second:'numeric',hour12:false});
+      var h=0,m2=0,s2=0;
+      fmt.formatToParts(now).forEach(function(p){if(p.type==='hour')h=parseInt(p.value);else if(p.type==='minute')m2=parseInt(p.value);else if(p.type==='second')s2=parseInt(p.value);});
+      var sec=h*3600+m2*60+s2;
+      var rem=tfSecs-(sec%tfSecs);
+      var mm=Math.floor(rem/60),ss=rem%60;
+      el.textContent='\u23F1 '+mm+':'+(ss<10?'0':'')+ss;
+      el.className='candle-close-timer';
+    }
+    upd();
+    popoutCandleTimerInterval=setInterval(upd,1000);
+  }
 
   // ── Math helpers ───────────────────────────────────────────────────────────
   function calcSMA(c,p){return c.map(function(_,i){if(i<p-1)return null;var s=c.slice(i-p+1,i+1);return s.reduce(function(a,b){return a+b;},0)/p;});}
@@ -5795,6 +5833,8 @@ def index():
     var arBtn=btn(tvAutoRange?'⤢ AR ON':'⤢ AR OFF','Toggle auto-range',function(){tvAutoRange=!tvAutoRange;arBtn.textContent=tvAutoRange?'⤢ AR ON':'⤢ AR OFF';arBtn.classList.toggle('active',tvAutoRange);if(tvChart)fitAll();},tvAutoRange?'active':'');
     tb.appendChild(arBtn);
     tb.appendChild(btn('⟳ Reset','Fit all data',fitAll));
+    var timerEl=document.createElement('span');timerEl.id='candle-close-timer';timerEl.className='candle-close-timer';timerEl.title='Time remaining until the current candle closes';timerEl.textContent='\u23F1 --:--';tb.appendChild(timerEl);
+    startCandleCloseTimer();
     if(tvChart)tvChart.subscribeClick(handleClick);
   }
   function tvApplyAutoscale(){if(!tvCandle)return;var lp=tvAllLevelPrices.slice();tvCandle.applyOptions({autoscaleInfoProvider:function(original){var res=original();if(!res)return res;if(lp.length===0)return res;var pad=(res.priceRange.maxValue-res.priceRange.minValue)*0.05;var minV=Math.min.apply(null,[res.priceRange.minValue].concat(lp))-pad;var maxV=Math.max.apply(null,[res.priceRange.maxValue].concat(lp))+pad;return{priceRange:{minValue:minV,maxValue:maxV},margins:res.margins};}});}
@@ -5805,6 +5845,7 @@ def index():
   function renderPriceChart(priceData){
     var candles=priceData.candles||[];
     var upColor=priceData.call_color||'#00FF00',downColor=priceData.put_color||'#FF0000';
+    popoutTimeframe=parseInt(priceData.timeframe)||1;
     lineStyleMap={dashed:LightweightCharts.LineStyle.Dashed,dotted:LightweightCharts.LineStyle.Dotted,large_dashed:LightweightCharts.LineStyle.LargeDashed};
     if(!tvChart){
       var el=document.getElementById('price-chart');
@@ -6113,7 +6154,10 @@ def index():
         });
 
         // Coloring mode listeners
-        document.getElementById('timeframe').addEventListener('change', updateData);
+        document.getElementById('timeframe').addEventListener('change', function() {
+            updateData();
+            startCandleCloseTimer();
+        });
         document.getElementById('coloring_mode').addEventListener('change', updateData);
         document.getElementById('exposure_metric').addEventListener('change', updateData);
         document.getElementById('levels_count').addEventListener('input', updateData);
@@ -6852,9 +6896,41 @@ def index():
             }
         }
 
+        // ── Candle Close Timer ─────────────────────────────────────────────────────
+        function startCandleCloseTimer() {
+            if (candleCloseTimerInterval) clearInterval(candleCloseTimerInterval);
+            function updateTimer() {
+                const el = document.getElementById('candle-close-timer');
+                if (!el) { clearInterval(candleCloseTimerInterval); return; }
+                const tfEl = document.getElementById('timeframe');
+                const tf = tfEl ? parseInt(tfEl.value) || 1 : 1;
+                const tfSecs = tf * 60;
+                // Use ET (America/New_York) time for candle boundary calculation
+                const now = new Date();
+                const etFormatter = new Intl.DateTimeFormat('en-US', {
+                    timeZone: 'America/New_York',
+                    hour: 'numeric', minute: 'numeric', second: 'numeric', hour12: false
+                });
+                const parts = etFormatter.formatToParts(now);
+                let h = 0, m2 = 0, s2 = 0;
+                for (const p of parts) {
+                    if (p.type === 'hour')   h  = parseInt(p.value);
+                    if (p.type === 'minute') m2 = parseInt(p.value);
+                    if (p.type === 'second') s2 = parseInt(p.value);
+                }
+                const secondsOfDay = h * 3600 + m2 * 60 + s2;
+                const elapsed = secondsOfDay % tfSecs;
+                const remaining = tfSecs - elapsed;
+                const minutes = Math.floor(remaining / 60);
+                const seconds = remaining % 60;
+                el.textContent = `⏱ ${minutes}:${seconds.toString().padStart(2, '0')}`;
+            }
+            updateTimer();
+            candleCloseTimerInterval = setInterval(updateTimer, 1000);
+        }
+
         // ── Build the chart toolbar ──────────────────────────────────────────
         function buildTVToolbar(container, candles, upColor, downColor) {
-            // toolbar lives in tv-toolbar-container, NOT inside the chart canvas
             const toolbarContainer = document.getElementById('tv-toolbar-container');
             if (!toolbarContainer) return;
             toolbarContainer.innerHTML = '';
@@ -6956,6 +7032,15 @@ def index():
             toolbar.appendChild(arBtn);
 
             toolbar.appendChild(btn('⟳ Reset', 'Reset zoom and pan to fit all data', () => tvFitAll()));
+
+            // Candle close timer
+            const timerEl = document.createElement('span');
+            timerEl.id = 'candle-close-timer';
+            timerEl.className = 'candle-close-timer';
+            timerEl.title = 'Time remaining until the current candle closes';
+            timerEl.textContent = '⏱ --:--';
+            toolbar.appendChild(timerEl);
+            startCandleCloseTimer();
 
             // Wire up click handler for drawing
             if (tvPriceChart) {
@@ -8483,6 +8568,14 @@ def update_price():
             max_level_color=max_level_color,
             coloring_mode=coloring_mode
         )
+        # Inject timeframe so the popout candle-close timer knows the selected interval
+        try:
+            import json as _json
+            pc_dict = _json.loads(price_chart)
+            pc_dict['timeframe'] = timeframe
+            price_chart = _json.dumps(pc_dict)
+        except Exception:
+            pass
         return jsonify({'price': price_chart})
     except Exception as e:
         import traceback
