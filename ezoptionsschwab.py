@@ -525,6 +525,10 @@ def format_ticker(ticker):
         return ticker
     elif ticker in ['SPX', '$SPX']:
         return '$SPX'  # Return $SPX for API calls
+    elif ticker in ['NDX', '$NDX']:
+        return '$NDX'  # Return $NDX for API calls
+    elif ticker in ['VIX', '$VIX']:
+        return '$VIX'  # Return $VIX for API calls
     return ticker
 
 def format_display_ticker(ticker):
@@ -537,6 +541,12 @@ def format_display_ticker(ticker):
     elif ticker in ['$SPX', 'SPX']:
         # For SPX, return SPXW for options symbols and $SPX for underlying
         return ['SPXW', '$SPX']
+    elif ticker in ['$NDX', 'NDX']:
+        # For NDX, return NDXP for options symbols and $NDX for underlying
+        return ['NDXP', '$NDX']
+    elif ticker in ['$VIX', 'VIX']:
+        # For VIX, return VIX for options symbols and $VIX for underlying
+        return ['VIX', '$VIX']
     elif ticker == 'MARKET2':
         return ['SPY']
     return [ticker]
