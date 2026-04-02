@@ -5122,6 +5122,7 @@ def index():
                         <label for="strike_range">Strike Range (%):</label>
                         <input type="range" id="strike_range" min="1" max="20" value="2" step="0.5">
                         <span class="range-value" id="strike_range_value">2%</span>
+                        <button id="match_em_range" title="Toggle: auto-sync strike range to Expected Move (ATM straddle) + 0.5% wiggle room" style="margin-left:4px;padding:2px 6px;font-size:11px;cursor:pointer;background:#2a2a2a;color:#888888;border:1px solid #555555;border-radius:3px;">📐 EM</button>
                     </div>
                     <div class="control-group">
                         <label for="exposure_metric">Exposure Metric:</label>
@@ -6234,6 +6235,54 @@ def index():
         document.getElementById('strike_range').addEventListener('input', function() {
             document.getElementById('strike_range_value').textContent = this.value + '%';
             updateData();
+        });
+
+        // EM range lock toggle state
+        let emRangeLocked = false;
+
+        function applyEmRange(em, triggerUpdate) {
+            if (!em || em.upper_pct == null) return false;
+            const emPct = Math.abs(em.upper_pct);
+            const withWiggle = emPct + 0.5;
+            const stepped = Math.round(withWiggle / 0.5) * 0.5;
+            const clamped = Math.min(20, Math.max(1, stepped));
+            const slider = document.getElementById('strike_range');
+            if (parseFloat(slider.value) === clamped) return true; // no change needed
+            slider.value = clamped;
+            document.getElementById('strike_range_value').textContent = clamped + '%';
+            if (triggerUpdate) updateData();
+            return true;
+        }
+
+        function setEmRangeLocked(locked) {
+            emRangeLocked = locked;
+            const btn = document.getElementById('match_em_range');
+            if (locked) {
+                btn.style.background = '#1a4a1a';
+                btn.style.color = '#00ff88';
+                btn.style.borderColor = '#00aa55';
+                btn.title = 'EM Range Lock ON — click to disable';
+            } else {
+                btn.style.background = '#2a2a2a';
+                btn.style.color = '#888888';
+                btn.style.borderColor = '#555555';
+                btn.title = 'Toggle: auto-sync strike range to Expected Move (ATM straddle) + 0.5% wiggle room';
+            }
+        }
+
+        // Match EM range button: toggle auto-sync of strike range to EM
+        document.getElementById('match_em_range').addEventListener('click', function() {
+            if (emRangeLocked) {
+                setEmRangeLocked(false);
+            } else {
+                setEmRangeLocked(true);
+                // Apply immediately if EM data is already available
+                const em = lastData && lastData.price_info && lastData.price_info.expected_move_range;
+                if (!applyEmRange(em, true)) {
+                    alert('Expected Move data not yet available. Fetch data first.');
+                    setEmRangeLocked(false);
+                }
+            }
         });
 
         // Coloring mode listeners
@@ -7745,6 +7794,10 @@ def index():
         }
         
         function updatePriceInfo(info) {
+            // If EM range lock is active, silently sync the slider without triggering a full re-fetch
+            if (emRangeLocked && info && info.expected_move_range) {
+                applyEmRange(info.expected_move_range, false);
+            }
             const priceInfo = document.getElementById('price-info');
             const selectedExpiries = lastData.selected_expiries || [];
             const expiryText = selectedExpiries.length > 1 ? 
