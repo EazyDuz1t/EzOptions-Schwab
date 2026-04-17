@@ -3097,6 +3097,15 @@ def build_historical_levels_overlay(ticker, display_date, chart_times, latest_pr
                 'reference_price': f"${row['price']:.2f}",
             })
 
+    historical_points.sort(
+        key=lambda point: (
+            point['time'],
+            0 if point.get('kind') == 'expected-move' else 1,
+            point.get('rank') or 99,
+            point['price'],
+        )
+    )
+
     historical_expected_moves = []
 
     return historical_points, historical_expected_moves
@@ -5842,6 +5851,7 @@ def index():
         let tvHistoricalOverlayPending = false;
         let tvHistoricalOverlayDomEventsBound = false;
         let tvHistoricalRenderedPoints = [];
+        const tvHistoricalOverlayMaxVisible = 1200;
         // Track the active ticker so we can reset chart state on ticker change
         let tvLastTicker = null;
         // When true, the next render will call fitContent() regardless of tvAutoRange
@@ -6253,6 +6263,8 @@ def index():
   var popoutCandleTimerInterval=null;
     var historicalDomBound=false;
     var tvHistoricalRenderedPoints=[];
+        var historicalBubbleDrawPending=false;
+        var historicalBubbleMaxVisible=1200;
 
   // ── Candle close timer (popout) ────────────────────────────────────────────
   function startCandleCloseTimer(){
@@ -6393,7 +6405,9 @@ def index():
     function posHistTip(t,e){var c=document.getElementById('price-chart');if(!t||!c||!e)return;var b=c.getBoundingClientRect();var l=Math.min(Math.max(8,e.clientX-b.left+12),Math.max(8,b.width-t.offsetWidth-8));var top=Math.min(Math.max(8,e.clientY-b.top+12),Math.max(8,b.height-t.offsetHeight-8));t.style.left=l+'px';t.style.top=top+'px';}
     function findHistHoverPoints(e){var c=document.getElementById('price-chart');if(!c||!tvHistoricalRenderedPoints.length)return[];var b=c.getBoundingClientRect(),cx=e.clientX-b.left,cy=e.clientY-b.top;return tvHistoricalRenderedPoints.filter(function(p){var dx=cx-p.x,dy=cy-p.y,r=Math.max(8,(p.size||8)/2+5);return(dx*dx+dy*dy)<=(r*r);}).sort(function(a,bp){var ad=(cx-a.x)*(cx-a.x)+(cy-a.y)*(cy-a.y),bd=(cx-bp.x)*(cx-bp.x)+(cy-bp.y)*(cy-bp.y);return ad-bd;});}
     function updateHistTip(e){var t=ensureHistTip();if(!t)return;var pts=findHistHoverPoints(e);if(!pts.length){t.style.display='none';return;}var topPts=pts.slice(0,5),anchorTime=topPts[0].time;t.innerHTML='<div class="tt-head"><span class="tt-badge">'+pts.length+' bubble'+(pts.length===1?'':'s')+'</span><div class="tt-time">'+fmtHistTime(anchorTime)+'</div></div><div class="tt-list">'+topPts.map(function(p){return histTipHtml(p);}).join('')+'</div>'+(pts.length>topPts.length?'<div class="tt-more">+'+(pts.length-topPts.length)+' more</div>':'');t.style.display='block';posHistTip(t,e);}
-    function drawHistoricalBubbles(){var o=ensureHistOverlay(),t=ensureHistTip();if(!o||!tvChart||!tvCandle)return;o.innerHTML='';tvHistoricalRenderedPoints=[];if(!tvHistoricalPoints.length){o.style.display='none';if(t)t.style.display='none';return;}var frag=document.createDocumentFragment(),visible=0;tvHistoricalPoints.forEach(function(p){var x=tvChart.timeScale().timeToCoordinate(p.time),y=tvCandle.priceToCoordinate(p.price);if(x==null||y==null||Number.isNaN(x)||Number.isNaN(y))return;var b=document.createElement('div');b.className='tv-historical-bubble';b.style.left=x+'px';b.style.top=y+'px';b.style.width=(p.size||8)+'px';b.style.height=(p.size||8)+'px';b.style.background=p.color||'rgba(255,255,255,0.6)';b.style.border=(p.border_width||1)+'px solid '+(p.border_color||p.color||'#fff');frag.appendChild(b);tvHistoricalRenderedPoints.push(Object.assign({},p,{x:x,y:y}));visible++;});o.appendChild(frag);o.style.display=visible>0?'block':'none';}
+    function getVisibleHistoricalBubblePoints(){if(!tvHistoricalPoints.length)return[];var pts=tvHistoricalPoints;try{var range=tvChart.timeScale().getVisibleLogicalRange();if(range&&tvLastCandles.length){var li=Math.max(0,Math.floor(range.from)-2),ri=Math.min(tvLastCandles.length-1,Math.ceil(range.to)+2),left=tvLastCandles[li],right=tvLastCandles[ri];if(left&&right){var span=tvLastCandles.length>1?Math.max(60,tvLastCandles[1].time-tvLastCandles[0].time):60,minTime=left.time-(span*2),maxTime=right.time+(span*2);pts=tvHistoricalPoints.filter(function(p){return p.time>=minTime&&p.time<=maxTime;});}}}catch(e){}if(pts.length<=historicalBubbleMaxVisible)return pts;var priority=[],secondary=[];pts.forEach(function(p){if(p.kind==='expected-move'||p.rank===1)priority.push(p);else secondary.push(p);});if(priority.length>=historicalBubbleMaxVisible){var pStride=Math.ceil(priority.length/historicalBubbleMaxVisible);return priority.filter(function(_,i){return i%pStride===0;});}var slots=Math.max(0,historicalBubbleMaxVisible-priority.length);if(!secondary.length||slots===0)return priority;var stride=Math.ceil(secondary.length/slots);return priority.concat(secondary.filter(function(_,i){return i%stride===0;}));}
+    function drawHistoricalBubbles(){var o=ensureHistOverlay(),t=ensureHistTip();if(!o||!tvChart||!tvCandle)return;tvHistoricalRenderedPoints=[];if(!tvHistoricalPoints.length){o.replaceChildren();o.style.display='none';if(t)t.style.display='none';return;}var points=getVisibleHistoricalBubblePoints();if(!points.length){o.replaceChildren();o.style.display='none';if(t)t.style.display='none';return;}var frag=document.createDocumentFragment(),visible=0;points.forEach(function(p){var x=tvChart.timeScale().timeToCoordinate(p.time),y=tvCandle.priceToCoordinate(p.price);if(x==null||y==null||Number.isNaN(x)||Number.isNaN(y))return;var b=document.createElement('div');b.className='tv-historical-bubble';b.style.left=x+'px';b.style.top=y+'px';b.style.width=(p.size||8)+'px';b.style.height=(p.size||8)+'px';b.style.background=p.color||'rgba(255,255,255,0.6)';b.style.border=(p.border_width||1)+'px solid '+(p.border_color||p.color||'#fff');frag.appendChild(b);tvHistoricalRenderedPoints.push(Object.assign({},p,{x:x,y:y}));visible++;});o.replaceChildren(frag);o.style.display=visible>0?'block':'none';}
+    function scheduleHistoricalBubbleDraw(){if(historicalBubbleDrawPending)return;historicalBubbleDrawPending=true;requestAnimationFrame(function(){historicalBubbleDrawPending=false;drawHistoricalBubbles();});}
 
   // ── Main renderer ──────────────────────────────────────────────────────────
   var isFirstRender=true;
@@ -6410,7 +6424,7 @@ def index():
       tvChart.priceScale('volume').applyOptions({scaleMargins:{top:0.88,bottom:0}});
       document.getElementById('chart-title').textContent=priceData.use_heikin_ashi?'Price Chart (Heikin-Ashi)':'Price Chart';
       buildToolbar(candles,upColor,downColor);
-    ensureHistOverlay();ensureHistTip();tvChart.timeScale().subscribeVisibleLogicalRangeChange(function(){requestAnimationFrame(drawHistoricalBubbles);});if(!historicalDomBound){historicalDomBound=true;el.addEventListener('wheel',function(){requestAnimationFrame(drawHistoricalBubbles);},{passive:true});el.addEventListener('mouseup',function(){requestAnimationFrame(drawHistoricalBubbles);});el.addEventListener('touchend',function(){requestAnimationFrame(drawHistoricalBubbles);},{passive:true});el.addEventListener('mousemove',function(e){updateHistTip(e);});el.addEventListener('mouseleave',function(){var t=ensureHistTip();if(t)t.style.display='none';});}
+    ensureHistOverlay();ensureHistTip();tvChart.timeScale().subscribeVisibleLogicalRangeChange(function(){scheduleHistoricalBubbleDraw();});if(!historicalDomBound){historicalDomBound=true;el.addEventListener('wheel',function(){scheduleHistoricalBubbleDraw();},{passive:true});el.addEventListener('mouseup',function(){scheduleHistoricalBubbleDraw();});el.addEventListener('touchend',function(){scheduleHistoricalBubbleDraw();},{passive:true});el.addEventListener('mousemove',function(e){updateHistTip(e);});el.addEventListener('mouseleave',function(){var t=ensureHistTip();if(t)t.style.display='none';});}
       // ── OHLC hover tooltip ──────────────────────────────────────────────
       var _ptip=document.createElement('div');_ptip.className='tv-ohlc-tooltip';_ptip.id='tv-ohlc-tooltip';el.appendChild(_ptip);
       tvChart.subscribeCrosshairMove(function(param){
@@ -6437,7 +6451,7 @@ def index():
         tvPriceLines.forEach(function(l){try{tvCandle.removePriceLine(l);}catch(e){}});tvPriceLines=[];tvAllLevelPrices=[];
         tvHistoricalPoints=priceData.historical_exposure_levels||[];
         tvHistoricalPoints.forEach(function(p){tvAllLevelPrices.push(p.price);});
-        requestAnimationFrame(drawHistoricalBubbles);
+        scheduleHistoricalBubbleDraw();
     tvApplyAutoscale();
     if(activeInds.size>0)applyIndicators(candles);
     if(isFirstRender||tvAutoRange){fitAll();isFirstRender=false;}
@@ -6548,7 +6562,7 @@ def index():
             tvPriceLines=[];tvAllLevelPrices=[];
                         tvHistoricalPoints=pd.historical_exposure_levels||[];
                         tvHistoricalPoints.forEach(function(p){tvAllLevelPrices.push(p.price);});
-                        requestAnimationFrame(drawHistoricalBubbles);
+                        scheduleHistoricalBubbleDraw();
             tvApplyAutoscale();
           }
         }
@@ -7779,14 +7793,69 @@ def index():
             tvHistoricalExpectedMoveSeries = [];
         }
 
+        function getVisibleTVHistoricalPoints() {
+            if (!tvHistoricalPoints.length) return [];
+
+            let visiblePoints = tvHistoricalPoints;
+            try {
+                const visibleRange = tvPriceChart.timeScale().getVisibleLogicalRange();
+                if (visibleRange && tvLastCandles.length) {
+                    const leftIndex = Math.max(0, Math.floor(visibleRange.from) - 2);
+                    const rightIndex = Math.min(tvLastCandles.length - 1, Math.ceil(visibleRange.to) + 2);
+                    const leftCandle = tvLastCandles[leftIndex];
+                    const rightCandle = tvLastCandles[rightIndex];
+                    if (leftCandle && rightCandle) {
+                        const candleSpan = tvLastCandles.length > 1
+                            ? Math.max(60, tvLastCandles[1].time - tvLastCandles[0].time)
+                            : 60;
+                        const minTime = leftCandle.time - (candleSpan * 2);
+                        const maxTime = rightCandle.time + (candleSpan * 2);
+                        visiblePoints = tvHistoricalPoints.filter(point => point.time >= minTime && point.time <= maxTime);
+                    }
+                }
+            } catch(e) {}
+
+            if (visiblePoints.length <= tvHistoricalOverlayMaxVisible) {
+                return visiblePoints;
+            }
+
+            const priorityPoints = [];
+            const secondaryPoints = [];
+            visiblePoints.forEach(point => {
+                if (point.kind === 'expected-move' || point.rank === 1) priorityPoints.push(point);
+                else secondaryPoints.push(point);
+            });
+
+            if (priorityPoints.length >= tvHistoricalOverlayMaxVisible) {
+                const stride = Math.ceil(priorityPoints.length / tvHistoricalOverlayMaxVisible);
+                return priorityPoints.filter((_, index) => index % stride === 0);
+            }
+
+            const secondarySlots = Math.max(0, tvHistoricalOverlayMaxVisible - priorityPoints.length);
+            if (!secondaryPoints.length || secondarySlots === 0) {
+                return priorityPoints;
+            }
+
+            const stride = Math.ceil(secondaryPoints.length / secondarySlots);
+            return priorityPoints.concat(secondaryPoints.filter((_, index) => index % stride === 0));
+        }
+
         function drawTVHistoricalOverlay() {
             const overlay = ensureTVHistoricalOverlay();
             const tooltip = ensureTVHistoricalTooltip();
             if (!overlay || !tvPriceChart || !tvCandleSeries) return;
 
-            overlay.innerHTML = '';
             tvHistoricalRenderedPoints = [];
             if (!tvHistoricalPoints.length) {
+                overlay.replaceChildren();
+                overlay.style.display = 'none';
+                if (tooltip) tooltip.style.display = 'none';
+                return;
+            }
+
+            const pointsToRender = getVisibleTVHistoricalPoints();
+            if (!pointsToRender.length) {
+                overlay.replaceChildren();
                 overlay.style.display = 'none';
                 if (tooltip) tooltip.style.display = 'none';
                 return;
@@ -7794,7 +7863,7 @@ def index():
 
             const fragment = document.createDocumentFragment();
             let visibleCount = 0;
-            for (const point of tvHistoricalPoints) {
+            for (const point of pointsToRender) {
                 const x = tvPriceChart.timeScale().timeToCoordinate(point.time);
                 const y = tvCandleSeries.priceToCoordinate(point.price);
                 if (x == null || y == null || Number.isNaN(x) || Number.isNaN(y)) continue;
@@ -7812,7 +7881,7 @@ def index():
                 visibleCount += 1;
             }
 
-            overlay.appendChild(fragment);
+            overlay.replaceChildren(fragment);
             overlay.style.display = visibleCount > 0 ? 'block' : 'none';
         }
 
