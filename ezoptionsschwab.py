@@ -2,6 +2,7 @@
 import pandas as pd
 import plotly.graph_objects as go
 import numpy as np
+from bisect import bisect_left
 from datetime import datetime, timedelta
 import math
 import time
@@ -23,6 +24,9 @@ load_dotenv()
 
 # Initialize Flask app
 app = Flask(__name__)
+
+MAX_RETAINED_SESSION_DATES = 2
+_retention_lock = threading.Lock()
 
 # Global error handlers for Flask
 @app.errorhandler(404)
@@ -54,6 +58,10 @@ def init_db():
                     net_delta REAL NOT NULL,
                     net_vanna REAL NOT NULL,
                     net_charm REAL,
+                    net_volume REAL,
+                    net_speed REAL,
+                    net_vomma REAL,
+                    net_color REAL,
                     abs_gex_total REAL,
                     date TEXT NOT NULL
                 )
@@ -63,11 +71,40 @@ def init_db():
                 cursor.execute('ALTER TABLE interval_data ADD COLUMN net_charm REAL')
             except sqlite3.OperationalError:
                 pass 
+            try:
+                cursor.execute('ALTER TABLE interval_data ADD COLUMN net_volume REAL')
+            except sqlite3.OperationalError:
+                pass
             # Add abs_gex_total column if it's missing
             try:
                 cursor.execute('ALTER TABLE interval_data ADD COLUMN abs_gex_total REAL')
             except sqlite3.OperationalError:
                 pass 
+            try:
+                cursor.execute('ALTER TABLE interval_data ADD COLUMN net_speed REAL')
+            except sqlite3.OperationalError:
+                pass
+            try:
+                cursor.execute('ALTER TABLE interval_data ADD COLUMN net_vomma REAL')
+            except sqlite3.OperationalError:
+                pass
+            try:
+                cursor.execute('ALTER TABLE interval_data ADD COLUMN net_color REAL')
+            except sqlite3.OperationalError:
+                pass
+
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS interval_session_data (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ticker TEXT NOT NULL,
+                    timestamp INTEGER NOT NULL,
+                    price REAL NOT NULL,
+                    expected_move REAL,
+                    expected_move_upper REAL,
+                    expected_move_lower REAL,
+                    date TEXT NOT NULL
+                )
+            ''')
             
             # Add centroid data table
             cursor.execute('''
@@ -95,6 +132,77 @@ def is_market_hours():
     market_close = now.replace(hour=16, minute=0, second=0, microsecond=0)
     return market_open <= now <= market_close
 
+
+INTERVAL_LEVEL_DISPLAY_NAMES = {
+    'GEX': 'GEX',
+    'AbsGEX': 'Abs GEX',
+    'DEX': 'DEX',
+    'VEX': 'Vanna',
+    'Charm': 'Charm',
+    'Volume': 'Volume',
+    'Speed': 'Speed',
+    'Vomma': 'Vomma',
+    'Color': 'Color',
+    'Expected Move': 'Expected Move',
+}
+
+INTERVAL_LEVEL_VALUE_KEYS = {
+    'GEX': 'net_gamma',
+    'AbsGEX': 'abs_gex_total',
+    'DEX': 'net_delta',
+    'VEX': 'net_vanna',
+    'Charm': 'net_charm',
+    'Volume': 'net_volume',
+    'Speed': 'net_speed',
+    'Vomma': 'net_vomma',
+    'Color': 'net_color',
+}
+
+
+def normalize_level_type(level_type):
+    if level_type in ('Vanna', 'VEX'):
+        return 'VEX'
+    return level_type
+
+
+def calculate_expected_move_snapshot(calls, puts, spot_price):
+    """Return the current ATM straddle-based expected move snapshot."""
+    if calls is None or puts is None or calls.empty or puts.empty or not spot_price:
+        return None
+
+    strikes_sorted = sorted(calls['strike'].unique())
+    if not strikes_sorted:
+        return None
+
+    atm_strike = min(strikes_sorted, key=lambda strike: abs(strike - spot_price))
+
+    def _get_mid(df, strike):
+        row = df.loc[df['strike'] == strike]
+        if row is None or row.empty:
+            return None
+        bid = row['bid'].values[0]
+        ask = row['ask'].values[0]
+        if bid > 0 and ask > 0:
+            return (bid + ask) / 2
+        if bid > 0:
+            return bid
+        if ask > 0:
+            return ask
+        return None
+
+    call_mid = _get_mid(calls, atm_strike)
+    put_mid = _get_mid(puts, atm_strike)
+    expected_move = (call_mid or 0) + (put_mid or 0)
+    if expected_move <= 0:
+        return None
+
+    return {
+        'atm_strike': atm_strike,
+        'move': float(expected_move),
+        'upper': float(spot_price + expected_move),
+        'lower': float(spot_price - expected_move),
+    }
+
 # Function to store centroid data
 def store_centroid_data(ticker, price, calls, puts):
     """Store call and put centroid data for 5-minute intervals during market hours only"""
@@ -114,6 +222,9 @@ def store_centroid_data(ticker, price, calls, puts):
     
     current_time = int(current_time_est.timestamp())
     current_date = current_time_est.strftime('%Y-%m-%d')
+
+    # Keep the DB bounded to the two most recent session dates.
+    clear_old_data()
     
     # Round to nearest 5-minute interval (300 seconds)
     interval_timestamp = (current_time // 300) * 300
@@ -201,17 +312,27 @@ def get_centroid_data(ticker, date=None):
 def store_interval_data(ticker, price, strike_range, calls, puts):
     if not is_market_hours():
         return
-    current_time = int(time.time())
-    current_date = datetime.now().strftime('%Y-%m-%d')
+    est = pytz.timezone('US/Eastern')
+    current_time_est = datetime.now(est)
+    current_time = int(current_time_est.timestamp())
+    current_date = current_time_est.strftime('%Y-%m-%d')
+
+    # Keep the DB bounded to the two most recent session dates.
+    clear_old_data()
     
-    # Round to nearest 5-minute interval (300 seconds)
-    interval_timestamp = (current_time // 300) * 300
+    # Store interval overlays at 1-minute resolution so they can be aggregated
+    # to whatever candle timeframe the chart is using.
+    interval_timestamp = (current_time // 60) * 60
     
-    # Delete existing data for this 5-minute interval to update with most recent data
+    # Delete existing data for this 1-minute interval to update with most recent data
     with closing(sqlite3.connect('options_data.db')) as conn:
         with closing(conn.cursor()) as cursor:
             cursor.execute('''
                 DELETE FROM interval_data 
+                WHERE ticker = ? AND timestamp = ? AND date = ?
+            ''', (ticker, interval_timestamp, current_date))
+            cursor.execute('''
+                DELETE FROM interval_session_data
                 WHERE ticker = ? AND timestamp = ? AND date = ?
             ''', (ticker, interval_timestamp, current_date))
             conn.commit()
@@ -224,7 +345,7 @@ def store_interval_data(ticker, price, strike_range, calls, puts):
     range_calls = calls[(calls['strike'] >= min_strike) & (calls['strike'] <= max_strike)]
     range_puts = puts[(puts['strike'] >= min_strike) & (puts['strike'] <= max_strike)]
     
-    # Calculate net gamma, delta, and vanna for each strike
+    # Calculate per-strike exposures used by the historical intraday overlays.
     exposure_by_strike = {}
     for _, row in range_calls.iterrows():
         strike = row['strike']
@@ -232,11 +353,29 @@ def store_interval_data(ticker, price, strike_range, calls, puts):
         delta = row['DEX']
         vanna = row['VEX']
         charm = row['Charm']
-        cur = exposure_by_strike.get(strike, {'gamma':0,'delta':0,'vanna':0,'charm':0,'call_gamma':0,'put_gamma':0})
+        speed = row['Speed']
+        vomma = row['Vomma']
+        color = row['Color']
+        cur = exposure_by_strike.get(strike, {
+            'gamma': 0,
+            'delta': 0,
+            'vanna': 0,
+            'charm': 0,
+            'volume': 0,
+            'speed': 0,
+            'vomma': 0,
+            'color': 0,
+            'call_gamma': 0,
+            'put_gamma': 0,
+        })
         cur['gamma'] = cur.get('gamma',0) + gamma
         cur['delta'] = cur.get('delta',0) + delta
         cur['vanna'] = cur.get('vanna',0) + vanna
         cur['charm'] = cur.get('charm',0) + charm
+        cur['volume'] = cur.get('volume',0) + row['volume']
+        cur['speed'] = cur.get('speed',0) + speed
+        cur['vomma'] = cur.get('vomma',0) + vomma
+        cur['color'] = cur.get('color',0) + color
         cur['call_gamma'] = cur.get('call_gamma',0) + gamma
         exposure_by_strike[strike] = cur
         
@@ -246,13 +385,33 @@ def store_interval_data(ticker, price, strike_range, calls, puts):
         delta = row['DEX']
         vanna = row['VEX']
         charm = row['Charm']
-        cur = exposure_by_strike.get(strike, {'gamma':0,'delta':0,'vanna':0,'charm':0,'call_gamma':0,'put_gamma':0})
+        speed = row['Speed']
+        vomma = row['Vomma']
+        color = row['Color']
+        cur = exposure_by_strike.get(strike, {
+            'gamma': 0,
+            'delta': 0,
+            'vanna': 0,
+            'charm': 0,
+            'volume': 0,
+            'speed': 0,
+            'vomma': 0,
+            'color': 0,
+            'call_gamma': 0,
+            'put_gamma': 0,
+        })
         cur['gamma'] = cur.get('gamma',0) - gamma
         cur['delta'] = cur.get('delta',0) + delta
         cur['vanna'] = cur.get('vanna',0) + vanna
         cur['charm'] = cur.get('charm',0) + charm
+        cur['volume'] = cur.get('volume',0) - row['volume']
+        cur['speed'] = cur.get('speed',0) + speed
+        cur['vomma'] = cur.get('vomma',0) + vomma
+        cur['color'] = cur.get('color',0) + color
         cur['put_gamma'] = cur.get('put_gamma',0) + gamma
         exposure_by_strike[strike] = cur
+
+    expected_move_snapshot = calculate_expected_move_snapshot(calls, puts, price)
     
     # Store data for each strike
     with closing(sqlite3.connect('options_data.db')) as conn:
@@ -260,23 +419,83 @@ def store_interval_data(ticker, price, strike_range, calls, puts):
             for strike, exposure in exposure_by_strike.items():
                 abs_gex_total = abs(exposure.get('call_gamma',0)) + abs(exposure.get('put_gamma',0))
                 cursor.execute('''
-                    INSERT INTO interval_data (ticker, timestamp, price, strike, net_gamma, net_delta, net_vanna, net_charm, abs_gex_total, date)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ''', (ticker, interval_timestamp, price, strike, exposure['gamma'], exposure['delta'], exposure['vanna'], exposure['charm'], abs_gex_total, current_date))
+                    INSERT INTO interval_data (
+                        ticker, timestamp, price, strike, net_gamma, net_delta, net_vanna,
+                        net_charm, net_volume, net_speed, net_vomma, net_color, abs_gex_total, date
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    ticker,
+                    interval_timestamp,
+                    price,
+                    strike,
+                    exposure['gamma'],
+                    exposure['delta'],
+                    exposure['vanna'],
+                    exposure['charm'],
+                    exposure['volume'],
+                    exposure['speed'],
+                    exposure['vomma'],
+                    exposure['color'],
+                    abs_gex_total,
+                    current_date,
+                ))
+
+            if expected_move_snapshot:
+                cursor.execute('''
+                    INSERT INTO interval_session_data (
+                        ticker, timestamp, price, expected_move, expected_move_upper, expected_move_lower, date
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    ticker,
+                    interval_timestamp,
+                    price,
+                    expected_move_snapshot['move'],
+                    expected_move_snapshot['upper'],
+                    expected_move_snapshot['lower'],
+                    current_date,
+                ))
             conn.commit()
 
 # Function to get interval data
 def get_interval_data(ticker, date=None):
     if date is None:
-        date = datetime.now().strftime('%Y-%m-%d')
+        date = datetime.now(pytz.timezone('US/Eastern')).strftime('%Y-%m-%d')
     
     with closing(sqlite3.connect('options_data.db')) as conn:
         with closing(conn.cursor()) as cursor:
             cursor.execute('''
-                SELECT timestamp, price, strike, net_gamma, net_delta, net_vanna, net_charm, abs_gex_total
+                  SELECT timestamp, price, strike, net_gamma, net_delta, net_vanna, net_charm,
+                      abs_gex_total, net_volume, net_speed, net_vomma, net_color
                 FROM interval_data
                 WHERE ticker = ? AND date = ?
                 ORDER BY timestamp, strike
+            ''', (ticker, date))
+            all_data = cursor.fetchall()
+
+    est = pytz.timezone('US/Eastern')
+    filtered = []
+    for row in all_data:
+        dt = datetime.fromtimestamp(row[0], est)
+        market_open = dt.replace(hour=9, minute=30, second=0, microsecond=0)
+        market_close = dt.replace(hour=16, minute=0, second=0, microsecond=0)
+        if dt.weekday() < 5 and market_open <= dt <= market_close:
+            filtered.append(row)
+    return filtered
+
+
+def get_interval_session_data(ticker, date=None):
+    if date is None:
+        date = datetime.now(pytz.timezone('US/Eastern')).strftime('%Y-%m-%d')
+
+    with closing(sqlite3.connect('options_data.db')) as conn:
+        with closing(conn.cursor()) as cursor:
+            cursor.execute('''
+                SELECT timestamp, price, expected_move, expected_move_upper, expected_move_lower
+                FROM interval_session_data
+                WHERE ticker = ? AND date = ?
+                ORDER BY timestamp
             ''', (ticker, date))
             all_data = cursor.fetchall()
 
@@ -300,22 +519,39 @@ def get_last_session_date(ticker, table='interval_data'):
 
 # Function to clear old data
 def clear_old_data():
-    """Clear data from previous days, keeping only today's data"""
-    est = pytz.timezone('US/Eastern')
-    today = datetime.now(est).strftime('%Y-%m-%d')
-    
-    with closing(sqlite3.connect('options_data.db')) as conn:
-        with closing(conn.cursor()) as cursor:
-            cursor.execute('''
-                DELETE FROM interval_data
-                WHERE date < ?
-            ''', (today,))
-            cursor.execute('''
-                DELETE FROM centroid_data
-                WHERE date < ?
-            ''', (today,))
-            conn.commit()
-            print(f"Cleared old data from database. Kept data from {today}")
+    """Keep only the most recent session dates in each SQLite history table."""
+    tables = ('interval_data', 'centroid_data', 'interval_session_data')
+    deleted_rows = {}
+
+    with _retention_lock:
+        with closing(sqlite3.connect('options_data.db')) as conn:
+            with closing(conn.cursor()) as cursor:
+                for table_name in tables:
+                    cursor.execute(f'''
+                        SELECT DISTINCT date
+                        FROM {table_name}
+                        WHERE date IS NOT NULL
+                        ORDER BY date DESC
+                    ''')
+                    all_dates = [row[0] for row in cursor.fetchall() if row[0]]
+                    stale_dates = all_dates[MAX_RETAINED_SESSION_DATES:]
+                    if not stale_dates:
+                        continue
+
+                    placeholders = ','.join('?' for _ in stale_dates)
+                    cursor.execute(
+                        f'DELETE FROM {table_name} WHERE date IN ({placeholders})',
+                        stale_dates,
+                    )
+                    deleted_rows[table_name] = cursor.rowcount
+
+                conn.commit()
+
+    if deleted_rows:
+        print(
+            'Pruned database history to the latest '
+            f'{MAX_RETAINED_SESSION_DATES} session dates: {deleted_rows}'
+        )
 
 # Function to clear centroid data for new session
 def clear_centroid_session_data(ticker):
@@ -335,13 +571,12 @@ def clear_centroid_session_data(ticker):
 # Initialize database
 init_db()
 
+# Prune retained history on startup as well as on active writes.
+clear_old_data()
+
 # Clear old data at the start of the day
 est = pytz.timezone('US/Eastern')
 current_time_est = datetime.now(est)
-
-# Clear old data at midnight ET
-if current_time_est.hour == 0 and current_time_est.minute == 0:
-    clear_old_data()
 
 # Clear centroid data at market open (9:30 AM ET) for a fresh session
 if current_time_est.hour == 9 and current_time_est.minute == 30 and current_time_est.weekday() < 5:
@@ -671,7 +906,7 @@ def fetch_options_for_date(ticker, date, exposure_metric="Open Interest", delta_
         bucket_size = get_strike_interval(base_all_strikes) if base_all_strikes else 5.0
 
         if ticker == "MARKET":
-            component_tickers = ["$SPX", "QQQ"]
+            component_tickers = ["$SPX", "$NDX", "QQQ", "SPY"]
         else:
             component_tickers = ["SPY"]
         
@@ -698,16 +933,20 @@ def fetch_options_for_date(ticker, date, exposure_metric="Open Interest", delta_
             
             if c.empty and p.empty: continue
             
-            # Per-Greek total absolute exposure ----------------------------
-            totals = {}
-            for col in exposure_cols + activity_cols:
-                total = 0
-                if not c.empty and col in c.columns:
-                    total += c[col].abs().sum()
-                if not p.empty and col in p.columns:
-                    total += p[col].abs().sum()
-                totals[col] = total if total > 0 else 1  # avoid /0
-            
+            # Use total open interest as the stable sizing anchor.
+            # OI only updates overnight, so normalization factors stay constant
+            # between live updates — preventing Greek exposure jumps caused by
+            # the per-Greek totals (GEX, DEX…) swinging with every price tick.
+            comp_oi = 0
+            if not c.empty and 'openInterest' in c.columns:
+                comp_oi += c['openInterest'].sum()
+            if not p.empty and 'openInterest' in p.columns:
+                comp_oi += p['openInterest'].sum()
+            comp_oi = max(comp_oi, 1)  # avoid /0
+            # Same anchor value for every column so the ratio base_oi/comp_oi
+            # is applied uniformly across all Greeks and activity columns.
+            totals = {col: comp_oi for col in exposure_cols + activity_cols}
+
             component_data.append({
                 'ticker': comp_tick,
                 'price': comp_price,
@@ -719,21 +958,17 @@ def fetch_options_for_date(ticker, date, exposure_metric="Open Interest", delta_
         if not component_data:
             return pd.DataFrame(), pd.DataFrame()
         
-        # Use the base component's totals as a fixed reference anchor.
-        # Base component (SPX) stays untouched (factor = 1.0).
-        # Non-base components: factor = base_total / component_total
-        # (scaled UP so their total matches SPX's magnitude).
-        # Combined total ≈ N × base_total.
-        #
-        # Key stability property: a change in QQQ's or IWM's totals only
-        # affects that component's bars — SPX/QQQ bars stay unchanged.
+        # OI-based reference anchor: base_oi / comp_oi is the single scale
+        # factor applied to all columns for every non-base component.
+        # Because OI only changes overnight, this ratio stays constant between
+        # live price-update cycles — eliminating the intraday Greek-jump problem
+        # that arose when per-Greek totals (GEX ∝ S², DEX ∝ S) swung with price.
         base_cd = next((cd for cd in component_data if cd['ticker'] == base_ticker), component_data[0])
-        base_totals = base_cd['totals']
-        
-        # Second pass: per-column normalization anchored to base component,
-        # then map strikes to base-equivalent via moneyness.
-        # Matches ezoptions.py: base component (SPX) is UNTOUCHED,
-        # non-base components are scaled so their total matches SPX's total.
+        base_totals = base_cd['totals']  # {col: base_oi} for all cols
+
+        # Second pass: OI-anchored normalization, then moneyness strike mapping.
+        # Base component (SPX) is untouched (factor = 1.0).
+        # Non-base: scale so their total OI matches base OI, then apply to Greeks.
         for cd in component_data:
             comp_tick = cd['ticker']
             comp_price = cd['price']
@@ -2569,6 +2804,7 @@ def create_price_chart(price_data, calls=None, puts=None, exposure_levels_types=
             col_name = exposure_levels_type
             if exposure_levels_type == 'Vanna' or exposure_levels_type == 'VEX': col_name = 'VEX'
             if exposure_levels_type == 'AbsGEX': col_name = 'GEX'
+            if exposure_levels_type == 'Volume': col_name = 'volume'
             
             # Check if column exists
             if col_name in range_calls.columns and col_name in range_puts.columns:
@@ -2590,6 +2826,9 @@ def create_price_chart(price_data, calls=None, puts=None, exposure_levels_types=
                     elif exposure_levels_type == 'AbsGEX':
                         # Absolute GEX = |Call GEX| + |Put GEX|
                         net_val = abs(c_val) + abs(p_val)
+                    elif exposure_levels_type == 'Volume':
+                        # Volume levels use call volume minus put volume.
+                        net_val = c_val - p_val
                     elif exposure_levels_type == 'DEX':
                          # DEX: Call + Put. (Puts have negative delta).
                          net_val = c_val + p_val
@@ -2684,11 +2923,190 @@ def create_price_chart(price_data, calls=None, puts=None, exposure_levels_types=
     return fig.to_json()
 
 
+def snap_timestamp_to_chart_time(timestamp, chart_times):
+    """Snap a stored interval timestamp to the nearest visible candle time."""
+    if not chart_times:
+        return None
+
+    idx = bisect_left(chart_times, timestamp)
+    if idx <= 0:
+        return chart_times[0]
+    if idx >= len(chart_times):
+        return chart_times[-1]
+
+    prev_time = chart_times[idx - 1]
+    next_time = chart_times[idx]
+    if abs(timestamp - prev_time) <= abs(next_time - timestamp):
+        return prev_time
+    return next_time
+
+
+def build_historical_levels_overlay(ticker, display_date, chart_times, latest_price, strike_range,
+                                    selected_types, levels_count, call_color, put_color,
+                                    highlight_max_level=False, max_level_color='#800080',
+                                    coloring_mode='Linear Intensity'):
+    """Build historical intraday exposure overlays for the TradingView price chart."""
+    if not ticker or not chart_times or not selected_types or not latest_price:
+        return [], []
+
+    normalized_types = []
+    include_expected_move = False
+    for level_type in selected_types:
+        normalized = normalize_level_type(level_type)
+        if normalized == 'Expected Move':
+            include_expected_move = True
+            continue
+        if normalized in INTERVAL_LEVEL_VALUE_KEYS and normalized not in normalized_types:
+            normalized_types.append(normalized)
+
+    min_strike = latest_price * (1 - strike_range)
+    max_strike = latest_price * (1 + strike_range)
+    interval_rows = get_interval_data(ticker, display_date) if normalized_types else []
+    session_rows = get_interval_session_data(ticker, display_date) if include_expected_move else []
+
+    points_by_time = {}
+    for row in interval_rows:
+        timestamp, _, strike, net_gamma, net_delta, net_vanna, net_charm, abs_gex_total, net_volume, net_speed, net_vomma, net_color = row
+        if strike < min_strike or strike > max_strike:
+            continue
+
+        snapped_time = snap_timestamp_to_chart_time(timestamp, chart_times)
+        if snapped_time is None:
+            continue
+
+        value_map = {
+            'GEX': net_gamma,
+            'AbsGEX': abs_gex_total,
+            'DEX': net_delta,
+            'VEX': net_vanna,
+            'Charm': net_charm,
+            'Volume': net_volume,
+            'Speed': net_speed,
+            'Vomma': net_vomma,
+            'Color': net_color,
+        }
+        bucket = points_by_time.setdefault(snapped_time, {'time': snapped_time, 'by_type': {}})
+        for level_type in normalized_types:
+            value = value_map.get(level_type)
+            if value is None or value == 0:
+                continue
+            bucket['by_type'].setdefault(level_type, []).append((float(strike), float(value)))
+
+    selected_points = []
+    max_abs_by_type = {}
+    for bucket in points_by_time.values():
+        snapped_time = bucket['time']
+        for level_type, candidates in bucket['by_type'].items():
+            top_levels = sorted(candidates, key=lambda item: abs(item[1]), reverse=True)[:levels_count]
+            for rank, (strike, value) in enumerate(top_levels, start=1):
+                selected_points.append({
+                    'time': snapped_time,
+                    'price': strike,
+                    'value': value,
+                    'type': level_type,
+                    'rank': rank,
+                })
+                max_abs_by_type[level_type] = max(max_abs_by_type.get(level_type, 0), abs(value))
+
+    highlight_abs_by_bucket_type = {}
+    if highlight_max_level:
+        for point in selected_points:
+            bucket_key = (point['time'], point['type'])
+            highlight_abs_by_bucket_type[bucket_key] = max(
+                highlight_abs_by_bucket_type.get(bucket_key, 0),
+                abs(point['value'])
+            )
+
+    historical_points = []
+    for point in selected_points:
+        level_type = point['type']
+        type_max_value = max_abs_by_type.get(level_type, 0) or 1.0
+        normalized_value = min(1.0, abs(point['value']) / type_max_value)
+        if coloring_mode == 'Solid':
+            intensity = 0.95
+        elif coloring_mode == 'Ranked Intensity':
+            intensity = 0.15 + 0.85 * (normalized_value ** 3)
+        else:
+            intensity = 0.35 + 0.65 * normalized_value
+
+        bucket_key = (point['time'], level_type)
+        is_max = (
+            highlight_max_level
+            and highlight_abs_by_bucket_type.get(bucket_key, 0) > 0
+            and abs(point['value']) == highlight_abs_by_bucket_type[bucket_key]
+        )
+        base_color = call_color if point['value'] >= 0 else put_color
+        historical_points.append({
+            'time': point['time'],
+            'price': round(point['price'], 4),
+            'size': round(6 + (12 * normalized_value) + (2 if is_max else 0), 2),
+            'color': hex_to_rgba(base_color, intensity),
+            'border_color': max_level_color if is_max else base_color,
+            'border_width': 2 if is_max else 1,
+            'label': INTERVAL_LEVEL_DISPLAY_NAMES.get(level_type, level_type),
+            'rank': point['rank'],
+            'side': 'Call' if point['value'] >= 0 else 'Put',
+            'value': format_large_number(point['value']),
+            'kind': 'exposure',
+        })
+
+    expected_move_by_time = {}
+    for row in session_rows:
+        timestamp, price, expected_move, expected_move_upper, expected_move_lower = row
+        if expected_move is None or expected_move <= 0 or expected_move_upper is None or expected_move_lower is None:
+            continue
+        snapped_time = snap_timestamp_to_chart_time(timestamp, chart_times)
+        if snapped_time is None:
+            continue
+        expected_move_by_time[snapped_time] = {
+            'time': snapped_time,
+            'price': round(price, 4),
+            'move': round(expected_move, 4),
+            'upper': round(expected_move_upper, 4),
+            'lower': round(expected_move_lower, 4),
+        }
+
+    expected_move_rows = [
+        expected_move_by_time[time_key]
+        for time_key in sorted(expected_move_by_time.keys())
+    ]
+    max_expected_move = max((row['move'] for row in expected_move_rows), default=0) or 1.0
+    for row in expected_move_rows:
+        normalized_value = min(1.0, abs(row['move']) / max_expected_move)
+        if coloring_mode == 'Solid':
+            intensity = 0.95
+        elif coloring_mode == 'Ranked Intensity':
+            intensity = 0.15 + 0.85 * (normalized_value ** 3)
+        else:
+            intensity = 0.35 + 0.65 * normalized_value
+
+        bubble_size = round(7 + (10 * normalized_value), 2)
+        for direction, bubble_price in (('Upper', row['upper']), ('Lower', row['lower'])):
+            historical_points.append({
+                'time': row['time'],
+                'price': bubble_price,
+                'size': bubble_size,
+                'color': hex_to_rgba('#036bfc', intensity),
+                'border_color': '#81b4ff',
+                'border_width': 1,
+                'label': 'Expected Move',
+                'rank': None,
+                'side': direction,
+                'value': f"${row['move']:.2f}",
+                'kind': 'expected-move',
+                'reference_price': f"${row['price']:.2f}",
+            })
+
+    historical_expected_moves = []
+
+    return historical_points, historical_expected_moves
+
+
 def prepare_price_chart_data(price_data, calls=None, puts=None, exposure_levels_types=[],
                               exposure_levels_count=3, call_color='#00FF00', put_color='#FF0000',
                               strike_range=0.1, use_heikin_ashi=False,
                               highlight_max_level=False, max_level_color='#800080',
-                              coloring_mode='Linear Intensity'):
+                              coloring_mode='Linear Intensity', ticker=None):
     """Return raw OHLCV + overlay data as JSON for TradingView Lightweight Charts rendering."""
     import json as _json
 
@@ -2719,9 +3137,11 @@ def prepare_price_chart_data(price_data, calls=None, puts=None, exposure_levels_
     # Filter to current day
     current_day_candles = [c for c in sorted_candles
                            if datetime.fromtimestamp(c['datetime'] / 1000, est).date() == current_date]
+    display_date = current_date
     if not current_day_candles:
         most_recent_date = max(
             datetime.fromtimestamp(c['datetime'] / 1000, est).date() for c in sorted_candles)
+        display_date = most_recent_date
         current_day_candles = [c for c in sorted_candles
                                if datetime.fromtimestamp(c['datetime'] / 1000, est).date() == most_recent_date]
 
@@ -2764,6 +3184,21 @@ def prepare_price_chart_data(price_data, calls=None, puts=None, exposure_levels_
     last_candle = display_candles[-1] if display_candles else None
     last_candle_up = (last_candle['close'] >= last_candle['open']) if last_candle else True
 
+    historical_exposure_levels, historical_expected_moves = build_historical_levels_overlay(
+        ticker=ticker,
+        display_date=display_date.strftime('%Y-%m-%d') if hasattr(display_date, 'strftime') else str(display_date),
+        chart_times=[c['time'] for c in lc_candles],
+        latest_price=current_price,
+        strike_range=strike_range,
+        selected_types=exposure_levels_types,
+        levels_count=exposure_levels_count,
+        call_color=call_color,
+        put_color=put_color,
+        highlight_max_level=highlight_max_level,
+        max_level_color=max_level_color,
+        coloring_mode=coloring_mode,
+    )
+
     # Compute exposure levels
     exposure_levels = []
     expected_moves = []
@@ -2779,31 +3214,11 @@ def prepare_price_chart_data(price_data, calls=None, puts=None, exposure_levels_
 
         for i, etype in enumerate(exposure_levels_types):
             if etype.lower() == 'expected move':
-                strikes_sorted = sorted(calls['strike'].unique()) if not calls.empty else []
-                if not strikes_sorted:
-                    continue
-                atm_strike = min(strikes_sorted, key=lambda x: abs(x - current_price))
-
-                def _get_mid(df, strike):
-                    row = df.loc[df['strike'] == strike]
-                    if row is not None and not row.empty:
-                        bid = row['bid'].values[0]
-                        ask = row['ask'].values[0]
-                        if bid > 0 and ask > 0:
-                            return (bid + ask) / 2
-                        elif bid > 0:
-                            return bid
-                        elif ask > 0:
-                            return ask
-                    return None
-
-                c_mid = _get_mid(calls, atm_strike)
-                p_mid = _get_mid(puts, atm_strike)
-                straddle = (c_mid or 0) + (p_mid or 0)
-                if straddle > 0:
+                expected_move_snapshot = calculate_expected_move_snapshot(calls, puts, current_price)
+                if expected_move_snapshot:
                     expected_moves.append({
-                        'upper': round(current_price + straddle, 2),
-                        'lower': round(current_price - straddle, 2)
+                        'upper': round(expected_move_snapshot['upper'], 2),
+                        'lower': round(expected_move_snapshot['lower'], 2)
                     })
                 continue
 
@@ -2812,6 +3227,8 @@ def prepare_price_chart_data(price_data, calls=None, puts=None, exposure_levels_
                 col_name = 'VEX'
             if etype == 'AbsGEX':
                 col_name = 'GEX'
+            if etype == 'Volume':
+                col_name = 'volume'
 
             if col_name in range_calls.columns and col_name in range_puts.columns:
                 call_ex = range_calls.groupby('strike')[col_name].sum().to_dict() if not range_calls.empty else {}
@@ -2825,6 +3242,8 @@ def prepare_price_chart_data(price_data, calls=None, puts=None, exposure_levels_
                         net_val = c_val - p_val
                     elif etype == 'AbsGEX':
                         net_val = abs(c_val) + abs(p_val)
+                    elif etype == 'Volume':
+                        net_val = c_val - p_val
                     else:
                         net_val = c_val + p_val
                     levels[strike] = net_val
@@ -2896,6 +3315,8 @@ def prepare_price_chart_data(price_data, calls=None, puts=None, exposure_levels_
         'last_candle_up': last_candle_up,
         'exposure_levels': exposure_levels,
         'expected_moves': expected_moves,
+        'historical_exposure_levels': historical_exposure_levels,
+        'historical_expected_moves': historical_expected_moves,
         'indicator_candles': lc_indicator_candles,
         'current_day_start_time': current_day_start_time,
     })
@@ -4491,41 +4912,6 @@ def index():
             /* overridden below by TV chart styles */
         }
         
-        .historical-bubbles-row {
-            display: grid;
-            gap: 5px;
-            width: 100%;
-            margin-bottom: 5px;
-        }
-        
-        .historical-bubbles-row.one-bubble {
-            grid-template-columns: 1fr;
-        }
-        
-        .historical-bubbles-row.two-bubbles {
-            grid-template-columns: repeat(2, 1fr);
-        }
-        
-        .historical-bubbles-row.three-bubbles {
-            grid-template-columns: repeat(3, 1fr);
-        }
-        
-        .historical-bubbles-row.four-bubbles {
-            grid-template-columns: repeat(2, 1fr);
-        }
-        
-        .historical-bubble-container {
-            width: 100%;
-            height: 500px;
-            background-color: #1E1E1E;
-            border-radius: 4px;
-            overflow: hidden;
-        }
-        
-        .historical-bubble-container .chart-container {
-            height: 100%;
-            width: 100%;
-        }
         
         .chart-container {
             padding: 5px;
@@ -4562,6 +4948,112 @@ def index():
             overflow: hidden;
             /* override .chart-container defaults that conflict */
             margin-bottom: 0 !important;
+        }
+        .tv-historical-overlay {
+            position: absolute;
+            inset: 0;
+            z-index: 4;
+            pointer-events: none;
+            overflow: hidden;
+        }
+        .tv-historical-bubble {
+            position: absolute;
+            border-radius: 999px;
+            transform: translate(-50%, -50%);
+            box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.25);
+            opacity: 0.95;
+            pointer-events: auto;
+            cursor: pointer;
+        }
+        .tv-historical-tooltip {
+            position: absolute;
+            z-index: 55;
+            display: none;
+            width: auto !important;
+            height: auto !important;
+            min-width: 0;
+            max-width: min(240px, calc(100% - 16px));
+            padding: 8px;
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            border-radius: 10px;
+            background: linear-gradient(180deg, rgba(30, 34, 41, 0.96), rgba(16, 18, 23, 0.98));
+            color: #eef2f7;
+            font-size: 10px;
+            line-height: 1.25;
+            pointer-events: none;
+            box-shadow: 0 14px 36px rgba(0, 0, 0, 0.38);
+            backdrop-filter: blur(10px);
+            flex: none !important;
+            align-self: flex-start;
+            overflow: hidden;
+            white-space: normal;
+        }
+        .tv-historical-tooltip .tt-head {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+            margin-bottom: 6px;
+        }
+        .tv-historical-tooltip .tt-badge {
+            padding: 2px 6px;
+            border-radius: 999px;
+            background: rgba(255, 255, 255, 0.08);
+            color: #c9d1db;
+            font-size: 9px;
+            letter-spacing: 0.02em;
+            text-transform: uppercase;
+        }
+        .tv-historical-tooltip .tt-time {
+            color: #8f9baa;
+            font-size: 9px;
+            margin-bottom: 0;
+        }
+        .tv-historical-tooltip .tt-list {
+            display: grid;
+            gap: 4px;
+        }
+        .tv-historical-tooltip .tt-row {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            min-width: 0;
+        }
+        .tv-historical-tooltip .tt-dot {
+            width: 7px;
+            height: 7px;
+            border-radius: 999px;
+            box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.12);
+            flex: 0 0 auto;
+        }
+        .tv-historical-tooltip .tt-main {
+            display: flex;
+            justify-content: space-between;
+            align-items: baseline;
+            gap: 8px;
+            min-width: 0;
+            width: 100%;
+        }
+        .tv-historical-tooltip .tt-name {
+            color: #f4f7fb;
+            font-weight: 600;
+            min-width: 0;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .tv-historical-tooltip .tt-value {
+            color: #9fb0c4;
+            font-variant-numeric: tabular-nums;
+            white-space: nowrap;
+            flex: 0 0 auto;
+        }
+        .tv-historical-tooltip .tt-more {
+            color: #8190a3;
+            margin-top: 4px;
+            padding-top: 4px;
+            border-top: 1px solid rgba(255, 255, 255, 0.06);
+            font-size: 9px;
         }
         .tv-chart-title {
             display: inline-block;
@@ -4915,15 +5407,7 @@ def index():
             .charts-grid.many-charts {
                 grid-template-columns: 1fr;
             }
-            .historical-bubbles-row.two-bubbles,
-            .historical-bubbles-row.three-bubbles,
-            .historical-bubbles-row.four-bubbles {
-                grid-template-columns: 1fr;
-            }
             .chart-container {
-                height: 350px;
-            }
-            .historical-bubble-container {
                 height: 350px;
             }
             .price-info {
@@ -4945,9 +5429,6 @@ def index():
                 font-size: 1.2em;
             }
             .chart-container {
-                height: 300px;
-            }
-            .historical-bubble-container {
                 height: 300px;
             }
         }
@@ -5120,7 +5601,7 @@ def index():
                 <div class="controls">
                     <div class="control-group">
                         <label for="strike_range">Strike Range (%):</label>
-                        <input type="range" id="strike_range" min="1" max="20" value="2" step="0.5">
+                        <input type="range" id="strike_range" min="0.5" max="20" value="2" step="0.5">
                         <span class="range-value" id="strike_range_value">2%</span>
                         <button id="match_em_range" title="Toggle: auto-sync strike range to Expected Move (ATM straddle) + 0.5% wiggle room" style="margin-left:4px;padding:2px 6px;font-size:11px;cursor:pointer;background:#2a2a2a;color:#888888;border:1px solid #555555;border-radius:3px;">📐 EM</button>
                     </div>
@@ -5173,6 +5654,7 @@ def index():
                                 <div class="levels-option"><input type="checkbox" value="DEX" id="lvl-DEX"><label for="lvl-DEX">DEX</label></div>
                                 <div class="levels-option"><input type="checkbox" value="VEX" id="lvl-VEX"><label for="lvl-VEX">Vanna</label></div>
                                 <div class="levels-option"><input type="checkbox" value="Charm" id="lvl-Charm"><label for="lvl-Charm">Charm</label></div>
+                                <div class="levels-option"><input type="checkbox" value="Volume" id="lvl-Volume"><label for="lvl-Volume">Volume</label></div>
                                 <div class="levels-option"><input type="checkbox" value="Speed" id="lvl-Speed"><label for="lvl-Speed">Speed</label></div>
                                 <div class="levels-option"><input type="checkbox" value="Vomma" id="lvl-Vomma"><label for="lvl-Vomma">Vomma</label></div>
                                 <div class="levels-option"><input type="checkbox" value="Color" id="lvl-Color"><label for="lvl-Color">Color</label></div>
@@ -5238,26 +5720,6 @@ def index():
             <div class="chart-checkbox">
                 <input type="checkbox" id="price" checked>
                 <label for="price">Price Chart</label>
-            </div>
-            <div class="chart-checkbox">
-                <input type="checkbox" id="gex_historical_bubble" checked>
-                <label for="gex_historical_bubble">GEX Historical Bubble Levels</label>
-            </div>
-            <div class="chart-checkbox" style="margin-left:12px;">
-                <input type="checkbox" id="gex_absolute">
-                <label for="gex_absolute">Absolute GEX (bubble)</label>
-            </div>
-            <div class="chart-checkbox">
-                <input type="checkbox" id="dex_historical_bubble" checked>
-                <label for="dex_historical_bubble">DEX Historical Bubble Levels</label>
-            </div>
-            <div class="chart-checkbox">
-                <input type="checkbox" id="vanna_historical_bubble" checked>
-                <label for="vanna_historical_bubble">Vanna Historical Bubble Levels</label>
-            </div>
-            <div class="chart-checkbox">
-                <input type="checkbox" id="charm_historical_bubble" checked>
-                <label for="charm_historical_bubble">Charm Historical Bubble Levels</label>
             </div>
             <div class="chart-checkbox">
                 <input type="checkbox" id="gamma" checked>
@@ -5327,9 +5789,6 @@ def index():
                     <div id="macd-chart" style="height:120px"></div>
                 </div>
             </div>
-            <div class="historical-bubbles-row" id="historical-bubbles-row">
-                <!-- Historical bubble levels will be dynamically inserted here -->
-            </div>
         </div>
     </div>
 
@@ -5378,6 +5837,11 @@ def index():
         // kept so they can be removed without a full chart rebuild
         let tvExposurePriceLines = [];
         let tvExpectedMovePriceLines = [];
+        let tvHistoricalPoints = [];
+        let tvHistoricalExpectedMoveSeries = [];
+        let tvHistoricalOverlayPending = false;
+        let tvHistoricalOverlayDomEventsBound = false;
+        let tvHistoricalRenderedPoints = [];
         // Track the active ticker so we can reset chart state on ticker change
         let tvLastTicker = null;
         // When true, the next render will call fitContent() regardless of tvAutoRange
@@ -5745,6 +6209,19 @@ def index():
   .tv-ohlc-tooltip .tt-time { color:#aaa; font-size:10px; margin-bottom:2px; }
   .tv-ohlc-tooltip .tt-up { color:#00FF00; }
   .tv-ohlc-tooltip .tt-dn { color:#FF4444; }
+    .tv-historical-overlay { position:absolute; inset:0; z-index:4; pointer-events:none; overflow:hidden; }
+    .tv-historical-bubble { position:absolute; border-radius:999px; transform:translate(-50%,-50%); box-shadow:0 0 0 1px rgba(0,0,0,0.25); opacity:0.95; pointer-events:auto; cursor:pointer; }
+    .tv-historical-tooltip { position:absolute; z-index:55; display:none; width:auto !important; height:auto !important; min-width:0; max-width:min(240px,calc(100% - 16px)); padding:8px; border:1px solid rgba(255,255,255,0.08); border-radius:10px; background:linear-gradient(180deg,rgba(30,34,41,0.96),rgba(16,18,23,0.98)); color:#eef2f7; font-size:10px; line-height:1.25; pointer-events:none; box-shadow:0 14px 36px rgba(0,0,0,0.38); backdrop-filter:blur(10px); flex:none !important; align-self:flex-start; overflow:hidden; white-space:normal; }
+    .tv-historical-tooltip .tt-head { display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:6px; }
+    .tv-historical-tooltip .tt-badge { padding:2px 6px; border-radius:999px; background:rgba(255,255,255,0.08); color:#c9d1db; font-size:9px; letter-spacing:0.02em; text-transform:uppercase; }
+    .tv-historical-tooltip .tt-time { color:#8f9baa; font-size:9px; margin-bottom:0; }
+    .tv-historical-tooltip .tt-list { display:grid; gap:4px; }
+    .tv-historical-tooltip .tt-row { display:flex; align-items:center; gap:6px; min-width:0; }
+    .tv-historical-tooltip .tt-dot { width:7px; height:7px; border-radius:999px; box-shadow:0 0 0 1px rgba(255,255,255,0.12); flex:0 0 auto; }
+    .tv-historical-tooltip .tt-main { display:flex; justify-content:space-between; align-items:baseline; gap:8px; min-width:0; width:100%; }
+    .tv-historical-tooltip .tt-name { color:#f4f7fb; font-weight:600; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .tv-historical-tooltip .tt-value { color:#9fb0c4; font-variant-numeric:tabular-nums; white-space:nowrap; flex:0 0 auto; }
+    .tv-historical-tooltip .tt-more { color:#8190a3; margin-top:4px; padding-top:4px; border-top:1px solid rgba(255,255,255,0.06); font-size:9px; }
 </style></head><body>
 <div id="popout-logo">EzDuz1t Options</div>
 <div id="toolbar">
@@ -5765,6 +6242,7 @@ def index():
   var activeInds=new Set();
   var tvPriceLines=[], tvDrawings=[], tvDrawingDefs=[];
   var tvAllLevelPrices=[];
+    var tvHistoricalPoints=[];
   var tvLastCandles=[];
   var tvDrawMode=null, tvDrawStart=null;
   var tvAutoRange=false;
@@ -5773,6 +6251,8 @@ def index():
   var lineStyleMap={};
   var popoutTimeframe=1;
   var popoutCandleTimerInterval=null;
+    var historicalDomBound=false;
+    var tvHistoricalRenderedPoints=[];
 
   // ── Candle close timer (popout) ────────────────────────────────────────────
   function startCandleCloseTimer(){
@@ -5906,6 +6386,14 @@ def index():
   }
   function tvApplyAutoscale(){if(!tvCandle)return;var lp=tvAllLevelPrices.slice();tvCandle.applyOptions({autoscaleInfoProvider:function(original){var res=original();if(!res)return res;if(lp.length===0)return res;var pad=(res.priceRange.maxValue-res.priceRange.minValue)*0.05;var minV=Math.min.apply(null,[res.priceRange.minValue].concat(lp))-pad;var maxV=Math.max.apply(null,[res.priceRange.maxValue].concat(lp))+pad;return{priceRange:{minValue:minV,maxValue:maxV},margins:res.margins};}});}
   function fitAll(){if(!tvChart)return;setTimeout(function(){try{tvChart.timeScale().fitContent();tvChart.priceScale('right').applyOptions({autoScale:true});tvApplyAutoscale();if(tvRsiChart)tvRsiChart.priceScale('right').applyOptions({autoScale:true});if(tvMacdChart)tvMacdChart.priceScale('right').applyOptions({autoScale:true});}catch(e){}},50);}
+    function ensureHistOverlay(){var c=document.getElementById('price-chart');if(!c)return null;var o=c.querySelector('.tv-historical-overlay');if(!o){o=document.createElement('div');o.className='tv-historical-overlay';c.appendChild(o);}return o;}
+    function ensureHistTip(){var c=document.getElementById('price-chart');if(!c)return null;var t=c.querySelector('.tv-historical-tooltip');if(!t){t=document.createElement('div');t.className='tv-historical-tooltip';c.appendChild(t);}return t;}
+    function fmtHistTime(ts){return new Date(ts*1000).toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit',hour12:false,timeZone:'America/New_York'})+' ET';}
+    function histTipHtml(p){var dot=p.border_color||p.color||'#fff',name=p.kind==='expected-move'?p.label+' '+p.side:p.label+' '+p.side.charAt(0),value=p.kind==='expected-move'?p.value:'$'+Number(p.price).toFixed(2)+'  '+p.value;return '<div class="tt-row"><span class="tt-dot" style="background:'+dot+'"></span><div class="tt-main"><span class="tt-name">'+name+'</span><span class="tt-value">'+value+'</span></div></div>';}
+    function posHistTip(t,e){var c=document.getElementById('price-chart');if(!t||!c||!e)return;var b=c.getBoundingClientRect();var l=Math.min(Math.max(8,e.clientX-b.left+12),Math.max(8,b.width-t.offsetWidth-8));var top=Math.min(Math.max(8,e.clientY-b.top+12),Math.max(8,b.height-t.offsetHeight-8));t.style.left=l+'px';t.style.top=top+'px';}
+    function findHistHoverPoints(e){var c=document.getElementById('price-chart');if(!c||!tvHistoricalRenderedPoints.length)return[];var b=c.getBoundingClientRect(),cx=e.clientX-b.left,cy=e.clientY-b.top;return tvHistoricalRenderedPoints.filter(function(p){var dx=cx-p.x,dy=cy-p.y,r=Math.max(8,(p.size||8)/2+5);return(dx*dx+dy*dy)<=(r*r);}).sort(function(a,bp){var ad=(cx-a.x)*(cx-a.x)+(cy-a.y)*(cy-a.y),bd=(cx-bp.x)*(cx-bp.x)+(cy-bp.y)*(cy-bp.y);return ad-bd;});}
+    function updateHistTip(e){var t=ensureHistTip();if(!t)return;var pts=findHistHoverPoints(e);if(!pts.length){t.style.display='none';return;}var topPts=pts.slice(0,5),anchorTime=topPts[0].time;t.innerHTML='<div class="tt-head"><span class="tt-badge">'+pts.length+' bubble'+(pts.length===1?'':'s')+'</span><div class="tt-time">'+fmtHistTime(anchorTime)+'</div></div><div class="tt-list">'+topPts.map(function(p){return histTipHtml(p);}).join('')+'</div>'+(pts.length>topPts.length?'<div class="tt-more">+'+(pts.length-topPts.length)+' more</div>':'');t.style.display='block';posHistTip(t,e);}
+    function drawHistoricalBubbles(){var o=ensureHistOverlay(),t=ensureHistTip();if(!o||!tvChart||!tvCandle)return;o.innerHTML='';tvHistoricalRenderedPoints=[];if(!tvHistoricalPoints.length){o.style.display='none';if(t)t.style.display='none';return;}var frag=document.createDocumentFragment(),visible=0;tvHistoricalPoints.forEach(function(p){var x=tvChart.timeScale().timeToCoordinate(p.time),y=tvCandle.priceToCoordinate(p.price);if(x==null||y==null||Number.isNaN(x)||Number.isNaN(y))return;var b=document.createElement('div');b.className='tv-historical-bubble';b.style.left=x+'px';b.style.top=y+'px';b.style.width=(p.size||8)+'px';b.style.height=(p.size||8)+'px';b.style.background=p.color||'rgba(255,255,255,0.6)';b.style.border=(p.border_width||1)+'px solid '+(p.border_color||p.color||'#fff');frag.appendChild(b);tvHistoricalRenderedPoints.push(Object.assign({},p,{x:x,y:y}));visible++;});o.appendChild(frag);o.style.display=visible>0?'block':'none';}
 
   // ── Main renderer ──────────────────────────────────────────────────────────
   var isFirstRender=true;
@@ -5922,6 +6410,7 @@ def index():
       tvChart.priceScale('volume').applyOptions({scaleMargins:{top:0.88,bottom:0}});
       document.getElementById('chart-title').textContent=priceData.use_heikin_ashi?'Price Chart (Heikin-Ashi)':'Price Chart';
       buildToolbar(candles,upColor,downColor);
+    ensureHistOverlay();ensureHistTip();tvChart.timeScale().subscribeVisibleLogicalRangeChange(function(){requestAnimationFrame(drawHistoricalBubbles);});if(!historicalDomBound){historicalDomBound=true;el.addEventListener('wheel',function(){requestAnimationFrame(drawHistoricalBubbles);},{passive:true});el.addEventListener('mouseup',function(){requestAnimationFrame(drawHistoricalBubbles);});el.addEventListener('touchend',function(){requestAnimationFrame(drawHistoricalBubbles);},{passive:true});el.addEventListener('mousemove',function(e){updateHistTip(e);});el.addEventListener('mouseleave',function(){var t=ensureHistTip();if(t)t.style.display='none';});}
       // ── OHLC hover tooltip ──────────────────────────────────────────────
       var _ptip=document.createElement('div');_ptip.className='tv-ohlc-tooltip';_ptip.id='tv-ohlc-tooltip';el.appendChild(_ptip);
       tvChart.subscribeCrosshairMove(function(param){
@@ -5945,10 +6434,10 @@ def index():
     tvCandle.setData(candles);
     tvVol.setData(priceData.volume||[]);
     tvLastCandles=candles;
-    // Exposure & expected-move price lines
-    tvPriceLines.forEach(function(l){try{tvCandle.removePriceLine(l);}catch(e){}});tvPriceLines=[];tvAllLevelPrices=[];
-    (priceData.exposure_levels||[]).forEach(function(lv){tvAllLevelPrices.push(lv.price);tvPriceLines.push(tvCandle.createPriceLine({price:lv.price,color:lv.color,lineWidth:lv.line_width||1,lineStyle:lineStyleMap[lv.dash_style]||LightweightCharts.LineStyle.Dashed,axisLabelVisible:true,title:lv.label}));});
-    (priceData.expected_moves||[]).forEach(function(em){tvAllLevelPrices.push(em.upper,em.lower);tvPriceLines.push(tvCandle.createPriceLine({price:em.upper,color:'#036bfc',lineWidth:2,lineStyle:LightweightCharts.LineStyle.Dashed,axisLabelVisible:true,title:'EM+'}));tvPriceLines.push(tvCandle.createPriceLine({price:em.lower,color:'#036bfc',lineWidth:2,lineStyle:LightweightCharts.LineStyle.Dashed,axisLabelVisible:true,title:'EM-'}));});
+        tvPriceLines.forEach(function(l){try{tvCandle.removePriceLine(l);}catch(e){}});tvPriceLines=[];tvAllLevelPrices=[];
+        tvHistoricalPoints=priceData.historical_exposure_levels||[];
+        tvHistoricalPoints.forEach(function(p){tvAllLevelPrices.push(p.price);});
+        requestAnimationFrame(drawHistoricalBubbles);
     tvApplyAutoscale();
     if(activeInds.size>0)applyIndicators(candles);
     if(isFirstRender||tvAutoRange){fitAll();isFirstRender=false;}
@@ -6057,8 +6546,9 @@ def index():
           if(tvCandle){
             tvPriceLines.forEach(function(l){try{tvCandle.removePriceLine(l);}catch(e){}});
             tvPriceLines=[];tvAllLevelPrices=[];
-            (pd.exposure_levels||[]).forEach(function(lv){tvAllLevelPrices.push(lv.price);tvPriceLines.push(tvCandle.createPriceLine({price:lv.price,color:lv.color,lineWidth:lv.line_width||1,lineStyle:lineStyleMap[lv.dash_style]||LightweightCharts.LineStyle.Dashed,axisLabelVisible:true,title:lv.label}));});
-            (pd.expected_moves||[]).forEach(function(em){tvAllLevelPrices.push(em.upper,em.lower);tvPriceLines.push(tvCandle.createPriceLine({price:em.upper,color:'#036bfc',lineWidth:2,lineStyle:LightweightCharts.LineStyle.Dashed,axisLabelVisible:true,title:'EM+'}));tvPriceLines.push(tvCandle.createPriceLine({price:em.lower,color:'#036bfc',lineWidth:2,lineStyle:LightweightCharts.LineStyle.Dashed,axisLabelVisible:true,title:'EM-'}));});
+                        tvHistoricalPoints=pd.historical_exposure_levels||[];
+                        tvHistoricalPoints.forEach(function(p){tvAllLevelPrices.push(p.price);});
+                        requestAnimationFrame(drawHistoricalBubbles);
             tvApplyAutoscale();
           }
         }
@@ -6221,7 +6711,6 @@ def index():
 
         document.getElementById('highlight_max_level').addEventListener('change', updateData);
         document.getElementById('max_level_mode').addEventListener('change', updateData);
-        document.getElementById('gex_absolute').addEventListener('change', updateData);
         
         // Helper function to create rgba color with opacity
         function createRgbaColor(hexColor, opacity) {
@@ -6245,7 +6734,7 @@ def index():
             const emPct = Math.abs(em.upper_pct);
             const withWiggle = emPct + 0.5;
             const stepped = Math.round(withWiggle / 0.5) * 0.5;
-            const clamped = Math.min(20, Math.max(1, stepped));
+            const clamped = Math.min(20, Math.max(0.5, stepped));
             const slider = document.getElementById('strike_range');
             if (parseFloat(slider.value) === clamped) return true; // no change needed
             slider.value = clamped;
@@ -6376,13 +6865,8 @@ def index():
             const maxLevelMode = document.getElementById('max_level_mode').value;
             
             // Get visible charts
-            const gexAbsolute = document.getElementById('gex_absolute').checked;
             const visibleCharts = {
                 show_price: document.getElementById('price').checked,
-                show_gex_historical_bubble: document.getElementById('gex_historical_bubble').checked,
-                show_dex_historical_bubble: document.getElementById('dex_historical_bubble').checked,
-                show_vanna_historical_bubble: document.getElementById('vanna_historical_bubble').checked,
-                show_charm_historical_bubble: document.getElementById('charm_historical_bubble').checked,
                 show_gamma: document.getElementById('gamma').checked,
                 show_delta: document.getElementById('delta').checked,
                 show_vanna: document.getElementById('vanna').checked,
@@ -6448,7 +6932,6 @@ def index():
                     highlight_max_level: highlightMaxLevel,
                     max_level_color: maxLevelColor,
                     max_level_mode: maxLevelMode,
-                    absolute_gex: gexAbsolute,
                     show_price: false,  // price is fetched independently via /update_price
                     ...visibleCharts
                 })
@@ -7180,6 +7663,168 @@ def index():
             }
         }
 
+        function ensureTVHistoricalOverlay() {
+            const container = document.getElementById('price-chart');
+            if (!container) return null;
+            let overlay = container.querySelector('.tv-historical-overlay');
+            if (!overlay) {
+                overlay = document.createElement('div');
+                overlay.className = 'tv-historical-overlay';
+                container.appendChild(overlay);
+            }
+            return overlay;
+        }
+
+        function ensureTVHistoricalTooltip() {
+            const container = document.getElementById('price-chart');
+            if (!container) return null;
+            let tooltip = container.querySelector('.tv-historical-tooltip');
+            if (!tooltip) {
+                tooltip = document.createElement('div');
+                tooltip.className = 'tv-historical-tooltip';
+                container.appendChild(tooltip);
+            }
+            return tooltip;
+        }
+
+        function formatTVBubbleTime(timestamp) {
+            return new Date(timestamp * 1000).toLocaleTimeString('en-US', {
+                hour: '2-digit',
+                minute: '2-digit',
+                hour12: false,
+                timeZone: 'America/New_York'
+            }) + ' ET';
+        }
+
+        function buildTVHistoricalTooltipHtml(point) {
+            const dotColor = point.border_color || point.color || '#ffffff';
+            const name = point.kind === 'expected-move'
+                ? point.label + ' ' + point.side
+                : point.label + ' ' + point.side.charAt(0);
+            const value = point.kind === 'expected-move'
+                ? point.value
+                : '$' + Number(point.price).toFixed(2) + '  ' + point.value;
+            return '<div class="tt-row">'
+                + '<span class="tt-dot" style="background:' + dotColor + '"></span>'
+                + '<div class="tt-main">'
+                + '<span class="tt-name">' + name + '</span>'
+                + '<span class="tt-value">' + value + '</span>'
+                + '</div>'
+                + '</div>';
+        }
+
+        function positionTVHistoricalTooltip(tooltip, event) {
+            const container = document.getElementById('price-chart');
+            if (!tooltip || !container || !event) return;
+            const bounds = container.getBoundingClientRect();
+            const offsetX = 12;
+            const offsetY = 12;
+            const left = Math.min(
+                Math.max(8, event.clientX - bounds.left + offsetX),
+                Math.max(8, bounds.width - tooltip.offsetWidth - 8)
+            );
+            const top = Math.min(
+                Math.max(8, event.clientY - bounds.top + offsetY),
+                Math.max(8, bounds.height - tooltip.offsetHeight - 8)
+            );
+            tooltip.style.left = `${left}px`;
+            tooltip.style.top = `${top}px`;
+        }
+
+        function findTVHistoricalHoverPoints(event) {
+            const container = document.getElementById('price-chart');
+            if (!container || !tvHistoricalRenderedPoints.length) return [];
+            const bounds = container.getBoundingClientRect();
+            const cursorX = event.clientX - bounds.left;
+            const cursorY = event.clientY - bounds.top;
+            return tvHistoricalRenderedPoints
+                .filter(point => {
+                    const dx = cursorX - point.x;
+                    const dy = cursorY - point.y;
+                    const radius = Math.max(8, (point.size || 8) / 2 + 5);
+                    return (dx * dx + dy * dy) <= (radius * radius);
+                })
+                .sort((left, right) => {
+                    const leftDist = (cursorX - left.x) ** 2 + (cursorY - left.y) ** 2;
+                    const rightDist = (cursorX - right.x) ** 2 + (cursorY - right.y) ** 2;
+                    return leftDist - rightDist;
+                });
+        }
+
+        function updateTVHistoricalTooltip(event) {
+            const tooltip = ensureTVHistoricalTooltip();
+            if (!tooltip) return;
+            const hoverPoints = findTVHistoricalHoverPoints(event);
+            if (!hoverPoints.length) {
+                tooltip.style.display = 'none';
+                return;
+            }
+
+            const topPoints = hoverPoints.slice(0, 5);
+            const anchorTime = topPoints[0].time;
+            tooltip.innerHTML = '<div class="tt-head"><span class="tt-badge">' + hoverPoints.length + ' bubble' + (hoverPoints.length === 1 ? '' : 's') + '</span><div class="tt-time">' + formatTVBubbleTime(anchorTime) + '</div></div>'
+                + '<div class="tt-list">' + topPoints.map(point => buildTVHistoricalTooltipHtml(point)).join('') + '</div>'
+                + (hoverPoints.length > topPoints.length
+                    ? '<div class="tt-more">+' + (hoverPoints.length - topPoints.length) + ' more</div>'
+                    : '');
+            tooltip.style.display = 'block';
+            positionTVHistoricalTooltip(tooltip, event);
+        }
+
+        function clearTVHistoricalExpectedMoveSeries() {
+            if (!tvPriceChart || !tvHistoricalExpectedMoveSeries.length) return;
+            tvHistoricalExpectedMoveSeries.forEach(series => {
+                try { tvPriceChart.removeSeries(series); } catch(e) {}
+            });
+            tvHistoricalExpectedMoveSeries = [];
+        }
+
+        function drawTVHistoricalOverlay() {
+            const overlay = ensureTVHistoricalOverlay();
+            const tooltip = ensureTVHistoricalTooltip();
+            if (!overlay || !tvPriceChart || !tvCandleSeries) return;
+
+            overlay.innerHTML = '';
+            tvHistoricalRenderedPoints = [];
+            if (!tvHistoricalPoints.length) {
+                overlay.style.display = 'none';
+                if (tooltip) tooltip.style.display = 'none';
+                return;
+            }
+
+            const fragment = document.createDocumentFragment();
+            let visibleCount = 0;
+            for (const point of tvHistoricalPoints) {
+                const x = tvPriceChart.timeScale().timeToCoordinate(point.time);
+                const y = tvCandleSeries.priceToCoordinate(point.price);
+                if (x == null || y == null || Number.isNaN(x) || Number.isNaN(y)) continue;
+
+                const bubble = document.createElement('div');
+                bubble.className = 'tv-historical-bubble';
+                bubble.style.left = `${x}px`;
+                bubble.style.top = `${y}px`;
+                bubble.style.width = `${point.size || 8}px`;
+                bubble.style.height = `${point.size || 8}px`;
+                bubble.style.background = point.color || 'rgba(255,255,255,0.6)';
+                bubble.style.border = `${point.border_width || 1}px solid ${point.border_color || point.color || '#ffffff'}`;
+                fragment.appendChild(bubble);
+                tvHistoricalRenderedPoints.push({ ...point, x, y });
+                visibleCount += 1;
+            }
+
+            overlay.appendChild(fragment);
+            overlay.style.display = visibleCount > 0 ? 'block' : 'none';
+        }
+
+        function scheduleTVHistoricalOverlayDraw() {
+            if (tvHistoricalOverlayPending) return;
+            tvHistoricalOverlayPending = true;
+            requestAnimationFrame(() => {
+                tvHistoricalOverlayPending = false;
+                drawTVHistoricalOverlay();
+            });
+        }
+
         function renderTVPriceChart(priceData) {
             const container = document.getElementById('price-chart');
             if (!container) return;
@@ -7268,6 +7913,19 @@ def index():
 
                 // Toolbar + title (only built once)
                 buildTVToolbar(container, candles, upColor, downColor);
+                ensureTVHistoricalOverlay();
+                tvPriceChart.timeScale().subscribeVisibleLogicalRangeChange(() => scheduleTVHistoricalOverlayDraw());
+                if (!tvHistoricalOverlayDomEventsBound) {
+                    tvHistoricalOverlayDomEventsBound = true;
+                    container.addEventListener('wheel', () => scheduleTVHistoricalOverlayDraw(), { passive: true });
+                    container.addEventListener('mouseup', () => scheduleTVHistoricalOverlayDraw());
+                    container.addEventListener('touchend', () => scheduleTVHistoricalOverlayDraw(), { passive: true });
+                    container.addEventListener('mousemove', (event) => updateTVHistoricalTooltip(event));
+                    container.addEventListener('mouseleave', () => {
+                        const tooltip = ensureTVHistoricalTooltip();
+                        if (tooltip) tooltip.style.display = 'none';
+                    });
+                }
                 const _tc2 = document.getElementById('tv-toolbar-container');
                 if (_tc2) {
                     const titleEl = document.createElement('div');
@@ -7335,31 +7993,17 @@ def index():
                 connectPriceStream(streamTicker);
             }
 
-            // Remove old dynamic price lines and re-add fresh ones
+            // Remove old dynamic price lines; historical levels now render only as bubbles.
             tvExposurePriceLines.forEach(l => { try { tvCandleSeries.removePriceLine(l); } catch(e){} });
             tvExposurePriceLines = [];
             tvExpectedMovePriceLines.forEach(l => { try { tvCandleSeries.removePriceLine(l); } catch(e){} });
             tvExpectedMovePriceLines = [];
+            clearTVHistoricalExpectedMoveSeries();
 
             tvAllLevelPrices = [];
-            for (const level of (priceData.exposure_levels || [])) {
-                tvAllLevelPrices.push(level.price);
-                tvExposurePriceLines.push(tvCandleSeries.createPriceLine({
-                    price:            level.price,
-                    color:            level.color,
-                    lineWidth:        level.line_width || 1,
-                    lineStyle:        lineStyleMap[level.dash_style] || LightweightCharts.LineStyle.Dashed,
-                    axisLabelVisible: true,
-                    title:            level.label,
-                }));
-            }
-            for (const em of (priceData.expected_moves || [])) {
-                tvAllLevelPrices.push(em.upper, em.lower);
-                tvExpectedMovePriceLines.push(
-                    tvCandleSeries.createPriceLine({ price: em.upper, color: '#036bfc', lineWidth: 2, lineStyle: LightweightCharts.LineStyle.Dashed, axisLabelVisible: true, title: 'EM+' }),
-                    tvCandleSeries.createPriceLine({ price: em.lower, color: '#036bfc', lineWidth: 2, lineStyle: LightweightCharts.LineStyle.Dashed, axisLabelVisible: true, title: 'EM-' })
-                );
-            }
+            tvHistoricalPoints = priceData.historical_exposure_levels || [];
+            tvHistoricalPoints.forEach(point => tvAllLevelPrices.push(point.price));
+            scheduleTVHistoricalOverlayDraw();
 
             tvApplyAutoscale();
             if (tvActiveInds.size > 0) applyIndicators(tvIndicatorCandles, tvActiveInds);
@@ -7374,6 +8018,7 @@ def index():
                         tvApplyAutoscale();
                         if (tvRsiChart)  tvRsiChart.priceScale('right').applyOptions({ autoScale: true });
                         if (tvMacdChart) tvMacdChart.priceScale('right').applyOptions({ autoScale: true });
+                        scheduleTVHistoricalOverlayDraw();
                     } catch(e) {}
                 }, 50);
                 tvForceFit = false;
@@ -7471,10 +8116,6 @@ def index():
             
             const selectedCharts = {
                 price: document.getElementById('price').checked,
-                gex_historical_bubble: document.getElementById('gex_historical_bubble').checked,
-                dex_historical_bubble: document.getElementById('dex_historical_bubble').checked,
-                vanna_historical_bubble: document.getElementById('vanna_historical_bubble').checked,
-                charm_historical_bubble: document.getElementById('charm_historical_bubble').checked,
                 gamma: document.getElementById('gamma').checked,
                 delta: document.getElementById('delta').checked,
                 vanna: document.getElementById('vanna').checked,
@@ -7536,117 +8177,14 @@ def index():
                     tvCandleSeries = null;
                     tvVolumeSeries = null;
                     tvIndicatorSeries = {};
+                    tvHistoricalPoints = [];
+                    tvHistoricalExpectedMoveSeries = [];
                 }
                 if (tvResizeObserver) {
                     tvResizeObserver.disconnect();
                     tvResizeObserver = null;
                 }
             }
-            
-            // Handle historical bubble levels and centroid
-            const historicalBubbles = ['gex_historical_bubble', 'dex_historical_bubble', 'vanna_historical_bubble', 'charm_historical_bubble', 'centroid'];
-            const historicalBubblesRow = document.getElementById('historical-bubbles-row');
-
-            // Count enabled historical bubble levels
-            const enabledBubbles = historicalBubbles.filter(bubbleType => selectedCharts[bubbleType]);
-
-            const bubbleConfig = {
-                responsive: true,
-                displayModeBar: true,
-                modeBarButtonsToRemove: ['lasso2d', 'select2d'],
-                displaylogo: false,
-                scrollZoom: true
-            };
-
-            // Only rebuild containers if the set of enabled bubbles changed
-            const currentBubbleIds = Array.from(historicalBubblesRow.querySelectorAll('.historical-bubble-container')).map(el => el.dataset.bubbleType || '');
-            const needsRebuild = enabledBubbles.length !== currentBubbleIds.length ||
-                                 !enabledBubbles.every((b, i) => currentBubbleIds[i] === b);
-
-            if (needsRebuild) {
-                // Purge existing Plotly charts before clearing DOM
-                currentBubbleIds.forEach(bt => {
-                    const el = document.getElementById(bt + '-chart');
-                    if (el) { try { Plotly.purge(el); } catch(e) {} }
-                    delete charts[bt];
-                });
-                historicalBubblesRow.innerHTML = '';
-                historicalBubblesRow.className = 'historical-bubbles-row';
-
-                // Hide the row if no bubbles are enabled
-                if (enabledBubbles.length === 0) {
-                    historicalBubblesRow.style.display = 'none';
-                } else {
-                    historicalBubblesRow.style.display = 'grid';
-
-                    // Add appropriate class based on number of enabled bubbles
-                    if (enabledBubbles.length === 1) {
-                        historicalBubblesRow.classList.add('one-bubble');
-                    } else if (enabledBubbles.length === 2) {
-                        historicalBubblesRow.classList.add('two-bubbles');
-                    } else if (enabledBubbles.length === 3) {
-                        historicalBubblesRow.classList.add('three-bubbles');
-                    } else if (enabledBubbles.length === 4) {
-                        historicalBubblesRow.classList.add('four-bubbles');
-                    }
-
-                    // Create containers and render Plotly charts
-                    enabledBubbles.forEach(bubbleType => {
-                        const bubbleContainer = document.createElement('div');
-                        bubbleContainer.className = 'historical-bubble-container';
-                        bubbleContainer.dataset.bubbleType = bubbleType;
-
-                        const chartDiv = document.createElement('div');
-                        chartDiv.className = 'chart-container';
-                        chartDiv.id = bubbleType + '-chart';
-
-                        bubbleContainer.appendChild(chartDiv);
-                        historicalBubblesRow.appendChild(bubbleContainer);
-
-                        if (data[bubbleType]) {
-                            const chartData = JSON.parse(data[bubbleType]);
-                            chartData.layout.margin = getChartMargins(chartDiv.id, chartData.layout.margin || {l: 50, r: 50, t: 50, b: 20});
-                            charts[bubbleType] = Plotly.newPlot(chartDiv, chartData.data, chartData.layout, bubbleConfig);
-                        }
-                    });
-                }
-            } else {
-                // Efficiently update existing Plotly charts without rebuilding DOM
-                enabledBubbles.forEach(bubbleType => {
-                    const chartDiv = document.getElementById(bubbleType + '-chart');
-                    if (!chartDiv) return;
-                    if (data[bubbleType]) {
-                        const chartData = JSON.parse(data[bubbleType]);
-                        chartData.layout.margin = getChartMargins(chartDiv.id, chartData.layout.margin || {l: 50, r: 50, t: 50, b: 20});
-                        Plotly.react(chartDiv, chartData.data, chartData.layout, bubbleConfig);
-                        charts[bubbleType] = true;
-                    } else {
-                        // No data for new ticker — clear to prevent stale previous ticker chart
-                        Plotly.react(chartDiv, [], {
-                            plot_bgcolor: '#1E1E1E',
-                            paper_bgcolor: '#1E1E1E',
-                            font: { color: '#CCCCCC' },
-                            annotations: [{
-                                text: 'No Data Available',
-                                x: 0.5, y: 0.5,
-                                xref: 'paper', yref: 'paper',
-                                showarrow: false,
-                                font: { color: '#CCCCCC', size: 14 }
-                            }]
-                        }, bubbleConfig);
-                        charts[bubbleType] = true;
-                    }
-                });
-            }
-
-            // Clean up disabled historical bubble levels from charts object
-            historicalBubbles.forEach(bubbleType => {
-                if (!selectedCharts[bubbleType]) {
-                    const el = document.getElementById(bubbleType + '-chart');
-                    if (el) { try { Plotly.purge(el); } catch(e) {} }
-                    delete charts[bubbleType];
-                }
-            });
             
             // Handle other charts
             let chartsGrid = document.querySelector('.charts-grid');
@@ -7659,9 +8197,9 @@ def index():
             // Check if we need to rebuild the grid (enabled charts changed)
             const currentChartIds = Array.from(chartsGrid.querySelectorAll('.chart-container')).map(el => el.id.replace('-chart', ''));
             
-            // Count enabled regular charts (excluding price and historical bubble levels)
+            // Count enabled regular charts (excluding price)
             const regularCharts = Object.entries(selectedCharts).filter(([key, selected]) => 
-                selected && !['price'].includes(key) && !historicalBubbles.includes(key) && data[key]
+                selected && !['price'].includes(key) && data[key]
             );
             
             const regularChartIds = regularCharts.map(([key]) => key);
@@ -7762,7 +8300,7 @@ def index():
             
             // Clean up disabled regular charts from charts object
             Object.keys(selectedCharts).forEach(key => {
-                if (!selectedCharts[key] && !['price'].includes(key) && !historicalBubbles.includes(key)) {
+                if (!selectedCharts[key] && !['price'].includes(key)) {
                     const container = document.getElementById(`${key}-chart`);
                     if (container) {
                         container.remove();
@@ -8063,6 +8601,7 @@ def index():
                     Plotly.Plots.resize(chartElement);
                 }
             });
+            scheduleTVHistoricalOverlayDraw();
         });
         
         // Cleanup on page unload
@@ -8113,20 +8652,16 @@ def index():
                 horizontal_bars: document.getElementById('horizontal_bars').checked,
                 show_abs_gex: document.getElementById('show_abs_gex').checked,
                 abs_gex_opacity: document.getElementById('abs_gex_opacity').value,
-                gex_absolute: document.getElementById('gex_absolute').checked,
                 use_range: document.getElementById('use_range').checked,
                 call_color: document.getElementById('call_color').value,
                 put_color: document.getElementById('put_color').value,
                 highlight_max_level: document.getElementById('highlight_max_level').checked,
                 max_level_color: document.getElementById('max_level_color').value,
                 max_level_mode: document.getElementById('max_level_mode').value,
+                em_range_locked: emRangeLocked,
                 // Chart visibility
                 charts: {
                     price: document.getElementById('price').checked,
-                    gex_historical_bubble: document.getElementById('gex_historical_bubble').checked,
-                    dex_historical_bubble: document.getElementById('dex_historical_bubble').checked,
-                    vanna_historical_bubble: document.getElementById('vanna_historical_bubble').checked,
-                    charm_historical_bubble: document.getElementById('charm_historical_bubble').checked,
                     gamma: document.getElementById('gamma').checked,
                     delta: document.getElementById('delta').checked,
                     vanna: document.getElementById('vanna').checked,
@@ -8167,7 +8702,7 @@ def index():
             if (settings.levels_types) {
                 document.querySelectorAll('.levels-option input').forEach(cb => cb.checked = false);
                 settings.levels_types.forEach(type => {
-                    const cb = document.getElementById('lvl-' + type.replace(/\s+/g, ''));
+                    const cb = document.getElementById('lvl-' + type.replace(/\\s+/g, ''));
                     if (cb) cb.checked = true;
                 });
                 updateLevelsDisplay();
@@ -8177,7 +8712,6 @@ def index():
             if (settings.horizontal_bars !== undefined) document.getElementById('horizontal_bars').checked = settings.horizontal_bars;
             if (settings.show_abs_gex !== undefined) document.getElementById('show_abs_gex').checked = settings.show_abs_gex;
             if (settings.abs_gex_opacity !== undefined) document.getElementById('abs_gex_opacity').value = settings.abs_gex_opacity;
-            if (settings.gex_absolute !== undefined) document.getElementById('gex_absolute').checked = settings.gex_absolute;
             if (settings.use_range !== undefined) document.getElementById('use_range').checked = settings.use_range;
             if (settings.call_color) {
                 document.getElementById('call_color').value = settings.call_color;
@@ -8196,6 +8730,9 @@ def index():
             }
             if (settings.max_level_mode) {
                 document.getElementById('max_level_mode').value = settings.max_level_mode;
+            }
+            if (settings.em_range_locked !== undefined) {
+                setEmRangeLocked(settings.em_range_locked);
             }
             // Chart visibility
             if (settings.charts) {
@@ -8524,20 +9061,6 @@ def update():
         # Create charts based on visibility settings
         # NOTE: price chart is handled by /update_price (separate concurrent request)
 
-        if data.get('show_gex_historical_bubble', True):
-            # Accept either 'gex_absolute' (old key) or 'absolute_gex' (JS payload) for compatibility
-            absolute_gex = bool(data.get('gex_absolute', data.get('absolute_gex', False)))
-            response['gex_historical_bubble'] = create_historical_bubble_levels_chart(ticker, strike_range, call_color, put_color, 'gamma', absolute=absolute_gex, highlight_max_level=highlight_max_level, max_level_color=max_level_color)
-
-        if data.get('show_dex_historical_bubble', True):
-            response['dex_historical_bubble'] = create_historical_bubble_levels_chart(ticker, strike_range, call_color, put_color, 'delta', highlight_max_level=highlight_max_level, max_level_color=max_level_color)
-
-        if data.get('show_vanna_historical_bubble', True):
-            response['vanna_historical_bubble'] = create_historical_bubble_levels_chart(ticker, strike_range, call_color, put_color, 'vanna', highlight_max_level=highlight_max_level, max_level_color=max_level_color)
-
-        if data.get('show_charm_historical_bubble', True):
-            response['charm_historical_bubble'] = create_historical_bubble_levels_chart(ticker, strike_range, call_color, put_color, 'charm', highlight_max_level=highlight_max_level, max_level_color=max_level_color)
-        
         if data.get('show_gamma', True):
             response['gamma'] = create_exposure_chart(calls, puts, "GEX", "Gamma Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, coloring_mode, call_color, put_color, expiry_dates, horizontal, show_abs_gex_area=show_abs_gex, abs_gex_opacity=abs_gex_opacity, highlight_max_level=highlight_max_level, max_level_color=max_level_color, max_level_mode=max_level_mode)
         
@@ -8736,7 +9259,8 @@ def update_price():
             use_heikin_ashi=use_heikin_ashi,
             highlight_max_level=highlight_max_level,
             max_level_color=max_level_color,
-            coloring_mode=coloring_mode
+            coloring_mode=coloring_mode,
+            ticker=ticker,
         )
         # Inject timeframe so the popout candle-close timer knows the selected interval
         try:
