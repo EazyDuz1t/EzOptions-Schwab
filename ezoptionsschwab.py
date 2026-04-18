@@ -5016,6 +5016,13 @@ def index():
             pointer-events: none;
             overflow: hidden;
         }
+        .tv-historical-canvas {
+            position: absolute;
+            inset: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+        }
         .tv-historical-bubble {
             position: absolute;
             border-radius: 999px;
@@ -6469,7 +6476,9 @@ def index():
         let tvHistoricalOverlayPending = false;
         let tvHistoricalOverlayDomEventsBound = false;
         let tvHistoricalRenderedPoints = [];
+        let tvHistoricalHoverBuckets = new Map();
         const tvHistoricalOverlayMaxVisible = 1200;
+        const tvHistoricalHoverBucketSize = 48;
         // Track the active ticker so we can reset chart state on ticker change
         let tvLastTicker = null;
         // When true, the next render will call fitContent() regardless of tvAutoRange
@@ -7432,6 +7441,7 @@ def index():
   .tv-ohlc-tooltip .tt-up { color:#00FF00; }
   .tv-ohlc-tooltip .tt-dn { color:#FF4444; }
     .tv-historical-overlay { position:absolute; inset:0; z-index:4; pointer-events:none; overflow:hidden; }
+    .tv-historical-canvas { position:absolute; inset:0; width:100%; height:100%; pointer-events:none; }
     .tv-historical-bubble { position:absolute; border-radius:999px; transform:translate(-50%,-50%); box-shadow:0 0 0 1px rgba(0,0,0,0.25); opacity:0.95; pointer-events:auto; cursor:pointer; }
         .tv-historical-tooltip { position:absolute; z-index:55; display:none; width:auto !important; height:auto !important; min-width:0; max-width:min(240px,calc(100% - 16px)); padding:8px; border:1px solid var(--tooltip-border); border-radius:10px; background:var(--tooltip-bg); color:var(--text-primary); font-size:10px; line-height:1.25; pointer-events:none; box-shadow:0 14px 36px rgba(0,0,0,0.38); backdrop-filter:blur(10px); flex:none !important; align-self:flex-start; overflow:hidden; white-space:normal; }
     .tv-historical-tooltip .tt-head { display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:6px; }
@@ -7477,8 +7487,10 @@ def index():
     var popoutThemeVars={};
     var historicalDomBound=false;
     var tvHistoricalRenderedPoints=[];
+    var tvHistoricalHoverBuckets=new Map();
         var historicalBubbleDrawPending=false;
         var historicalBubbleMaxVisible=1200;
+        var historicalBubbleHoverBucketSize=48;
 
     function getThemeVar(name,fallback){
         var value=getComputedStyle(document.documentElement).getPropertyValue(name).trim();
@@ -7637,14 +7649,18 @@ def index():
   function tvApplyAutoscale(){if(!tvCandle)return;var lp=tvAllLevelPrices.slice();tvCandle.applyOptions({autoscaleInfoProvider:function(original){var res=original();if(!res)return res;if(lp.length===0)return res;var pad=(res.priceRange.maxValue-res.priceRange.minValue)*0.05;var minV=Math.min.apply(null,[res.priceRange.minValue].concat(lp))-pad;var maxV=Math.max.apply(null,[res.priceRange.maxValue].concat(lp))+pad;return{priceRange:{minValue:minV,maxValue:maxV},margins:res.margins};}});}
   function fitAll(){if(!tvChart)return;setTimeout(function(){try{tvChart.timeScale().fitContent();tvChart.priceScale('right').applyOptions({autoScale:true});tvApplyAutoscale();if(tvRsiChart)tvRsiChart.priceScale('right').applyOptions({autoScale:true});if(tvMacdChart)tvMacdChart.priceScale('right').applyOptions({autoScale:true});}catch(e){}},50);}
     function ensureHistOverlay(){var c=document.getElementById('price-chart');if(!c)return null;var o=c.querySelector('.tv-historical-overlay');if(!o){o=document.createElement('div');o.className='tv-historical-overlay';c.appendChild(o);}return o;}
+    function ensureHistCanvas(){var o=ensureHistOverlay();if(!o)return null;var canvas=o.querySelector('.tv-historical-canvas');if(!canvas){canvas=document.createElement('canvas');canvas.className='tv-historical-canvas';o.appendChild(canvas);}return canvas;}
+    function syncHistCanvas(canvas,overlay){if(!canvas||!overlay)return null;var dpr=window.devicePixelRatio||1,width=Math.max(1,Math.round(overlay.clientWidth)),height=Math.max(1,Math.round(overlay.clientHeight)),pixelWidth=Math.max(1,Math.round(width*dpr)),pixelHeight=Math.max(1,Math.round(height*dpr));if(canvas.width!==pixelWidth||canvas.height!==pixelHeight){canvas.width=pixelWidth;canvas.height=pixelHeight;canvas.style.width=width+'px';canvas.style.height=height+'px';}var ctx=canvas.getContext('2d');if(!ctx)return null;ctx.setTransform(dpr,0,0,dpr,0,0);ctx.clearRect(0,0,width,height);return{ctx:ctx,width:width,height:height};}
     function ensureHistTip(){var c=document.getElementById('price-chart');if(!c)return null;var t=c.querySelector('.tv-historical-tooltip');if(!t){t=document.createElement('div');t.className='tv-historical-tooltip';c.appendChild(t);}return t;}
     function fmtHistTime(ts){return new Date(ts*1000).toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit',hour12:false,timeZone:'America/New_York'})+' ET';}
     function histTipHtml(p){var dot=p.border_color||p.color||'#fff',name=p.kind==='expected-move'?p.label+' '+p.side:p.label+' '+p.side.charAt(0),value=p.kind==='expected-move'?p.value:'$'+Number(p.price).toFixed(2)+'  '+p.value;return '<div class="tt-row"><span class="tt-dot" style="background:'+dot+'"></span><div class="tt-main"><span class="tt-name">'+name+'</span><span class="tt-value">'+value+'</span></div></div>';}
     function posHistTip(t,e){var c=document.getElementById('price-chart');if(!t||!c||!e)return;var b=c.getBoundingClientRect();var l=Math.min(Math.max(8,e.clientX-b.left+12),Math.max(8,b.width-t.offsetWidth-8));var top=Math.min(Math.max(8,e.clientY-b.top+12),Math.max(8,b.height-t.offsetHeight-8));t.style.left=l+'px';t.style.top=top+'px';}
-    function findHistHoverPoints(e){var c=document.getElementById('price-chart');if(!c||!tvHistoricalRenderedPoints.length)return[];var b=c.getBoundingClientRect(),cx=e.clientX-b.left,cy=e.clientY-b.top;return tvHistoricalRenderedPoints.filter(function(p){var dx=cx-p.x,dy=cy-p.y,r=Math.max(8,(p.size||8)/2+5);return(dx*dx+dy*dy)<=(r*r);}).sort(function(a,bp){var ad=(cx-a.x)*(cx-a.x)+(cy-a.y)*(cy-a.y),bd=(cx-bp.x)*(cx-bp.x)+(cy-bp.y)*(cy-bp.y);return ad-bd;});}
-    function updateHistTip(e){var t=ensureHistTip();if(!t)return;var pts=findHistHoverPoints(e);if(!pts.length){t.style.display='none';return;}var topPts=pts.slice(0,5),anchorTime=topPts[0].time;t.innerHTML='<div class="tt-head"><span class="tt-badge">'+pts.length+' bubble'+(pts.length===1?'':'s')+'</span><div class="tt-time">'+fmtHistTime(anchorTime)+'</div></div><div class="tt-list">'+topPts.map(function(p){return histTipHtml(p);}).join('')+'</div>'+(pts.length>topPts.length?'<div class="tt-more">+'+(pts.length-topPts.length)+' more</div>':'');t.style.display='block';posHistTip(t,e);}
+    function addHistHoverPoint(point){var hoverRadius=Math.max(8,(point.size||8)/2+5),minBucketX=Math.floor((point.x-hoverRadius)/historicalBubbleHoverBucketSize),maxBucketX=Math.floor((point.x+hoverRadius)/historicalBubbleHoverBucketSize),minBucketY=Math.floor((point.y-hoverRadius)/historicalBubbleHoverBucketSize),maxBucketY=Math.floor((point.y+hoverRadius)/historicalBubbleHoverBucketSize);for(var bucketX=minBucketX;bucketX<=maxBucketX;bucketX++){for(var bucketY=minBucketY;bucketY<=maxBucketY;bucketY++){var key=bucketX+':'+bucketY,bucket=tvHistoricalHoverBuckets.get(key);if(!bucket){bucket=[];tvHistoricalHoverBuckets.set(key,bucket);}bucket.push(point);}}}
+    function getHistHoverCandidates(cx,cy){if(!tvHistoricalHoverBuckets.size)return tvHistoricalRenderedPoints;var minBucketX=Math.floor((cx-32)/historicalBubbleHoverBucketSize),maxBucketX=Math.floor((cx+32)/historicalBubbleHoverBucketSize),minBucketY=Math.floor((cy-32)/historicalBubbleHoverBucketSize),maxBucketY=Math.floor((cy+32)/historicalBubbleHoverBucketSize),seen=new Set(),candidates=[];for(var bucketX=minBucketX;bucketX<=maxBucketX;bucketX++){for(var bucketY=minBucketY;bucketY<=maxBucketY;bucketY++){var bucket=tvHistoricalHoverBuckets.get(bucketX+':'+bucketY);if(!bucket)continue;bucket.forEach(function(point){if(seen.has(point))return;seen.add(point);candidates.push(point);});}}return candidates;}
+    function findHistHoverPoints(e){var c=document.getElementById('price-chart');if(!c||!tvHistoricalRenderedPoints.length)return[];var b=c.getBoundingClientRect(),cx=e.clientX-b.left,cy=e.clientY-b.top;return getHistHoverCandidates(cx,cy).filter(function(p){var dx=cx-p.x,dy=cy-p.y,r=Math.max(8,(p.size||8)/2+5);return(dx*dx+dy*dy)<=(r*r);}).sort(function(a,bp){var ad=(cx-a.x)*(cx-a.x)+(cy-a.y)*(cy-a.y),bd=(cx-bp.x)*(cx-bp.x)+(cy-bp.y)*(cy-bp.y);return ad-bd;});}
+    function updateHistTip(e){var t=ensureHistTip();if(!t)return;if(e&&e.buttons){t.style.display='none';return;}var pts=findHistHoverPoints(e);if(!pts.length){t.style.display='none';return;}var topPts=pts.slice(0,5),anchorTime=topPts[0].time;t.innerHTML='<div class="tt-head"><span class="tt-badge">'+pts.length+' bubble'+(pts.length===1?'':'s')+'</span><div class="tt-time">'+fmtHistTime(anchorTime)+'</div></div><div class="tt-list">'+topPts.map(function(p){return histTipHtml(p);}).join('')+'</div>'+(pts.length>topPts.length?'<div class="tt-more">+'+(pts.length-topPts.length)+' more</div>':'');t.style.display='block';posHistTip(t,e);}
     function getVisibleHistoricalBubblePoints(){if(!tvHistoricalPoints.length)return[];var pts=tvHistoricalPoints;try{var range=tvChart.timeScale().getVisibleLogicalRange();if(range&&tvLastCandles.length){var li=Math.max(0,Math.floor(range.from)-2),ri=Math.min(tvLastCandles.length-1,Math.ceil(range.to)+2),left=tvLastCandles[li],right=tvLastCandles[ri];if(left&&right){var span=tvLastCandles.length>1?Math.max(60,tvLastCandles[1].time-tvLastCandles[0].time):60,minTime=left.time-(span*2),maxTime=right.time+(span*2);pts=tvHistoricalPoints.filter(function(p){return p.time>=minTime&&p.time<=maxTime;});}}}catch(e){}if(pts.length<=historicalBubbleMaxVisible)return pts;var priority=[],secondary=[];pts.forEach(function(p){if(p.kind==='expected-move'||p.rank===1)priority.push(p);else secondary.push(p);});if(priority.length>=historicalBubbleMaxVisible){var pStride=Math.ceil(priority.length/historicalBubbleMaxVisible);return priority.filter(function(_,i){return i%pStride===0;});}var slots=Math.max(0,historicalBubbleMaxVisible-priority.length);if(!secondary.length||slots===0)return priority;var stride=Math.ceil(secondary.length/slots);return priority.concat(secondary.filter(function(_,i){return i%stride===0;}));}
-    function drawHistoricalBubbles(){var o=ensureHistOverlay(),t=ensureHistTip();if(!o||!tvChart||!tvCandle)return;tvHistoricalRenderedPoints=[];if(!tvHistoricalPoints.length){o.replaceChildren();o.style.display='none';if(t)t.style.display='none';return;}var points=getVisibleHistoricalBubblePoints();if(!points.length){o.replaceChildren();o.style.display='none';if(t)t.style.display='none';return;}var frag=document.createDocumentFragment(),visible=0;points.forEach(function(p){var x=tvChart.timeScale().timeToCoordinate(p.time),y=tvCandle.priceToCoordinate(p.price);if(x==null||y==null||Number.isNaN(x)||Number.isNaN(y))return;var b=document.createElement('div');b.className='tv-historical-bubble';b.style.left=x+'px';b.style.top=y+'px';b.style.width=(p.size||8)+'px';b.style.height=(p.size||8)+'px';b.style.background=p.color||'rgba(255,255,255,0.6)';b.style.border=(p.border_width||1)+'px solid '+(p.border_color||p.color||'#fff');frag.appendChild(b);tvHistoricalRenderedPoints.push(Object.assign({},p,{x:x,y:y}));visible++;});o.replaceChildren(frag);o.style.display=visible>0?'block':'none';}
+    function drawHistoricalBubbles(){var o=ensureHistOverlay(),canvas=ensureHistCanvas(),t=ensureHistTip();if(!o||!canvas||!tvChart||!tvCandle)return;tvHistoricalRenderedPoints=[];tvHistoricalHoverBuckets=new Map();var canvasState=syncHistCanvas(canvas,o);if(!canvasState){o.style.display='none';if(t)t.style.display='none';return;}var ctx=canvasState.ctx,width=canvasState.width,height=canvasState.height;if(!tvHistoricalPoints.length){o.style.display='none';if(t)t.style.display='none';return;}var points=getVisibleHistoricalBubblePoints();if(!points.length){o.style.display='none';if(t)t.style.display='none';return;}var visible=0;points.forEach(function(p){var x=tvChart.timeScale().timeToCoordinate(p.time),y=tvCandle.priceToCoordinate(p.price);if(x==null||y==null||Number.isNaN(x)||Number.isNaN(y))return;var size=p.size||8,radius=size/2,hoverRadius=Math.max(8,radius+5);if(x<-hoverRadius||x>width+hoverRadius||y<-hoverRadius||y>height+hoverRadius)return;ctx.save();ctx.globalAlpha=0.95;ctx.fillStyle=p.color||'rgba(255,255,255,0.6)';ctx.beginPath();ctx.arc(x,y,radius,0,Math.PI*2);ctx.fill();ctx.globalAlpha=1;ctx.strokeStyle='rgba(0,0,0,0.25)';ctx.lineWidth=1;ctx.beginPath();ctx.arc(x,y,radius+1,0,Math.PI*2);ctx.stroke();ctx.strokeStyle=p.border_color||p.color||'#fff';ctx.lineWidth=p.border_width||1;ctx.beginPath();ctx.arc(x,y,Math.max(0.5,radius-((p.border_width||1)/2)),0,Math.PI*2);ctx.stroke();ctx.restore();var renderedPoint=Object.assign({},p,{x:x,y:y});tvHistoricalRenderedPoints.push(renderedPoint);addHistHoverPoint(renderedPoint);visible++;});o.style.display=visible>0?'block':'none';}
     function scheduleHistoricalBubbleDraw(){if(historicalBubbleDrawPending)return;historicalBubbleDrawPending=true;requestAnimationFrame(function(){historicalBubbleDrawPending=false;drawHistoricalBubbles();});}
 
   // ── Main renderer ──────────────────────────────────────────────────────────
@@ -7826,7 +7842,7 @@ def index():
         var themePayload=arguments.length>2?arguments[2]:null;
         try{if(themePayload)applyPopoutTheme(themePayload);var priceData=typeof priceDataJSON==='string'?JSON.parse(priceDataJSON):priceDataJSON;if(!priceData||priceData.error)return;renderPriceChart(priceData);}catch(e){console.error('Popout price chart error:',e);}
   };
-  window.addEventListener('resize',function(){if(tvChart&&tvAutoRange){try{tvChart.timeScale().fitContent();}catch(e){}}});
+    window.addEventListener('resize',function(){scheduleHistoricalBubbleDraw();if(tvChart&&tvAutoRange){try{tvChart.timeScale().fitContent();}catch(e){}}});
   window.addEventListener('beforeunload',function(){if(popoutEvtSource){try{popoutEvtSource.close();}catch(e){}}});
 <\\/script></body></html>`);
             } else {
@@ -8998,6 +9014,40 @@ def index():
             return overlay;
         }
 
+        function ensureTVHistoricalCanvas() {
+            const overlay = ensureTVHistoricalOverlay();
+            if (!overlay) return null;
+            let canvas = overlay.querySelector('.tv-historical-canvas');
+            if (!canvas) {
+                canvas = document.createElement('canvas');
+                canvas.className = 'tv-historical-canvas';
+                overlay.appendChild(canvas);
+            }
+            return canvas;
+        }
+
+        function syncTVHistoricalCanvas(canvas, overlay) {
+            if (!canvas || !overlay) return null;
+            const pixelRatio = window.devicePixelRatio || 1;
+            const width = Math.max(1, Math.round(overlay.clientWidth));
+            const height = Math.max(1, Math.round(overlay.clientHeight));
+            const pixelWidth = Math.max(1, Math.round(width * pixelRatio));
+            const pixelHeight = Math.max(1, Math.round(height * pixelRatio));
+
+            if (canvas.width !== pixelWidth || canvas.height !== pixelHeight) {
+                canvas.width = pixelWidth;
+                canvas.height = pixelHeight;
+                canvas.style.width = `${width}px`;
+                canvas.style.height = `${height}px`;
+            }
+
+            const context = canvas.getContext('2d');
+            if (!context) return null;
+            context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
+            context.clearRect(0, 0, width, height);
+            return { context, width, height };
+        }
+
         function ensureTVHistoricalTooltip() {
             const container = document.getElementById('price-chart');
             if (!container) return null;
@@ -9054,13 +9104,58 @@ def index():
             tooltip.style.top = `${top}px`;
         }
 
+        function indexTVHistoricalHoverPoint(point) {
+            const hoverRadius = Math.max(8, (point.size || 8) / 2 + 5);
+            const minBucketX = Math.floor((point.x - hoverRadius) / tvHistoricalHoverBucketSize);
+            const maxBucketX = Math.floor((point.x + hoverRadius) / tvHistoricalHoverBucketSize);
+            const minBucketY = Math.floor((point.y - hoverRadius) / tvHistoricalHoverBucketSize);
+            const maxBucketY = Math.floor((point.y + hoverRadius) / tvHistoricalHoverBucketSize);
+
+            for (let bucketX = minBucketX; bucketX <= maxBucketX; bucketX += 1) {
+                for (let bucketY = minBucketY; bucketY <= maxBucketY; bucketY += 1) {
+                    const key = `${bucketX}:${bucketY}`;
+                    let bucket = tvHistoricalHoverBuckets.get(key);
+                    if (!bucket) {
+                        bucket = [];
+                        tvHistoricalHoverBuckets.set(key, bucket);
+                    }
+                    bucket.push(point);
+                }
+            }
+        }
+
+        function getTVHistoricalHoverCandidates(cursorX, cursorY) {
+            if (!tvHistoricalHoverBuckets.size) return tvHistoricalRenderedPoints;
+
+            const minBucketX = Math.floor((cursorX - 32) / tvHistoricalHoverBucketSize);
+            const maxBucketX = Math.floor((cursorX + 32) / tvHistoricalHoverBucketSize);
+            const minBucketY = Math.floor((cursorY - 32) / tvHistoricalHoverBucketSize);
+            const maxBucketY = Math.floor((cursorY + 32) / tvHistoricalHoverBucketSize);
+            const seen = new Set();
+            const candidates = [];
+
+            for (let bucketX = minBucketX; bucketX <= maxBucketX; bucketX += 1) {
+                for (let bucketY = minBucketY; bucketY <= maxBucketY; bucketY += 1) {
+                    const bucket = tvHistoricalHoverBuckets.get(`${bucketX}:${bucketY}`);
+                    if (!bucket) continue;
+                    bucket.forEach(point => {
+                        if (seen.has(point)) return;
+                        seen.add(point);
+                        candidates.push(point);
+                    });
+                }
+            }
+
+            return candidates;
+        }
+
         function findTVHistoricalHoverPoints(event) {
             const container = document.getElementById('price-chart');
             if (!container || !tvHistoricalRenderedPoints.length) return [];
             const bounds = container.getBoundingClientRect();
             const cursorX = event.clientX - bounds.left;
             const cursorY = event.clientY - bounds.top;
-            return tvHistoricalRenderedPoints
+            return getTVHistoricalHoverCandidates(cursorX, cursorY)
                 .filter(point => {
                     const dx = cursorX - point.x;
                     const dy = cursorY - point.y;
@@ -9077,6 +9172,10 @@ def index():
         function updateTVHistoricalTooltip(event) {
             const tooltip = ensureTVHistoricalTooltip();
             if (!tooltip) return;
+            if (event && event.buttons) {
+                tooltip.style.display = 'none';
+                return;
+            }
             const hoverPoints = findTVHistoricalHoverPoints(event);
             if (!hoverPoints.length) {
                 tooltip.style.display = 'none';
@@ -9151,12 +9250,20 @@ def index():
 
         function drawTVHistoricalOverlay() {
             const overlay = ensureTVHistoricalOverlay();
+            const canvas = ensureTVHistoricalCanvas();
             const tooltip = ensureTVHistoricalTooltip();
-            if (!overlay || !tvPriceChart || !tvCandleSeries) return;
+            if (!overlay || !canvas || !tvPriceChart || !tvCandleSeries) return;
 
             tvHistoricalRenderedPoints = [];
+            tvHistoricalHoverBuckets = new Map();
+            const canvasState = syncTVHistoricalCanvas(canvas, overlay);
+            if (!canvasState) {
+                overlay.style.display = 'none';
+                if (tooltip) tooltip.style.display = 'none';
+                return;
+            }
+            const { context, width, height } = canvasState;
             if (!tvHistoricalPoints.length) {
-                overlay.replaceChildren();
                 overlay.style.display = 'none';
                 if (tooltip) tooltip.style.display = 'none';
                 return;
@@ -9164,33 +9271,48 @@ def index():
 
             const pointsToRender = getVisibleTVHistoricalPoints();
             if (!pointsToRender.length) {
-                overlay.replaceChildren();
                 overlay.style.display = 'none';
                 if (tooltip) tooltip.style.display = 'none';
                 return;
             }
 
-            const fragment = document.createDocumentFragment();
             let visibleCount = 0;
             for (const point of pointsToRender) {
                 const x = tvPriceChart.timeScale().timeToCoordinate(point.time);
                 const y = tvCandleSeries.priceToCoordinate(point.price);
                 if (x == null || y == null || Number.isNaN(x) || Number.isNaN(y)) continue;
+                const size = point.size || 8;
+                const radius = size / 2;
+                const hoverRadius = Math.max(8, radius + 5);
+                if (x < -hoverRadius || x > width + hoverRadius || y < -hoverRadius || y > height + hoverRadius) {
+                    continue;
+                }
 
-                const bubble = document.createElement('div');
-                bubble.className = 'tv-historical-bubble';
-                bubble.style.left = `${x}px`;
-                bubble.style.top = `${y}px`;
-                bubble.style.width = `${point.size || 8}px`;
-                bubble.style.height = `${point.size || 8}px`;
-                bubble.style.background = point.color || 'rgba(255,255,255,0.6)';
-                bubble.style.border = `${point.border_width || 1}px solid ${point.border_color || point.color || '#ffffff'}`;
-                fragment.appendChild(bubble);
-                tvHistoricalRenderedPoints.push({ ...point, x, y });
+                context.save();
+                context.globalAlpha = 0.95;
+                context.fillStyle = point.color || 'rgba(255,255,255,0.6)';
+                context.beginPath();
+                context.arc(x, y, radius, 0, Math.PI * 2);
+                context.fill();
+                context.globalAlpha = 1;
+                context.strokeStyle = 'rgba(0,0,0,0.25)';
+                context.lineWidth = 1;
+                context.beginPath();
+                context.arc(x, y, radius + 1, 0, Math.PI * 2);
+                context.stroke();
+                context.strokeStyle = point.border_color || point.color || '#ffffff';
+                context.lineWidth = point.border_width || 1;
+                context.beginPath();
+                context.arc(x, y, Math.max(0.5, radius - ((point.border_width || 1) / 2)), 0, Math.PI * 2);
+                context.stroke();
+                context.restore();
+
+                const renderedPoint = { ...point, x, y };
+                tvHistoricalRenderedPoints.push(renderedPoint);
+                indexTVHistoricalHoverPoint(renderedPoint);
                 visibleCount += 1;
             }
 
-            overlay.replaceChildren(fragment);
             overlay.style.display = visibleCount > 0 ? 'block' : 'none';
         }
 
@@ -10006,6 +10128,9 @@ def index():
         // Handle window resize
         window.addEventListener('resize', () => {
             applyMobileLayoutState();
+            if (tvPriceChart) {
+                scheduleTVHistoricalOverlayDraw();
+            }
         });
         
         // Cleanup on page unload
