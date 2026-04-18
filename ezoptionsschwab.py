@@ -4638,7 +4638,7 @@ def index():
 <html>
 <head>
     <title>EzOptions - Schwab</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
     <meta name="mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-capable" content="yes">
     <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
@@ -4971,7 +4971,7 @@ def index():
         
         .chart-container {
             padding: 0;
-            height: 500px;
+            height: var(--chart-height, 500px);
             width: 100%;
             min-width: 0;
             position: relative;
@@ -5003,7 +5003,7 @@ def index():
         #price-chart {
             padding: 0 !important;
             background-color: #1E1E1E !important;
-            height: 680px !important;
+            height: var(--price-chart-height, 680px) !important;
             border-radius: 0 0 0 0;
             overflow: hidden;
             /* override .chart-container defaults that conflict */
@@ -5241,6 +5241,22 @@ def index():
             font-size: 1.2em;
             flex-wrap: wrap;
             width: 100%;
+        }
+        .price-info-item {
+            min-width: 0;
+        }
+        .price-info-item strong {
+            display: block;
+            margin-bottom: 4px;
+            font-size: 0.72em;
+            font-weight: 600;
+            letter-spacing: 0.04em;
+            text-transform: uppercase;
+            color: var(--text-muted);
+        }
+        .price-info-item span,
+        .price-info-item div {
+            display: block;
         }
         .green {
             color: #00FF00;
@@ -5634,6 +5650,13 @@ def index():
             background-color: var(--app-bg);
             color: var(--text-primary);
         }
+        body[data-theme="neon"] {
+            background-image:
+                radial-gradient(circle at top left, rgba(0, 234, 255, 0.14), transparent 28%),
+                radial-gradient(circle at top right, rgba(255, 79, 163, 0.16), transparent 24%),
+                radial-gradient(circle at 50% 100%, rgba(143, 255, 61, 0.10), transparent 30%);
+            background-attachment: fixed;
+        }
         body,
         .header,
         .control-group,
@@ -5822,6 +5845,44 @@ def index():
         .chart-container.fullscreen {
             background-color: var(--chart-bg) !important;
         }
+        body[data-theme="neon"] .header {
+            border: 1px solid color-mix(in srgb, var(--accent-color) 30%, var(--border-color));
+            box-shadow: 0 0 0 1px rgba(0, 234, 255, 0.08), 0 24px 50px rgba(0, 0, 0, 0.46), 0 0 34px rgba(0, 234, 255, 0.10);
+        }
+        body[data-theme="neon"] .title {
+            color: #7df7ff;
+            text-shadow: 0 0 10px rgba(0, 234, 255, 0.32), 0 0 22px rgba(255, 79, 163, 0.18);
+        }
+        body[data-theme="neon"] .control-group,
+        body[data-theme="neon"] .chart-checkbox,
+        body[data-theme="neon"] .expiry-options,
+        body[data-theme="neon"] .levels-options,
+        body[data-theme="neon"] .chart-container,
+        body[data-theme="neon"] .price-chart-container,
+        body[data-theme="neon"] .tv-toolbar-container,
+        body[data-theme="neon"] .tv-sub-pane {
+            border-color: color-mix(in srgb, var(--accent-color) 22%, var(--border-color));
+            box-shadow: 0 0 0 1px rgba(0, 234, 255, 0.06), inset 0 1px 0 rgba(255, 255, 255, 0.02), var(--button-shadow);
+        }
+        body[data-theme="neon"] .price-chart-container,
+        body[data-theme="neon"] #price-chart,
+        body[data-theme="neon"] .tv-toolbar-container,
+        body[data-theme="neon"] .tv-sub-pane {
+            background-image: linear-gradient(180deg, rgba(0, 234, 255, 0.03), transparent 24%);
+        }
+        body[data-theme="neon"] .expiry-buttons .expiry-range-btns button,
+        body[data-theme="neon"] .tv-tb-btn.active,
+        body[data-theme="neon"] .mobile-panel-toggles button.active,
+        body[data-theme="neon"] #match_em_range.active {
+            box-shadow: 0 0 0 1px rgba(0, 234, 255, 0.22), 0 0 18px rgba(0, 234, 255, 0.18);
+        }
+        body[data-theme="neon"] .stream-control button::before {
+            box-shadow: 0 0 10px currentColor;
+        }
+        body[data-theme="neon"] ::-webkit-scrollbar-thumb {
+            background: linear-gradient(180deg, rgba(0, 234, 255, 0.78), rgba(255, 79, 163, 0.82));
+            box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.08), 0 0 10px rgba(0, 234, 255, 0.18);
+        }
         #match_em_range {
             margin-left: 4px;
             padding: 2px 6px;
@@ -5841,6 +5902,14 @@ def index():
         .theme-control select {
             min-width: 120px;
         }
+        .mobile-panel-toggles {
+            display: none;
+        }
+        .mobile-panel-toggles button.active {
+            background-color: color-mix(in srgb, var(--accent-color) 28%, var(--panel-bg-strong));
+            border-color: var(--accent-color);
+            color: var(--text-primary);
+        }
         ::-webkit-scrollbar {
             width: 10px;
             height: 10px;
@@ -5851,6 +5920,218 @@ def index():
         ::-webkit-scrollbar-thumb {
             background: color-mix(in srgb, var(--border-color) 85%, var(--accent-color));
             border-radius: 999px;
+        }
+        @media screen and (max-width: 900px) {
+            body.mobile-layout {
+                padding-bottom: calc(72px + env(safe-area-inset-bottom, 0px));
+            }
+            body.mobile-layout .container {
+                width: 100%;
+                padding: 12px;
+            }
+            body.mobile-layout .header {
+                gap: 12px;
+                margin-bottom: 12px;
+                padding: 14px;
+                border-radius: 16px;
+            }
+            body.mobile-layout .header-top {
+                align-items: stretch;
+                gap: 12px;
+            }
+            body.mobile-layout .header-top .controls {
+                width: 100%;
+                display: grid;
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+                gap: 10px;
+                align-items: stretch;
+            }
+            body.mobile-layout .header-top .controls > * {
+                min-width: 0;
+                margin-left: 0;
+            }
+            body.mobile-layout .header-top .control-group,
+            body.mobile-layout .header-top .stream-control,
+            body.mobile-layout .header-top .settings-control {
+                width: 100%;
+                min-height: 48px;
+                margin-left: 0;
+                justify-content: space-between;
+            }
+            body.mobile-layout .header-top .control-group input[type="text"],
+            body.mobile-layout .header-top .control-group select,
+            body.mobile-layout .header-top .control-group .expiry-dropdown,
+            body.mobile-layout .header-top .control-group .levels-dropdown {
+                min-width: 0;
+                width: 100%;
+            }
+            body.mobile-layout .header-top .stream-control button,
+            body.mobile-layout .header-top .settings-control button {
+                width: 100%;
+                min-height: 48px;
+                justify-content: center;
+            }
+            body.mobile-layout .header-top .settings-control {
+                display: grid;
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+                gap: 10px;
+            }
+            body.mobile-layout .mobile-panel-toggles {
+                display: grid;
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+                gap: 10px;
+                position: sticky;
+                top: 0;
+                z-index: 400;
+                margin: 0 0 12px;
+                padding-top: 4px;
+                background: linear-gradient(180deg, color-mix(in srgb, var(--app-bg) 96%, transparent), transparent);
+            }
+            body.mobile-layout .mobile-panel-toggles button {
+                min-height: 48px;
+                border: 1px solid var(--border-color);
+                background: var(--panel-bg);
+                color: var(--text-primary);
+                box-shadow: var(--button-shadow);
+                font-weight: 600;
+            }
+            body.mobile-layout #advanced-controls,
+            body.mobile-layout #chart-selector {
+                display: none;
+            }
+            body.mobile-layout.mobile-filters-open #advanced-controls {
+                display: block;
+                margin-bottom: 12px;
+                padding: 14px;
+                border: 1px solid var(--border-color);
+                border-radius: 16px;
+                background: var(--panel-bg);
+                box-shadow: var(--button-shadow);
+            }
+            body.mobile-layout.mobile-filters-open #advanced-controls .controls {
+                display: grid;
+                grid-template-columns: 1fr;
+                width: 100%;
+                gap: 10px;
+            }
+            body.mobile-layout.mobile-filters-open #advanced-controls .control-group {
+                width: 100%;
+                min-height: 48px;
+                justify-content: space-between;
+            }
+            body.mobile-layout.mobile-filters-open #advanced-controls .control-group input[type="text"],
+            body.mobile-layout.mobile-filters-open #advanced-controls .control-group select,
+            body.mobile-layout.mobile-filters-open #advanced-controls .control-group .expiry-dropdown,
+            body.mobile-layout.mobile-filters-open #advanced-controls .control-group .levels-dropdown {
+                min-width: 0;
+                width: 100%;
+            }
+            body.mobile-layout.mobile-filters-open #advanced-controls .expiry-display,
+            body.mobile-layout.mobile-filters-open #advanced-controls .levels-display,
+            body.mobile-layout.mobile-filters-open #advanced-controls input[type="text"],
+            body.mobile-layout.mobile-filters-open #advanced-controls input[type="number"],
+            body.mobile-layout.mobile-filters-open #advanced-controls select {
+                min-height: 48px;
+                font-size: 16px;
+            }
+            body.mobile-layout.mobile-filters-open #advanced-controls input[type="range"] {
+                width: 100%;
+            }
+            body.mobile-layout.mobile-filters-open #advanced-controls .expiry-options,
+            body.mobile-layout.mobile-filters-open #advanced-controls .levels-options {
+                max-height: min(42dvh, 320px);
+            }
+            body.mobile-layout.mobile-charts-open #chart-selector {
+                display: grid;
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+                gap: 10px;
+                margin: 0 0 14px;
+            }
+            body.mobile-layout #chart-selector .chart-checkbox {
+                width: 100%;
+                min-height: 54px;
+                padding: 10px 12px;
+                gap: 10px;
+            }
+            body.mobile-layout #chart-selector .chart-checkbox input[type="checkbox"] {
+                width: 22px;
+                height: 22px;
+            }
+            body.mobile-layout .price-info {
+                display: grid;
+                grid-auto-flow: column;
+                grid-auto-columns: minmax(180px, 1fr);
+                gap: 8px;
+                overflow-x: auto;
+                flex-wrap: nowrap;
+                padding: 2px 0 8px;
+                scroll-snap-type: x proximity;
+            }
+            body.mobile-layout .price-info-item {
+                min-height: 78px;
+                padding: 10px 12px;
+                border-radius: 14px;
+                background: var(--panel-bg-alt);
+                border: 1px solid var(--border-color);
+                box-sizing: border-box;
+                scroll-snap-align: start;
+            }
+            body.mobile-layout .chart-container {
+                height: clamp(320px, 44dvh, 420px);
+                border-radius: 14px;
+            }
+            body.mobile-layout .price-chart-container {
+                border-radius: 14px;
+            }
+            body.mobile-layout #price-chart {
+                height: clamp(380px, 58dvh, 560px) !important;
+            }
+            body.mobile-layout .tv-toolbar-container {
+                flex-wrap: nowrap;
+                overflow-x: auto;
+                -webkit-overflow-scrolling: touch;
+                padding-bottom: 8px;
+            }
+            body.mobile-layout .tv-tb-btn,
+            body.mobile-layout .candle-close-timer {
+                flex: 0 0 auto;
+                min-height: 38px;
+            }
+            body.mobile-layout .tv-toolbar-sep,
+            body.mobile-layout .tv-chart-title {
+                flex: 0 0 auto;
+            }
+            body.mobile-layout .chart-container.fullscreen {
+                padding: 12px 8px 8px !important;
+            }
+            body.mobile-layout .chart-container.fullscreen .chart-fullscreen-btn {
+                top: 10px;
+                left: 10px;
+            }
+        }
+        @media screen and (max-width: 640px) {
+            body.mobile-layout .header-top .controls,
+            body.mobile-layout .header-top .settings-control,
+            body.mobile-layout.mobile-charts-open #chart-selector {
+                grid-template-columns: 1fr;
+            }
+            body.mobile-layout.mobile-filters-open #advanced-controls .control-group {
+                flex-wrap: wrap;
+                align-items: flex-start;
+            }
+            body.mobile-layout .price-info {
+                grid-auto-columns: minmax(220px, 88vw);
+            }
+        }
+        @media (hover: none), (pointer: coarse) {
+            .chart-fullscreen-btn {
+                opacity: 1;
+                width: 38px;
+                height: 38px;
+            }
+            .chart-popout-btn {
+                display: none;
+            }
         }
     </style>
 </head>
@@ -5938,7 +6219,7 @@ def index():
                     </div>
                 </div>
             </div>
-            <div class="header-bottom">
+            <div class="header-bottom" id="advanced-controls">
                 <div class="controls">
                     <div class="control-group">
                         <label for="strike_range">Strike Range (%):</label>
@@ -6054,10 +6335,15 @@ def index():
                 </div>
             </div>
         </div>
+
+        <div class="mobile-panel-toggles">
+            <button type="button" id="mobile-toggle-filters" aria-controls="advanced-controls" aria-expanded="false">Filters</button>
+            <button type="button" id="mobile-toggle-charts" aria-controls="chart-selector" aria-expanded="false">Charts</button>
+        </div>
         
         <div class="price-info" id="price-info"></div>
         
-        <div class="chart-selector">
+        <div class="chart-selector" id="chart-selector">
             <div class="chart-checkbox">
                 <input type="checkbox" id="price" checked>
                 <label for="price">Price Chart</label>
@@ -6530,37 +6816,41 @@ def index():
                 '--tooltip-bg': 'linear-gradient(180deg, rgba(71, 51, 16, 0.97), rgba(18, 13, 5, 0.99))',
             },
             neon: {
-                '--app-bg': '#040404',
-                '--panel-bg': '#090909',
-                '--panel-bg-alt': '#111111',
-                '--panel-bg-strong': '#171717',
-                '--panel-hover': '#222222',
-                '--chart-bg': '#050505',
-                '--chart-bg-alt': '#0b0b0b',
-                '--border-color': '#3a3a3a',
-                '--text-primary': '#f7fff9',
-                '--text-secondary': '#d8ffe8',
-                '--text-muted': '#82c89b',
-                '--accent-color': '#ff38c7',
-                '--accent-soft': 'rgba(255, 56, 199, 0.22)',
-                '--slider-color': '#7dff3a',
-                '--good-color': '#7dff3a',
-                '--bad-color': '#ff6b9b',
-                '--toolbar-bg': '#090909',
-                '--toolbar-button-bg': '#131313',
-                '--toolbar-button-hover': '#1d1d1d',
-                '--toolbar-button-active': '#7a1f66',
-                '--grid-color': '#1a1a1a',
-                '--crosshair-color': '#595959',
-                '--tooltip-bg': 'linear-gradient(180deg, rgba(19, 19, 19, 0.98), rgba(4, 4, 4, 0.99))',
-                '--match-em-bg': '#1f1513',
-                '--match-em-text': '#ffb57f',
-                '--match-em-border': '#9d5e34',
-                '--match-em-active-bg': '#11240a',
-                '--match-em-active-text': '#a3ff7a',
-                '--match-em-active-border': '#5ecf26',
-                '--floating-button-bg': 'rgba(13, 13, 13, 0.94)',
-                '--floating-button-hover': 'rgba(28, 28, 28, 0.98)',
+                '--app-bg': '#02060c',
+                '--panel-bg': '#07111b',
+                '--panel-bg-alt': '#0b1724',
+                '--panel-bg-strong': '#102133',
+                '--panel-hover': '#17314b',
+                '--chart-bg': '#030a12',
+                '--chart-bg-alt': '#08111d',
+                '--border-color': '#1d4565',
+                '--text-primary': '#f3feff',
+                '--text-secondary': '#c4f5ff',
+                '--text-muted': '#76a7bf',
+                '--accent-color': '#00eaff',
+                '--accent-soft': 'rgba(0, 234, 255, 0.22)',
+                '--slider-color': '#8fff3d',
+                '--good-color': '#8fff3d',
+                '--bad-color': '#ff4fa3',
+                '--toolbar-bg': '#050d17',
+                '--toolbar-button-bg': '#0d1927',
+                '--toolbar-button-hover': '#14263a',
+                '--toolbar-button-active': '#5628a8',
+                '--toolbar-button-danger': '#4a1530',
+                '--grid-color': '#12314a',
+                '--crosshair-color': '#4fb6d3',
+                '--tooltip-bg': 'linear-gradient(180deg, rgba(13, 27, 39, 0.98), rgba(2, 8, 14, 0.99))',
+                '--tooltip-border': 'rgba(0, 234, 255, 0.20)',
+                '--button-shadow': '0 0 0 1px rgba(0, 234, 255, 0.14), 0 18px 42px rgba(0, 0, 0, 0.48), 0 0 26px rgba(0, 234, 255, 0.10)',
+                '--overlay-shadow': '0 0 0 1px rgba(255, 79, 163, 0.16), 0 22px 54px rgba(0, 0, 0, 0.58), 0 0 32px rgba(0, 234, 255, 0.12)',
+                '--match-em-bg': '#221526',
+                '--match-em-text': '#ffb8e2',
+                '--match-em-border': '#9c4f8b',
+                '--match-em-active-bg': '#10290d',
+                '--match-em-active-text': '#b8ff8f',
+                '--match-em-active-border': '#6ae232',
+                '--floating-button-bg': 'rgba(5, 13, 22, 0.94)',
+                '--floating-button-hover': 'rgba(16, 31, 48, 0.98)',
             },
         };
 
@@ -6788,9 +7078,74 @@ def index():
             if (priceInfo) {
                 const cpLine = priceInfo.querySelector('[data-live-price]');
                 if (cpLine) {
-                    cpLine.textContent = 'Current Price: $' + priceStr;
+                    cpLine.textContent = '$' + priceStr;
                 }
             }
+        }
+
+        function isMobileViewport() {
+            return window.matchMedia('(max-width: 900px)').matches;
+        }
+
+        function resizeAllCharts() {
+            Object.keys(charts).forEach(chartKey => {
+                const chartElement = document.getElementById(`${chartKey}-chart`);
+                if (chartElement && charts[chartKey] && chartKey !== 'large_trades') {
+                    try { Plotly.Plots.resize(chartElement); } catch (e) {}
+                }
+            });
+            scheduleTVHistoricalOverlayDraw();
+        }
+
+        function syncMobilePanelButtons() {
+            const filtersButton = document.getElementById('mobile-toggle-filters');
+            const chartsButton = document.getElementById('mobile-toggle-charts');
+            if (!filtersButton || !chartsButton) {
+                return;
+            }
+
+            const filtersOpen = document.body.classList.contains('mobile-filters-open');
+            const chartsOpen = document.body.classList.contains('mobile-charts-open');
+            const selectedChartsCount = document.querySelectorAll('.chart-checkbox input[type="checkbox"]:checked').length;
+
+            filtersButton.classList.toggle('active', filtersOpen);
+            chartsButton.classList.toggle('active', chartsOpen);
+            filtersButton.textContent = filtersOpen ? 'Hide Filters' : 'Filters';
+            chartsButton.textContent = chartsOpen
+                ? `Hide Charts (${selectedChartsCount})`
+                : `Charts (${selectedChartsCount})`;
+            filtersButton.setAttribute('aria-expanded', filtersOpen ? 'true' : 'false');
+            chartsButton.setAttribute('aria-expanded', chartsOpen ? 'true' : 'false');
+        }
+
+        function applyMobileLayoutState() {
+            const mobileLayout = isMobileViewport();
+            document.body.classList.toggle('mobile-layout', mobileLayout);
+            if (!mobileLayout) {
+                document.body.classList.remove('mobile-filters-open', 'mobile-charts-open');
+            }
+            syncMobilePanelButtons();
+            requestAnimationFrame(resizeAllCharts);
+        }
+
+        function toggleMobilePanel(panelName) {
+            if (!document.body.classList.contains('mobile-layout')) {
+                return;
+            }
+
+            const filtersClass = 'mobile-filters-open';
+            const chartsClass = 'mobile-charts-open';
+
+            if (panelName === 'filters') {
+                document.body.classList.toggle(filtersClass, !document.body.classList.contains(filtersClass));
+                document.body.classList.remove(chartsClass);
+            } else if (panelName === 'charts') {
+                document.body.classList.toggle(chartsClass, !document.body.classList.contains(chartsClass));
+                document.body.classList.remove(filtersClass);
+            }
+
+            syncMobilePanelButtons();
+            requestAnimationFrame(resizeAllCharts);
         }
 
         // Apply (or re-apply) the autoscaleInfoProvider so the Y-axis always fits levels
@@ -7782,6 +8137,7 @@ def index():
         document.querySelectorAll('.levels-option input[type="checkbox"]').forEach(checkbox => {
             checkbox.addEventListener('change', function() {
                 updateLevelsDisplay();
+                syncMobilePanelButtons();
                 updateData();
             });
         });
@@ -9374,7 +9730,7 @@ def index():
                 // lower bound is below spot -> use putColor, upper bound above spot -> callColor
                 const lowColor = putColor;
                 const highColor = callColor;
-                expectedMoveHtml = `<div>Expected Move: <span style="color:${lowColor}">$${info.expected_move_range.lower.toFixed(2)} ${lowPct}</span> - <span style="color:${highColor}">$${info.expected_move_range.upper.toFixed(2)} ${highPct}</span></div>`;
+                expectedMoveHtml = `<div class="price-info-item"><strong>Expected Move</strong><span><span style="color:${lowColor}">$${info.expected_move_range.lower.toFixed(2)} ${lowPct}</span> - <span style="color:${highColor}">$${info.expected_move_range.upper.toFixed(2)} ${highPct}</span></span></div>`;
             }
 
             // high/low diff coloring (use call/put colors)
@@ -9389,15 +9745,31 @@ def index():
             // Use the live streamer price if available, otherwise use the fetched price
             const displayPrice = (livePrice !== null) ? livePrice : info.current_price;
             priceInfo.innerHTML = `
-                <div data-live-price>Current Price: $${displayPrice.toFixed(2)}</div>
-                <div>High: $${info.high.toFixed(2)} <span style="color:${highColor}">(${highDiffPct>=0?'+':''}${highDiffPct.toFixed(2)}%)</span></div>
-                <div>Low:  $${info.low.toFixed(2)}  <span style="color:${lowColor}">(${lowDiffPct>=0?'+':''}${lowDiffPct.toFixed(2)}%)</span></div>
-                <div class="${info.net_change >= 0 ? 'green' : 'red'}">
-                    <span style="color:white !important">Change:</span> ${info.net_change >= 0 ? '+' : ''}${info.net_change.toFixed(2)} (${info.net_percent >= 0 ? '+' : ''}${info.net_percent.toFixed(2)}%)
+                <div class="price-info-item">
+                    <strong>Current Price</strong>
+                    <span data-live-price>$${displayPrice.toFixed(2)}</span>
                 </div>
-                <div>Vol Ratio: <span style="color: ${callColor}">${info.call_percentage.toFixed(2)}%</span>/<span style="color: ${putColor}">${info.put_percentage.toFixed(2)}%</span></div>
+                <div class="price-info-item">
+                    <strong>Day High</strong>
+                    <span>$${info.high.toFixed(2)} <span style="color:${highColor}">(${highDiffPct>=0?'+':''}${highDiffPct.toFixed(2)}%)</span></span>
+                </div>
+                <div class="price-info-item">
+                    <strong>Day Low</strong>
+                    <span>$${info.low.toFixed(2)} <span style="color:${lowColor}">(${lowDiffPct>=0?'+':''}${lowDiffPct.toFixed(2)}%)</span></span>
+                </div>
+                <div class="price-info-item ${info.net_change >= 0 ? 'green' : 'red'}">
+                    <strong>Change</strong>
+                    <span>${info.net_change >= 0 ? '+' : ''}${info.net_change.toFixed(2)} (${info.net_percent >= 0 ? '+' : ''}${info.net_percent.toFixed(2)}%)</span>
+                </div>
+                <div class="price-info-item">
+                    <strong>Vol Ratio</strong>
+                    <span><span style="color: ${callColor}">${info.call_percentage.toFixed(2)}%</span>/<span style="color: ${putColor}">${info.put_percentage.toFixed(2)}%</span></span>
+                </div>
                 ${expectedMoveHtml}
-                <div>Expiries: ${expiryText}</div>
+                <div class="price-info-item">
+                    <strong>Expiries</strong>
+                    <span>${expiryText}</span>
+                </div>
             `;
         }
         
@@ -9486,12 +9858,23 @@ def index():
         
         // Add event listeners for checkboxes
         document.querySelectorAll('.chart-checkbox input[type="checkbox"]').forEach(checkbox => {
-            checkbox.addEventListener('change', updateData);
+            checkbox.addEventListener('change', function() {
+                syncMobilePanelButtons();
+                updateData();
+            });
         });
         
         // Add event listeners for control checkboxes
         document.querySelectorAll('.control-group input[type="checkbox"]').forEach(checkbox => {
             checkbox.addEventListener('change', updateData);
+        });
+
+        document.getElementById('mobile-toggle-filters').addEventListener('click', function() {
+            toggleMobilePanel('filters');
+        });
+
+        document.getElementById('mobile-toggle-charts').addEventListener('click', function() {
+            toggleMobilePanel('charts');
         });
         
         document.getElementById('ticker').addEventListener('change', loadExpirations);
@@ -9612,6 +9995,8 @@ def index():
 
         applyTheme('dark');
 
+        applyMobileLayoutState();
+
         // Initial load - automatically load saved settings, or use defaults
         loadSettings(false);
 
@@ -9620,13 +10005,7 @@ def index():
         
         // Handle window resize
         window.addEventListener('resize', () => {
-            Object.keys(charts).forEach(chartKey => {
-                const chartElement = document.getElementById(`${chartKey}-chart`);
-                if (chartElement && charts[chartKey]) {
-                    Plotly.Plots.resize(chartElement);
-                }
-            });
-            scheduleTVHistoricalOverlayDraw();
+            applyMobileLayoutState();
         });
         
         // Cleanup on page unload
@@ -9768,6 +10147,7 @@ def index():
                     if (checkbox) checkbox.checked = settings.charts[chartId];
                 });
             }
+            syncMobilePanelButtons();
         }
         
         function saveSettings() {
