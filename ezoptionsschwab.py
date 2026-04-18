@@ -1576,6 +1576,117 @@ def get_net_colors(values, max_val, call_color, put_color, coloring_mode='Solid'
     
     return colors
 
+
+def add_current_price_reference(fig, price, horizontal=False, text_color='white'):
+    """Add a current-price guide line and keep horizontal labels in chart margin space."""
+    if horizontal:
+        fig.add_hline(
+            y=price,
+            line_dash="dash",
+            line_color=text_color,
+            opacity=0.5,
+            line_width=1
+        )
+        fig.add_annotation(
+            x=1.0,
+            y=price,
+            xref='paper',
+            yref='y',
+            text=f"{price:.2f}",
+            showarrow=False,
+            xanchor='left',
+            yanchor='middle',
+            xshift=4,
+            font=dict(color=text_color, size=11),
+        )
+        return
+
+    fig.add_vline(
+        x=price,
+        line_dash="dash",
+        line_color=text_color,
+        opacity=0.5,
+        annotation_text=f"{price:.2f}",
+        annotation_position="top",
+        annotation_font_color=text_color,
+        line_width=1
+    )
+
+
+def build_chart_title_text(base_title, selected_expiries=None, showing_last_session=False):
+    chart_title = base_title
+    if selected_expiries and len(selected_expiries) > 1:
+        chart_title = f"{base_title} ({len(selected_expiries)} expiries)"
+    if showing_last_session:
+        chart_title += ' (Last Session)'
+    return chart_title
+
+
+def build_bar_chart_title(base_title, call_total, put_total, net_total, call_color, put_color,
+                          selected_expiries=None):
+    return build_chart_title_text(base_title, selected_expiries=selected_expiries)
+
+
+def build_bar_chart_totals_annotation(call_total, put_total, net_total, call_color, put_color):
+    net_color = call_color if net_total >= 0 else put_color
+    return dict(
+        text=(
+            f"<b><span style='color:{call_color}'>{format_large_number(abs(call_total))}</span>"
+            f" <span style='color:#8e9cb1'>|</span> "
+            f"<span style='color:{net_color}'>Net: {format_large_number(abs(net_total))}</span>"
+            f" <span style='color:#8e9cb1'>|</span> "
+            f"<span style='color:{put_color}'>{format_large_number(abs(put_total))}</span></b>"
+        ),
+        x=0.5,
+        y=1.04,
+        xref='paper',
+        yref='paper',
+        xanchor='center',
+        yanchor='bottom',
+        showarrow=False,
+        align='center',
+        font=dict(size=13, color='#CCCCCC'),
+    )
+
+
+def build_left_aligned_title(title_text, text_color='#CCCCCC', size=16, y=0.98):
+    return dict(
+        text=f"<b>{title_text}</b>",
+        font=dict(color=text_color, size=size),
+        x=0.01,
+        xanchor='left',
+        y=y,
+    )
+
+
+def ensure_bar_text_visibility(fig, horizontal=False):
+    """Keep bar labels visible by disabling clipping and padding the value axis."""
+    fig.update_traces(cliponaxis=False, selector=dict(type='bar'))
+
+    values = []
+    for trace in fig.data:
+        if getattr(trace, 'type', None) != 'bar':
+            continue
+        series_values = trace.x if horizontal else trace.y
+        if not series_values:
+            continue
+        values.extend(float(value) for value in series_values if value is not None)
+
+    if not values:
+        return
+
+    min_value = min(values)
+    max_value = max(values)
+    value_span = max_value - min_value
+    padding = value_span * 0.12 if value_span else max(abs(max_value), 1.0) * 0.12
+    lower_bound = min(0, min_value - padding)
+    upper_bound = max(0, max_value + padding)
+
+    if horizontal:
+        fig.update_xaxes(range=[lower_bound, upper_bound])
+    else:
+        fig.update_yaxes(range=[lower_bound, upper_bound])
+
 def create_exposure_chart(calls, puts, exposure_type, title, S, strike_range=0.02, show_calls=True, show_puts=True, show_net=True, coloring_mode='Solid', call_color='#00FF00', put_color='#FF0000', selected_expiries=None, horizontal=False, show_abs_gex_area=False, abs_gex_opacity=0.2, highlight_max_level=False, max_level_color='#800080', max_level_mode='Absolute'):
     # Ensure the exposure_type column exists
     if exposure_type not in calls.columns or exposure_type not in puts.columns:
@@ -1788,38 +1899,20 @@ def create_exposure_chart(calls, puts, exposure_type, title, S, strike_range=0.0
                 marker_line_width=0
             ))
     
-    if horizontal:
-        # Add current price line
-        fig.add_hline(
-            y=S,
-            line_dash="dash",
-            line_color=text_color,
-            opacity=0.5,
-            annotation_text=f"{S:.2f}",
-            annotation_position="right",
-            annotation_font_color=text_color,
-            line_width=1
-        )
-    else:
-        # Add current price line with improved styling
-        fig.add_vline(
-            x=S,
-            line_dash="dash",
-            line_color=text_color,
-            opacity=0.5,
-            annotation_text=f"{S:.2f}",
-            annotation_position="top",
-            annotation_font_color=text_color,
-            line_width=1
-        )
+    add_current_price_reference(fig, S, horizontal=horizontal, text_color=text_color)
     
     # Calculate padding as percentage of price range
     padding = (max_strike - min_strike) * 0.02
     
-    # Add expiry info to title if multiple expiries are selected
-    chart_title = title
-    if selected_expiries and len(selected_expiries) > 1:
-        chart_title = f"{title} ({len(selected_expiries)} expiries)"
+    chart_title = build_bar_chart_title(
+        title,
+        total_call_exposure,
+        total_put_exposure,
+        total_net_exposure,
+        call_color,
+        put_color,
+        selected_expiries=selected_expiries,
+    )
     
     xaxis_config = dict(
         title='',
@@ -1880,29 +1973,15 @@ def create_exposure_chart(calls, puts, exposure_type, title, S, strike_range=0.0
             showticklabels=True
         ))
 
-    # Update layout with improved styling and split title
     fig.update_layout(
-        title=dict(
-            text=chart_title,  # Main title with expiry info
-            font=dict(color=text_color, size=16),
-            x=0.5,
-            xanchor='center',
-            y=0.98  # Push title higher to avoid collision with price annotation
-        ),
+        title=build_left_aligned_title(chart_title, text_color=text_color),
         annotations=list(fig.layout.annotations) + [
-            dict(
-                text=f"Net: {format_large_number(abs(total_net_exposure))}",
-                x=0.98,
-                y=1.03,
-                xref='paper',
-                yref='paper',
-                xanchor='right',
-                yanchor='top',
-                showarrow=False,
-                font=dict(
-                    size=14,
-                    color=call_color if total_net_exposure >= 0 else put_color
-                )
+            build_bar_chart_totals_annotation(
+                total_call_exposure,
+                total_put_exposure,
+                total_net_exposure,
+                call_color,
+                put_color,
             )
         ],
         xaxis=xaxis_config,
@@ -1915,7 +1994,7 @@ def create_exposure_chart(calls, puts, exposure_type, title, S, strike_range=0.0
         showlegend=False,  # Removed legend
         bargap=0.1,
         bargroupgap=0.1,
-        margin=dict(l=50, r=80, t=60, b=20),
+        margin=dict(l=38, r=56 if horizontal else 68, t=56, b=16),
         hoverlabel=dict(
             bgcolor=background_color,
             font_size=12,
@@ -1925,6 +2004,8 @@ def create_exposure_chart(calls, puts, exposure_type, title, S, strike_range=0.0
         hoverdistance=100,
         height=500
     )
+
+    ensure_bar_text_visibility(fig, horizontal=horizontal)
     
     # Add hover spikes
     fig.update_xaxes(showspikes=True, spikecolor=text_color, spikethickness=1)
@@ -2005,9 +2086,7 @@ def create_exposure_chart(calls, puts, exposure_type, title, S, strike_range=0.0
 
 def create_volume_chart(call_volume, put_volume, use_itm=True, call_color='#00FF00', put_color='#FF0000', selected_expiries=None):
     base_title = '% Range Call vs Put Volume Ratio' if use_itm else 'Call vs Put Volume Ratio'
-    title = base_title
-    if selected_expiries and len(selected_expiries) > 1:
-        title = f"{base_title} ({len(selected_expiries)} expiries)"
+    title = build_chart_title_text(base_title, selected_expiries=selected_expiries)
     fig = go.Figure(data=[go.Pie(
         labels=['Calls', 'Puts'],
         values=[call_volume, put_volume],
@@ -2016,8 +2095,8 @@ def create_volume_chart(call_volume, put_volume, use_itm=True, call_color='#00FF
     )])
     
     fig.update_layout(
-        title_text=title,
-        showlegend=True,
+        title=build_left_aligned_title(title, text_color='white'),
+        showlegend=False,
         plot_bgcolor='#1E1E1E',
         paper_bgcolor='#1E1E1E',
         font=dict(color='white'),
@@ -2027,6 +2106,10 @@ def create_volume_chart(call_volume, put_volume, use_itm=True, call_color='#00FF
     return fig.to_json()
 
 def create_options_volume_chart(calls, puts, S, strike_range=0.02, call_color='#00FF00', put_color='#FF0000', coloring_mode='Solid', show_calls=True, show_puts=True, show_net=True, selected_expiries=None, horizontal=False, highlight_max_level=False, max_level_color='#800080', max_level_mode='Absolute'):
+    total_call_volume = calls['volume'].sum() if not calls.empty and 'volume' in calls.columns else 0
+    total_put_volume = puts['volume'].sum() if not puts.empty and 'volume' in puts.columns else 0
+    total_net_volume = total_call_volume - total_put_volume
+
     # Filter strikes within range
     min_strike = S * (1 - strike_range)
     max_strike = S * (1 + strike_range)
@@ -2159,35 +2242,17 @@ def create_options_volume_chart(calls, puts, S, strike_range=0.02, call_color='#
                 marker_line_width=0
             ))
     
-    if horizontal:
-        # Add current price line
-        fig.add_hline(
-            y=S,
-            line_dash="dash",
-            line_color="white",
-            opacity=0.5,
-            annotation_text=f"{S:.2f}",
-            annotation_position="right",
-            annotation_font_color="white",
-            line_width=1
-        )
-    else:
-        # Add current price line
-        fig.add_vline(
-            x=S,
-            line_dash="dash",
-            line_color="white",
-            opacity=0.5,
-            annotation_text=f"{S:.2f}",
-            annotation_position="top",
-            annotation_font_color="white",
-            line_width=1
-        )
+    add_current_price_reference(fig, S, horizontal=horizontal, text_color='white')
     
-    # Add expiry info to title if multiple expiries are selected
-    chart_title = 'Options Volume by Strike'
-    if selected_expiries and len(selected_expiries) > 1:
-        chart_title = f"Options Volume by Strike ({len(selected_expiries)} expiries)"
+    chart_title = build_bar_chart_title(
+        'Options Volume by Strike',
+        total_call_volume,
+        total_put_volume,
+        total_net_volume,
+        call_color,
+        put_color,
+        selected_expiries=selected_expiries,
+    )
     
     xaxis_config = dict(
         title='',
@@ -2232,12 +2297,16 @@ def create_options_volume_chart(calls, puts, S, strike_range=0.02, call_color='#
 
     # Update layout
     fig.update_layout(
-        title=dict(
-            text=chart_title,
-            font=dict(color='#CCCCCC', size=16),
-            x=0.5,
-            xanchor='center'
-        ),
+        title=build_left_aligned_title(chart_title),
+        annotations=list(fig.layout.annotations) + [
+            build_bar_chart_totals_annotation(
+                total_call_volume,
+                total_put_volume,
+                total_net_volume,
+                call_color,
+                put_color,
+            )
+        ],
         xaxis=xaxis_config,
         yaxis=yaxis_config,
         barmode='relative',
@@ -2256,7 +2325,7 @@ def create_options_volume_chart(calls, puts, S, strike_range=0.02, call_color='#
         ),
         bargap=0.1,
         bargroupgap=0.1,
-        margin=dict(l=50, r=50, t=50, b=100),
+        margin=dict(l=38, r=56 if horizontal else 42, t=52, b=28 if horizontal else 72),
         hoverlabel=dict(
             bgcolor='#1E1E1E',
             font_size=12,
@@ -2264,9 +2333,11 @@ def create_options_volume_chart(calls, puts, S, strike_range=0.02, call_color='#
         ),
         spikedistance=1000,
         hoverdistance=100,
-        showlegend=True,
+        showlegend=False,
         height=500
     )
+
+    ensure_bar_text_visibility(fig, horizontal=horizontal)
     
     # Add hover spikes
     fig.update_xaxes(showspikes=True, spikecolor='#CCCCCC', spikethickness=1)
@@ -2635,13 +2706,7 @@ def create_price_chart(price_data, calls=None, puts=None, exposure_levels_types=
     # Update layout with subplots
     chart_title = 'Price Chart (Heikin-Ashi)' if use_heikin_ashi else 'Price Chart'
     fig.update_layout(
-        title=dict(
-            text=chart_title,
-            font=dict(color='#CCCCCC', size=16),
-            x=0.5,
-            xanchor='center',
-            y=0.98
-        ),
+        title=build_left_aligned_title(chart_title, y=0.98),
         xaxis=dict(
             title='',
             title_font=dict(color='#CCCCCC'),
@@ -2710,7 +2775,7 @@ def create_price_chart(price_data, calls=None, puts=None, exposure_levels_types=
         bargroupgap=0.1,
         margin=dict(l=50, r=120, t=30, b=20),  # Increased right margin further
         hovermode='x unified',
-        showlegend=True,
+        showlegend=False,
         height=550,  # Increased height for better visibility
         dragmode='pan',  # Set default tool to pan
         # Add current price annotation
@@ -3369,34 +3434,34 @@ def create_large_trades_table(calls, puts, S, strike_range, call_color='#00FF00'
     
     # Create HTML table with sorting functionality
     html_content = f'''
-    <div style="background-color: #1E1E1E; padding: 10px; border-radius: 10px; height: 100%; overflow: hidden; display: flex; flex-direction: column;">
-        <h3 style="color: #CCCCCC; text-align: center; margin: 0 0 10px 0; font-size: 14px;">{chart_title}</h3>
+    <div style="background-color: var(--chart-bg, #1E1E1E); color: var(--text-primary, white); padding: 10px; border-radius: 10px; height: 100%; overflow: hidden; display: flex; flex-direction: column;">
+        <h3 style="color: var(--text-secondary, #CCCCCC); text-align: center; margin: 0 0 10px 0; font-size: 14px;">{chart_title}</h3>
         <div style="flex: 1; overflow: auto;">
-            <table id="optionsChainTable" style="width: 100%; border-collapse: collapse; background-color: #1E1E1E; color: white; font-family: Arial, sans-serif; font-size: 10px; table-layout: fixed;">
+            <table id="optionsChainTable" style="width: 100%; border-collapse: collapse; background-color: var(--chart-bg, #1E1E1E); color: var(--text-primary, white); font-family: Arial, sans-serif; font-size: 10px; table-layout: fixed;">
                 <thead>
-                    <tr style="background-color: #2D2D2D; position: sticky; top: 0; z-index: 10;">
-                        <th onclick="sortTable(0, 'string')" style="padding: 4px 2px; border: 1px solid #444444; cursor: pointer; user-select: none; font-size: 10px; width: 8%;">
+                    <tr style="background-color: var(--panel-bg-alt, #2D2D2D); position: sticky; top: 0; z-index: 10;">
+                        <th onclick="sortTable(0, 'string')" style="padding: 4px 2px; border: 1px solid var(--border-color, #444444); cursor: pointer; user-select: none; font-size: 10px; width: 8%;">
                             Type <span style="font-size: 8px;">▼▲</span>
                         </th>
-                        <th onclick="sortTable(1, 'number')" style="padding: 4px 2px; border: 1px solid #444444; cursor: pointer; user-select: none; font-size: 10px; width: 12%;">
+                        <th onclick="sortTable(1, 'number')" style="padding: 4px 2px; border: 1px solid var(--border-color, #444444); cursor: pointer; user-select: none; font-size: 10px; width: 12%;">
                             Strike <span style="font-size: 8px;">▼▲</span>
                         </th>
-                        <th onclick="sortTable(2, 'number')" style="padding: 4px 2px; border: 1px solid #444444; cursor: pointer; user-select: none; font-size: 10px; width: 12%;">
+                        <th onclick="sortTable(2, 'number')" style="padding: 4px 2px; border: 1px solid var(--border-color, #444444); cursor: pointer; user-select: none; font-size: 10px; width: 12%;">
                             Bid <span style="font-size: 8px;">▼▲</span>
                         </th>
-                        <th onclick="sortTable(3, 'number')" style="padding: 4px 2px; border: 1px solid #444444; cursor: pointer; user-select: none; font-size: 10px; width: 12%;">
+                        <th onclick="sortTable(3, 'number')" style="padding: 4px 2px; border: 1px solid var(--border-color, #444444); cursor: pointer; user-select: none; font-size: 10px; width: 12%;">
                             Ask <span style="font-size: 8px;">▼▲</span>
                         </th>
-                        <th onclick="sortTable(4, 'number')" style="padding: 4px 2px; border: 1px solid #444444; cursor: pointer; user-select: none; font-size: 10px; width: 12%;">
+                        <th onclick="sortTable(4, 'number')" style="padding: 4px 2px; border: 1px solid var(--border-color, #444444); cursor: pointer; user-select: none; font-size: 10px; width: 12%;">
                             Last <span style="font-size: 8px;">▼▲</span>
                         </th>
-                        <th onclick="sortTable(5, 'number')" style="padding: 4px 2px; border: 1px solid #444444; cursor: pointer; user-select: none; font-size: 10px; width: 14%;">
+                        <th onclick="sortTable(5, 'number')" style="padding: 4px 2px; border: 1px solid var(--border-color, #444444); cursor: pointer; user-select: none; font-size: 10px; width: 14%;">
                             Vol <span style="font-size: 8px;">▼▲</span>
                         </th>
-                        <th onclick="sortTable(6, 'number')" style="padding: 4px 2px; border: 1px solid #444444; cursor: pointer; user-select: none; font-size: 10px; width: 22%;">
+                        <th onclick="sortTable(6, 'number')" style="padding: 4px 2px; border: 1px solid var(--border-color, #444444); cursor: pointer; user-select: none; font-size: 10px; width: 22%;">
                             OI <span style="font-size: 8px;">▼▲</span>
                         </th>
-                        <th onclick="sortTable(7, 'number')" style="padding: 4px 2px; border: 1px solid #444444; cursor: pointer; user-select: none; font-size: 10px; width: 8%;">
+                        <th onclick="sortTable(7, 'number')" style="padding: 4px 2px; border: 1px solid var(--border-color, #444444); cursor: pointer; user-select: none; font-size: 10px; width: 8%;">
                             IV <span style="font-size: 8px;">▼▲</span>
                         </th>
                     </tr>
@@ -3408,15 +3473,15 @@ def create_large_trades_table(calls, puts, S, strike_range, call_color='#00FF00'
     for option in options_chain:
         row_color = call_color if option['type'] == 'Call' else put_color
         html_content += f'''
-                    <tr style="border-bottom: 1px solid #333333;" onmouseover="this.style.backgroundColor='#333333'" onmouseout="this.style.backgroundColor='transparent'">
-                        <td style="padding: 3px 2px; border: 1px solid #444444; color: {row_color}; font-weight: bold; text-align: center; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">{option['type'][0]}</td>
-                        <td style="padding: 3px 2px; border: 1px solid #444444; text-align: right; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" data-sort="{option['strike']}">{option['strike']:.0f}</td>
-                        <td style="padding: 3px 2px; border: 1px solid #444444; text-align: right; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" data-sort="{option['bid']}">{option['bid']:.2f}</td>
-                        <td style="padding: 3px 2px; border: 1px solid #444444; text-align: right; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" data-sort="{option['ask']}">{option['ask']:.2f}</td>
-                        <td style="padding: 3px 2px; border: 1px solid #444444; text-align: right; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" data-sort="{option['last']}">{option['last']:.2f}</td>
-                        <td style="padding: 3px 2px; border: 1px solid #444444; text-align: right; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" data-sort="{option['volume']}">{option['volume']:,}</td>
-                        <td style="padding: 3px 2px; border: 1px solid #444444; text-align: right; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" data-sort="{option['openInterest']}">{option['openInterest']:,}</td>
-                        <td style="padding: 3px 2px; border: 1px solid #444444; text-align: right; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" data-sort="{option['iv']}">{option['iv']:.0%}</td>
+                    <tr style="border-bottom: 1px solid var(--grid-color, #333333);" onmouseover="this.style.backgroundColor='var(--panel-hover, #333333)'" onmouseout="this.style.backgroundColor='transparent'">
+                        <td style="padding: 3px 2px; border: 1px solid var(--border-color, #444444); color: {row_color}; font-weight: bold; text-align: center; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">{option['type'][0]}</td>
+                        <td style="padding: 3px 2px; border: 1px solid var(--border-color, #444444); text-align: right; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" data-sort="{option['strike']}">{option['strike']:.0f}</td>
+                        <td style="padding: 3px 2px; border: 1px solid var(--border-color, #444444); text-align: right; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" data-sort="{option['bid']}">{option['bid']:.2f}</td>
+                        <td style="padding: 3px 2px; border: 1px solid var(--border-color, #444444); text-align: right; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" data-sort="{option['ask']}">{option['ask']:.2f}</td>
+                        <td style="padding: 3px 2px; border: 1px solid var(--border-color, #444444); text-align: right; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" data-sort="{option['last']}">{option['last']:.2f}</td>
+                        <td style="padding: 3px 2px; border: 1px solid var(--border-color, #444444); text-align: right; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" data-sort="{option['volume']}">{option['volume']:,}</td>
+                        <td style="padding: 3px 2px; border: 1px solid var(--border-color, #444444); text-align: right; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" data-sort="{option['openInterest']}">{option['openInterest']:,}</td>
+                        <td style="padding: 3px 2px; border: 1px solid var(--border-color, #444444); text-align: right; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" data-sort="{option['iv']}">{option['iv']:.0%}</td>
                     </tr>
         '''
     
@@ -3745,11 +3810,11 @@ def create_historical_bubble_levels_chart(ticker, strike_range, call_color='#00F
     
     # Update layout
     fig.update_layout(
-        title=dict(
-            text=f'Historical Bubble Levels - {exposure_name}' + (' (Last Session)' if showing_last_session else ''),
-            font=dict(color='#CCCCCC', size=16),
-            x=0.5,
-            xanchor='center'
+        title=build_left_aligned_title(
+            build_chart_title_text(
+                f'Historical Bubble Levels - {exposure_name}',
+                showing_last_session=showing_last_session,
+            )
         ),
         xaxis=dict(
             title='Time (Full Session)',
@@ -3791,7 +3856,7 @@ def create_historical_bubble_levels_chart(ticker, strike_range, call_color='#00F
             bgcolor='#1E1E1E'
         ),
         margin=dict(l=50, r=50, t=50, b=20),
-        showlegend=True,
+        showlegend=False,
         autosize=True,
         hovermode='closest',
         hoverlabel=dict(
@@ -3812,6 +3877,10 @@ def create_historical_bubble_levels_chart(ticker, strike_range, call_color='#00F
 
 
 def create_open_interest_chart(calls, puts, S, strike_range=0.02, call_color='#00FF00', put_color='#FF0000', coloring_mode='Solid', show_calls=True, show_puts=True, show_net=True, selected_expiries=None, horizontal=False, highlight_max_level=False, max_level_color='#800080', max_level_mode='Absolute'):
+    total_call_oi = calls['openInterest'].sum() if not calls.empty and 'openInterest' in calls.columns else 0
+    total_put_oi = puts['openInterest'].sum() if not puts.empty and 'openInterest' in puts.columns else 0
+    total_net_oi = total_call_oi - total_put_oi
+
     # Filter strikes within range
     min_strike = S * (1 - strike_range)
     max_strike = S * (1 + strike_range)
@@ -3937,33 +4006,17 @@ def create_open_interest_chart(calls, puts, S, strike_range=0.02, call_color='#0
                 marker_line_width=0
             ))
     
-    if horizontal:
-        fig.add_hline(
-            y=S,
-            line_dash="dash",
-            line_color="white",
-            opacity=0.5,
-            annotation_text=f"{S:.2f}",
-            annotation_position="right",
-            annotation_font_color="white",
-            line_width=1
-        )
-    else:
-        fig.add_vline(
-            x=S,
-            line_dash="dash",
-            line_color="white",
-            opacity=0.5,
-            annotation_text=f"{S:.2f}",
-            annotation_position="top",
-            annotation_font_color="white",
-            line_width=1
-        )
+    add_current_price_reference(fig, S, horizontal=horizontal, text_color='white')
     
-    base_title = 'Open Interest by Strike'
-    chart_title = base_title
-    if selected_expiries and len(selected_expiries) > 1:
-        chart_title = f"{base_title} ({len(selected_expiries)} expiries)"
+    chart_title = build_bar_chart_title(
+        'Open Interest by Strike',
+        total_call_oi,
+        total_put_oi,
+        total_net_oi,
+        call_color,
+        put_color,
+        selected_expiries=selected_expiries,
+    )
     
     xaxis_config = dict(
         title='',
@@ -4007,12 +4060,16 @@ def create_open_interest_chart(calls, puts, S, strike_range=0.02, call_color='#0
         ))
 
     fig.update_layout(
-        title=dict(
-            text=chart_title,
-            font=dict(color='#CCCCCC', size=16),
-            x=0.5,
-            xanchor='center'
-        ),
+        title=build_left_aligned_title(chart_title),
+        annotations=list(fig.layout.annotations) + [
+            build_bar_chart_totals_annotation(
+                total_call_oi,
+                total_put_oi,
+                total_net_oi,
+                call_color,
+                put_color,
+            )
+        ],
         xaxis=xaxis_config,
         yaxis=yaxis_config,
         barmode='relative',
@@ -4031,7 +4088,7 @@ def create_open_interest_chart(calls, puts, S, strike_range=0.02, call_color='#0
         ),
         bargap=0.1,
         bargroupgap=0.1,
-        margin=dict(l=50, r=50, t=50, b=100),
+        margin=dict(l=38, r=56 if horizontal else 42, t=52, b=28 if horizontal else 72),
         hoverlabel=dict(
             bgcolor='#1E1E1E',
             font_size=12,
@@ -4039,9 +4096,11 @@ def create_open_interest_chart(calls, puts, S, strike_range=0.02, call_color='#0
         ),
         spikedistance=1000,
         hoverdistance=100,
-        showlegend=True,
+        showlegend=False,
         height=500
     )
+
+    ensure_bar_text_visibility(fig, horizontal=horizontal)
     
     fig.update_xaxes(showspikes=True, spikecolor='#CCCCCC', spikethickness=1)
     fig.update_yaxes(showspikes=True, spikecolor='#CCCCCC', spikethickness=1)
@@ -4092,6 +4151,10 @@ def create_open_interest_chart(calls, puts, S, strike_range=0.02, call_color='#0
     return fig.to_json()
 
 def create_premium_chart(calls, puts, S, strike_range=0.02, call_color='#00FF00', put_color='#FF0000', coloring_mode='Solid', show_calls=True, show_puts=True, show_net=True, selected_expiries=None, horizontal=False, highlight_max_level=False, max_level_color='#800080', max_level_mode='Absolute'):
+    total_call_premium = calls['lastPrice'].sum() if not calls.empty and 'lastPrice' in calls.columns else 0
+    total_put_premium = puts['lastPrice'].sum() if not puts.empty and 'lastPrice' in puts.columns else 0
+    total_net_premium = total_call_premium - total_put_premium
+
     # Filter strikes within range
     min_strike = S * (1 - strike_range)
     max_strike = S * (1 + strike_range)
@@ -4224,35 +4287,17 @@ def create_premium_chart(calls, puts, S, strike_range=0.02, call_color='#00FF00'
                 marker_line_width=0
             ))
     
-    if horizontal:
-        # Add current price line
-        fig.add_hline(
-            y=S,
-            line_dash="dash",
-            line_color="white",
-            opacity=0.5,
-            annotation_text=f"{S:.2f}",
-            annotation_position="right",
-            annotation_font_color="white",
-            line_width=1
-        )
-    else:
-        # Add current price line
-        fig.add_vline(
-            x=S,
-            line_dash="dash",
-            line_color="white",
-            opacity=0.5,
-            annotation_text=f"{S:.2f}",
-            annotation_position="top",
-            annotation_font_color="white",
-            line_width=1
-        )
+    add_current_price_reference(fig, S, horizontal=horizontal, text_color='white')
     
-    # Add expiry info to title if multiple expiries are selected
-    chart_title = 'Option Premium by Strike'
-    if selected_expiries and len(selected_expiries) > 1:
-        chart_title = f"Option Premium by Strike ({len(selected_expiries)} expiries)"
+    chart_title = build_bar_chart_title(
+        'Option Premium by Strike',
+        total_call_premium,
+        total_put_premium,
+        total_net_premium,
+        call_color,
+        put_color,
+        selected_expiries=selected_expiries,
+    )
     
     xaxis_config = dict(
         title='',
@@ -4297,12 +4342,16 @@ def create_premium_chart(calls, puts, S, strike_range=0.02, call_color='#00FF00'
 
     # Update layout
     fig.update_layout(
-        title=dict(
-            text=chart_title,
-            font=dict(color='#CCCCCC', size=16),
-            x=0.5,
-            xanchor='center'
-        ),
+        title=build_left_aligned_title(chart_title),
+        annotations=list(fig.layout.annotations) + [
+            build_bar_chart_totals_annotation(
+                total_call_premium,
+                total_put_premium,
+                total_net_premium,
+                call_color,
+                put_color,
+            )
+        ],
         xaxis=xaxis_config,
         yaxis=yaxis_config,
         barmode='relative',
@@ -4321,7 +4370,7 @@ def create_premium_chart(calls, puts, S, strike_range=0.02, call_color='#00FF00'
         ),
         bargap=0.1,
         bargroupgap=0.1,
-        margin=dict(l=50, r=50, t=40, b=20),
+        margin=dict(l=38, r=56 if horizontal else 42, t=48, b=16),
         hoverlabel=dict(
             bgcolor='#1E1E1E',
             font_size=12,
@@ -4329,9 +4378,11 @@ def create_premium_chart(calls, puts, S, strike_range=0.02, call_color='#00FF00'
         ),
         spikedistance=1000,
         hoverdistance=100,
-        showlegend=True,
+        showlegend=False,
         height=500
     )
+
+    ensure_bar_text_visibility(fig, horizontal=horizontal)
     
     # Add hover spikes
     fig.update_xaxes(showspikes=True, spikecolor='#CCCCCC', spikethickness=1)
@@ -4391,7 +4442,7 @@ def create_centroid_chart(ticker, call_color='#00FF00', put_color='#FF0000', sel
     def _empty_centroid_chart(title):
         fig = go.Figure()
         fig.update_layout(
-            title=dict(text=title, font=dict(color='#CCCCCC', size=16), x=0.5, xanchor='center'),
+            title=build_left_aligned_title(title),
             plot_bgcolor='#1E1E1E',
             paper_bgcolor='#1E1E1E',
             font=dict(color='#CCCCCC'),
@@ -4476,20 +4527,15 @@ def create_centroid_chart(ticker, call_color='#00FF00', put_color='#FF0000', sel
     ))
     
     # Add expiry info to title if multiple expiries are selected
-    chart_title = 'Call vs Put Centroid Map'
-    if selected_expiries and len(selected_expiries) > 1:
-        chart_title = f"Call vs Put Centroid Map ({len(selected_expiries)} expiries)"
-    if showing_last_session:
-        chart_title += ' (Last Session)'
+    chart_title = build_chart_title_text(
+        'Call vs Put Centroid Map',
+        selected_expiries=selected_expiries,
+        showing_last_session=showing_last_session,
+    )
     
     # Update layout to match interval map style
     fig.update_layout(
-        title=dict(
-            text=chart_title,
-            font=dict(color='#CCCCCC', size=16),
-            x=0.5,
-            xanchor='center'
-        ),
+        title=build_left_aligned_title(chart_title),
         xaxis=dict(
             title='Time',
             title_font=dict(color='#CCCCCC'),
@@ -4530,7 +4576,7 @@ def create_centroid_chart(ticker, call_color='#00FF00', put_color='#FF0000', sel
             bgcolor='#1E1E1E'
         ),
         margin=dict(l=50, r=50, t=50, b=20),
-        showlegend=True,
+        showlegend=False,
         autosize=True,
         hovermode='x unified',
         hoverlabel=dict(
@@ -4915,6 +4961,7 @@ def index():
             grid-template-columns: 1fr;
             gap: 5px;
             width: 100%;
+            min-width: 0;
         }
         
         .price-chart-container {
@@ -4923,7 +4970,7 @@ def index():
         
         
         .chart-container {
-            padding: 5px;
+            padding: 0;
             height: 500px;
             width: 100%;
             min-width: 0;
@@ -4933,12 +4980,16 @@ def index():
             margin-bottom: 5px;
             display: flex;
             flex-direction: column;
+            overflow: hidden;
+            box-sizing: border-box;
         }
         
         .chart-container > div {
             flex: 1;
             width: 100%;
             height: 100%;
+            min-width: 0;
+            min-height: 0;
         }
 
         /* TradingView-style price chart overrides */
@@ -5112,7 +5163,7 @@ def index():
             position: absolute;
             bottom: 8px;
             left: 8px;
-            display: flex;
+            display: none;
             flex-wrap: wrap;
             gap: 6px;
             z-index: 15;
@@ -5308,6 +5359,8 @@ def index():
             display: grid;
             gap: 5px;
             width: 100%;
+            min-width: 0;
+            align-items: stretch;
         }
         
         .charts-grid.one-chart {
@@ -5315,19 +5368,19 @@ def index():
         }
         
         .charts-grid.two-charts {
-            grid-template-columns: repeat(2, 1fr);
+            grid-template-columns: repeat(2, minmax(0, 1fr));
         }
         
         .charts-grid.three-charts {
-            grid-template-columns: repeat(2, 1fr);
+            grid-template-columns: repeat(2, minmax(0, 1fr));
         }
         
         .charts-grid.four-charts {
-            grid-template-columns: repeat(2, 1fr);
+            grid-template-columns: repeat(2, minmax(0, 1fr));
         }
         
         .charts-grid.many-charts {
-            grid-template-columns: repeat(2, 1fr);
+            grid-template-columns: repeat(2, minmax(0, 1fr));
         }
         #error-notification {
             position: fixed;
@@ -5536,6 +5589,269 @@ def index():
             left: 50px;
             z-index: 10001;
         }
+
+        :root {
+            --app-bg: #0f131a;
+            --panel-bg: #1a212c;
+            --panel-bg-alt: #222b38;
+            --panel-bg-strong: #2a3444;
+            --panel-hover: #344155;
+            --chart-bg: #10161f;
+            --chart-bg-alt: #171f2b;
+            --border-color: #3a4659;
+            --text-primary: #eef3fb;
+            --text-secondary: #c7d1e0;
+            --text-muted: #8e9cb1;
+            --accent-color: #5ab0ff;
+            --accent-soft: rgba(90, 176, 255, 0.18);
+            --slider-color: #4dd5a6;
+            --good-color: #37d67a;
+            --bad-color: #ff6675;
+            --toolbar-bg: #151d29;
+            --toolbar-button-bg: #243142;
+            --toolbar-button-hover: #304157;
+            --toolbar-button-active: #1d5fa6;
+            --toolbar-button-danger: #5f2428;
+            --grid-color: #2b3748;
+            --crosshair-color: #607188;
+            --tooltip-bg: linear-gradient(180deg, rgba(30, 36, 46, 0.97), rgba(14, 18, 24, 0.99));
+            --tooltip-border: rgba(255, 255, 255, 0.08);
+            --error-bg: #c84d57;
+            --success-bg: #2c8f54;
+            --button-shadow: 0 10px 28px rgba(0, 0, 0, 0.18);
+            --overlay-shadow: 0 14px 36px rgba(0, 0, 0, 0.38);
+            --match-em-bg: #243142;
+            --match-em-text: #9eb3d2;
+            --match-em-border: #5c6d86;
+            --match-em-active-bg: #123d38;
+            --match-em-active-text: #7ef0ca;
+            --match-em-active-border: #2e9b82;
+            --floating-button-bg: rgba(25, 32, 42, 0.88);
+            --floating-button-hover: rgba(58, 72, 92, 0.96);
+        }
+
+        body {
+            background-color: var(--app-bg);
+            color: var(--text-primary);
+        }
+        body,
+        .header,
+        .control-group,
+        .chart-checkbox,
+        .chart-container,
+        .price-chart-container,
+        .tv-toolbar-container,
+        .tv-sub-pane,
+        input,
+        select,
+        button,
+        .expiry-display,
+        .levels-display,
+        .expiry-options,
+        .levels-options,
+        .tv-historical-tooltip,
+        #error-notification {
+            transition: background-color 0.2s ease, color 0.2s ease, border-color 0.2s ease, box-shadow 0.2s ease;
+        }
+        .header {
+            background-color: var(--panel-bg);
+            box-shadow: var(--button-shadow);
+        }
+        .header-bottom {
+            border-top-color: var(--border-color);
+        }
+        .control-group,
+        .chart-checkbox {
+            background-color: var(--panel-bg-alt);
+            color: var(--text-secondary);
+            border: 1px solid transparent;
+        }
+        .control-group label,
+        .chart-checkbox label,
+        .price-info,
+        .tv-chart-title,
+        .tv-legend-item,
+        .tv-sub-pane-header {
+            color: var(--text-secondary);
+        }
+        .expiry-display,
+        .levels-display,
+        input[type="text"],
+        input[type="number"],
+        select {
+            background-color: var(--panel-bg-strong);
+            color: var(--text-primary);
+            border-color: var(--border-color);
+        }
+        .expiry-display:hover,
+        .levels-display:hover,
+        .expiry-option:hover,
+        .levels-option:hover,
+        button:hover,
+        .stream-control button:hover,
+        .settings-control button:hover {
+            background-color: var(--panel-hover);
+            border-color: var(--accent-color);
+        }
+        .expiry-display::after,
+        .levels-display::after,
+        .tm-stats,
+        .tm-label,
+        .tm-divider,
+        .tv-sub-pane-header {
+            color: var(--text-muted);
+        }
+        .expiry-options,
+        .levels-options {
+            background-color: var(--panel-bg-strong);
+            border-color: var(--border-color);
+            box-shadow: var(--button-shadow);
+        }
+        .expiry-buttons,
+        .tv-toolbar-container,
+        .tv-sub-pane {
+            border-color: var(--border-color);
+        }
+        .expiry-buttons button,
+        .settings-control button,
+        .stream-control button,
+        button,
+        .tm-btn,
+        .tv-tb-btn,
+        .candle-close-timer {
+            background-color: var(--panel-bg-strong);
+            color: var(--text-primary);
+            border-color: var(--border-color);
+        }
+        .expiry-buttons .expiry-range-btns button,
+        .tv-tb-btn.active {
+            background-color: color-mix(in srgb, var(--accent-color) 30%, var(--panel-bg-strong));
+            border-color: var(--accent-color);
+            color: var(--text-primary);
+        }
+        .tv-tb-btn.danger {
+            background-color: var(--toolbar-button-danger);
+            border-color: color-mix(in srgb, var(--bad-color) 70%, var(--toolbar-button-danger));
+        }
+        .tm-btn:hover,
+        .tv-tb-btn:hover {
+            color: var(--text-primary);
+        }
+        .tm-btn-del:hover {
+            background: color-mix(in srgb, var(--bad-color) 22%, transparent);
+            border-color: var(--bad-color);
+            color: var(--bad-color);
+        }
+        input[type="range"] {
+            background: var(--grid-color);
+        }
+        input[type="range"]::-webkit-slider-thumb {
+            background: var(--slider-color);
+        }
+        input[type="checkbox"] {
+            accent-color: var(--accent-color);
+        }
+        .title {
+            color: var(--accent-color);
+        }
+        .green {
+            color: var(--good-color);
+        }
+        .red {
+            color: var(--bad-color);
+        }
+        .chart-container {
+            background-color: var(--panel-bg);
+            box-shadow: var(--button-shadow);
+        }
+        .price-chart-container,
+        #price-chart,
+        .tv-toolbar-container,
+        .tv-sub-pane {
+            background: var(--chart-bg);
+        }
+        .tv-historical-tooltip {
+            background: var(--tooltip-bg);
+            border-color: var(--tooltip-border);
+            color: var(--text-primary);
+            box-shadow: var(--overlay-shadow);
+        }
+        .tv-historical-tooltip .tt-badge {
+            background: color-mix(in srgb, var(--text-primary) 10%, transparent);
+            color: var(--text-secondary);
+        }
+        .tv-historical-tooltip .tt-time,
+        .tv-historical-tooltip .tt-value,
+        .tv-historical-tooltip .tt-more,
+        .tv-ohlc-tooltip .tt-time {
+            color: var(--text-muted);
+        }
+        .tv-historical-tooltip .tt-name,
+        .tv-ohlc-tooltip {
+            color: var(--text-primary);
+        }
+        .stream-control button::before {
+            background-color: var(--good-color);
+        }
+        .stream-control button.paused {
+            color: var(--bad-color);
+        }
+        .stream-control button.paused::before {
+            background-color: var(--bad-color);
+        }
+        .settings-control button.success {
+            background-color: var(--success-bg);
+            border-color: var(--success-bg);
+        }
+        #error-notification {
+            background-color: var(--error-bg);
+            color: var(--text-primary);
+        }
+        .chart-fullscreen-btn,
+        .chart-popout-btn {
+            background: var(--floating-button-bg);
+            border-color: var(--border-color);
+            color: var(--text-secondary);
+        }
+        .chart-fullscreen-btn:hover,
+        .chart-popout-btn:hover {
+            background: var(--floating-button-hover);
+            border-color: var(--accent-color);
+            color: var(--text-primary);
+        }
+        .chart-container.fullscreen {
+            background-color: var(--chart-bg) !important;
+        }
+        #match_em_range {
+            margin-left: 4px;
+            padding: 2px 6px;
+            font-size: 11px;
+            min-height: auto;
+            background: var(--match-em-bg);
+            color: var(--match-em-text);
+            border: 1px solid var(--match-em-border);
+            border-radius: 3px;
+            box-shadow: none;
+        }
+        #match_em_range.active {
+            background: var(--match-em-active-bg);
+            color: var(--match-em-active-text);
+            border-color: var(--match-em-active-border);
+        }
+        .theme-control select {
+            min-width: 120px;
+        }
+        ::-webkit-scrollbar {
+            width: 10px;
+            height: 10px;
+        }
+        ::-webkit-scrollbar-track {
+            background: color-mix(in srgb, var(--chart-bg) 88%, black);
+        }
+        ::-webkit-scrollbar-thumb {
+            background: color-mix(in srgb, var(--border-color) 85%, var(--accent-color));
+            border-radius: 999px;
+        }
     </style>
 </head>
 <body>
@@ -5550,9 +5866,9 @@ def index():
                     <div class="title">EzDuz1t Options</div>
                     <div id="token-monitor">
                         <span class="tm-dot tm-neutral" id="tm-dot"></span>
-                        <span class="tm-stats" style="color:#666;font-size:10px;">SCHWAB API</span>
+                        <span class="tm-stats tm-label">SCHWAB API</span>
                         <span class="tm-stats" id="tm-access-stat" title="">…</span>
-                        <span class="tm-stats" style="color:#444;">·</span>
+                        <span class="tm-stats tm-divider">·</span>
                         <span class="tm-stats" id="tm-refresh-stat" title="">…</span>
                         <div class="tm-btn-group">
                             <button class="tm-btn" onclick="fetchTokenHealth()" title="Refresh token status">&#8635;</button>
@@ -5604,6 +5920,22 @@ def index():
                         <button id="saveSettings" title="Save current settings to file">💾 Save</button>
                         <button id="loadSettings" title="Load settings from file">📂 Load</button>
                     </div>
+                    <div class="control-group theme-control">
+                        <label for="theme_select">Theme:</label>
+                        <select id="theme_select" title="Choose a site theme">
+                            <option value="dark" selected>Dark</option>
+                            <option value="light">Light</option>
+                            <option value="ocean">Ocean</option>
+                            <option value="midnight">Midnight</option>
+                            <option value="arctic">Arctic</option>
+                            <option value="cobalt">Cobalt</option>
+                            <option value="forest">Forest</option>
+                            <option value="sunset">Sunset</option>
+                            <option value="ruby">Ruby</option>
+                            <option value="amber">Amber</option>
+                            <option value="neon">Neon</option>
+                        </select>
+                    </div>
                 </div>
             </div>
             <div class="header-bottom">
@@ -5612,7 +5944,7 @@ def index():
                         <label for="strike_range">Strike Range (%):</label>
                         <input type="range" id="strike_range" min="0.5" max="20" value="2" step="0.5">
                         <span class="range-value" id="strike_range_value">2%</span>
-                        <button id="match_em_range" title="Toggle: auto-sync strike range to Expected Move (ATM straddle) + 0.5% wiggle room" style="margin-left:4px;padding:2px 6px;font-size:11px;cursor:pointer;background:#2a2a2a;color:#888888;border:1px solid #555555;border-radius:3px;">📐 EM</button>
+                        <button id="match_em_range" title="Toggle: auto-sync strike range to Expected Move (ATM straddle) + 0.5% wiggle room">📐 EM</button>
                     </div>
                     <div class="control-group">
                         <label for="exposure_metric">Exposure Metric:</label>
@@ -5867,6 +6199,530 @@ def index():
         let livePrice = null;
         // Debounce timer for Plotly price-line updates (avoid flooding relayout calls)
         let plotlyPriceUpdateTimer = null;
+        let currentTheme = 'dark';
+
+        const BASE_THEME = {
+            '--app-bg': '#0f131a',
+            '--panel-bg': '#1a212c',
+            '--panel-bg-alt': '#222b38',
+            '--panel-bg-strong': '#2a3444',
+            '--panel-hover': '#344155',
+            '--chart-bg': '#10161f',
+            '--chart-bg-alt': '#171f2b',
+            '--border-color': '#3a4659',
+            '--text-primary': '#eef3fb',
+            '--text-secondary': '#c7d1e0',
+            '--text-muted': '#8e9cb1',
+            '--accent-color': '#5ab0ff',
+            '--accent-soft': 'rgba(90, 176, 255, 0.18)',
+            '--slider-color': '#4dd5a6',
+            '--good-color': '#37d67a',
+            '--bad-color': '#ff6675',
+            '--toolbar-bg': '#151d29',
+            '--toolbar-button-bg': '#243142',
+            '--toolbar-button-hover': '#304157',
+            '--toolbar-button-active': '#1d5fa6',
+            '--toolbar-button-danger': '#5f2428',
+            '--grid-color': '#2b3748',
+            '--crosshair-color': '#607188',
+            '--tooltip-bg': 'linear-gradient(180deg, rgba(30, 36, 46, 0.97), rgba(14, 18, 24, 0.99))',
+            '--tooltip-border': 'rgba(255, 255, 255, 0.08)',
+            '--error-bg': '#c84d57',
+            '--success-bg': '#2c8f54',
+            '--button-shadow': '0 10px 28px rgba(0, 0, 0, 0.18)',
+            '--overlay-shadow': '0 14px 36px rgba(0, 0, 0, 0.38)',
+            '--match-em-bg': '#243142',
+            '--match-em-text': '#9eb3d2',
+            '--match-em-border': '#5c6d86',
+            '--match-em-active-bg': '#123d38',
+            '--match-em-active-text': '#7ef0ca',
+            '--match-em-active-border': '#2e9b82',
+            '--floating-button-bg': 'rgba(25, 32, 42, 0.88)',
+            '--floating-button-hover': 'rgba(58, 72, 92, 0.96)',
+        };
+
+        const THEME_PRESETS = {
+            dark: {
+                '--app-bg': '#000000',
+                '--panel-bg': '#0b0b0d',
+                '--panel-bg-alt': '#121317',
+                '--panel-bg-strong': '#1b1d22',
+                '--panel-hover': '#262930',
+                '--chart-bg': '#050607',
+                '--chart-bg-alt': '#0f1114',
+                '--border-color': '#2f333b',
+                '--text-primary': '#f6f7f9',
+                '--text-secondary': '#d8dbe2',
+                '--text-muted': '#8a909b',
+                '--accent-color': '#ffb84d',
+                '--accent-soft': 'rgba(255, 184, 77, 0.18)',
+                '--slider-color': '#41d98a',
+                '--good-color': '#41d98a',
+                '--bad-color': '#ff6878',
+                '--toolbar-bg': '#08090b',
+                '--toolbar-button-bg': '#181a20',
+                '--toolbar-button-hover': '#252830',
+                '--toolbar-button-active': '#8f5a11',
+                '--toolbar-button-danger': '#5f2428',
+                '--grid-color': '#1e2128',
+                '--crosshair-color': '#666c79',
+                '--tooltip-bg': 'linear-gradient(180deg, rgba(18, 18, 22, 0.98), rgba(4, 4, 5, 0.99))',
+                '--tooltip-border': 'rgba(255, 255, 255, 0.08)',
+                '--button-shadow': '0 16px 36px rgba(0, 0, 0, 0.42)',
+                '--overlay-shadow': '0 18px 48px rgba(0, 0, 0, 0.55)',
+                '--match-em-bg': '#231e14',
+                '--match-em-text': '#ffd18b',
+                '--match-em-border': '#91641f',
+                '--match-em-active-bg': '#0f3524',
+                '--match-em-active-text': '#7df0b1',
+                '--match-em-active-border': '#2ba262',
+                '--floating-button-bg': 'rgba(14, 15, 18, 0.92)',
+                '--floating-button-hover': 'rgba(34, 37, 43, 0.98)',
+            },
+            light: {
+                '--app-bg': '#f7f1e6',
+                '--panel-bg': '#fffdf8',
+                '--panel-bg-alt': '#f1e8d8',
+                '--panel-bg-strong': '#e4d6be',
+                '--panel-hover': '#dbc9ac',
+                '--chart-bg': '#fffefb',
+                '--chart-bg-alt': '#fbf6ee',
+                '--border-color': '#cbb89b',
+                '--text-primary': '#1f1b16',
+                '--text-secondary': '#473c30',
+                '--text-muted': '#817160',
+                '--accent-color': '#2667c9',
+                '--slider-color': '#1aa36c',
+                '--good-color': '#15885b',
+                '--bad-color': '#c95061',
+                '--toolbar-bg': '#f2e7d5',
+                '--toolbar-button-bg': '#e5d5bb',
+                '--toolbar-button-hover': '#d8c4a3',
+                '--toolbar-button-active': '#2667c9',
+                '--grid-color': '#e4d6bf',
+                '--crosshair-color': '#9f8d76',
+                '--tooltip-bg': 'linear-gradient(180deg, rgba(255, 252, 246, 0.98), rgba(243, 232, 213, 0.98))',
+                '--tooltip-border': 'rgba(31, 27, 22, 0.10)',
+                '--button-shadow': '0 12px 30px rgba(76, 54, 28, 0.10)',
+                '--overlay-shadow': '0 18px 42px rgba(81, 59, 31, 0.14)',
+                '--match-em-bg': '#ebdfca',
+                '--match-em-text': '#61523f',
+                '--match-em-border': '#b89f78',
+                '--match-em-active-bg': '#d9f0e4',
+                '--match-em-active-text': '#116e4c',
+                '--match-em-active-border': '#37a57a',
+                '--floating-button-bg': 'rgba(255, 248, 239, 0.96)',
+                '--floating-button-hover': 'rgba(241, 229, 207, 0.98)',
+            },
+            ocean: {
+                '--app-bg': '#03141d',
+                '--panel-bg': '#082430',
+                '--panel-bg-alt': '#0f3442',
+                '--panel-bg-strong': '#154758',
+                '--panel-hover': '#1d5b6f',
+                '--chart-bg': '#041821',
+                '--chart-bg-alt': '#0a212d',
+                '--border-color': '#2d6878',
+                '--text-primary': '#e7fcff',
+                '--text-secondary': '#bde4eb',
+                '--text-muted': '#77b3bf',
+                '--accent-color': '#2bd4ff',
+                '--accent-soft': 'rgba(43, 212, 255, 0.18)',
+                '--slider-color': '#1ee8b7',
+                '--good-color': '#1ee8b7',
+                '--bad-color': '#ff7f88',
+                '--toolbar-bg': '#061c28',
+                '--toolbar-button-bg': '#123746',
+                '--toolbar-button-hover': '#1b4b5f',
+                '--toolbar-button-active': '#0e84a3',
+                '--grid-color': '#204857',
+                '--crosshair-color': '#6ca0aa',
+                '--tooltip-bg': 'linear-gradient(180deg, rgba(10, 38, 48, 0.97), rgba(3, 18, 24, 0.99))',
+                '--match-em-bg': '#113848',
+                '--match-em-text': '#9befff',
+                '--match-em-border': '#32a6c8',
+                '--match-em-active-bg': '#093833',
+                '--match-em-active-text': '#83ffe6',
+                '--match-em-active-border': '#1dc6a8',
+            },
+            midnight: {
+                '--app-bg': '#06040d',
+                '--panel-bg': '#120b1f',
+                '--panel-bg-alt': '#1b1230',
+                '--panel-bg-strong': '#271946',
+                '--panel-hover': '#35245d',
+                '--chart-bg': '#0a0714',
+                '--chart-bg-alt': '#130c22',
+                '--border-color': '#4a3674',
+                '--text-primary': '#f5efff',
+                '--text-secondary': '#d8c8ff',
+                '--text-muted': '#9f8bc9',
+                '--accent-color': '#9f7bff',
+                '--accent-soft': 'rgba(159, 123, 255, 0.20)',
+                '--slider-color': '#5bd7ff',
+                '--toolbar-bg': '#0d0918',
+                '--toolbar-button-bg': '#24183d',
+                '--toolbar-button-hover': '#342458',
+                '--toolbar-button-active': '#5f43c7',
+                '--grid-color': '#2d2147',
+                '--crosshair-color': '#7f70a5',
+                '--tooltip-bg': 'linear-gradient(180deg, rgba(28, 19, 45, 0.98), rgba(8, 5, 16, 0.99))',
+                '--match-em-bg': '#2a1f4a',
+                '--match-em-text': '#d8c8ff',
+                '--match-em-border': '#8266d3',
+            },
+            arctic: {
+                '--app-bg': '#edf9ff',
+                '--panel-bg': '#fcfeff',
+                '--panel-bg-alt': '#dff2fb',
+                '--panel-bg-strong': '#c7e7f4',
+                '--panel-hover': '#b1dced',
+                '--chart-bg': '#f9fdff',
+                '--chart-bg-alt': '#eff9fd',
+                '--border-color': '#abd2e1',
+                '--text-primary': '#0e2330',
+                '--text-secondary': '#23485e',
+                '--text-muted': '#6e95a8',
+                '--accent-color': '#00a7e1',
+                '--accent-soft': 'rgba(0, 167, 225, 0.18)',
+                '--slider-color': '#11c68d',
+                '--good-color': '#11b57f',
+                '--bad-color': '#de6172',
+                '--toolbar-bg': '#e7f6fd',
+                '--toolbar-button-bg': '#d0ecf8',
+                '--toolbar-button-hover': '#bbe2f2',
+                '--toolbar-button-active': '#00a7e1',
+                '--grid-color': '#d0e9f3',
+                '--crosshair-color': '#89b7c7',
+                '--tooltip-bg': 'linear-gradient(180deg, rgba(253, 255, 255, 0.98), rgba(226, 244, 251, 0.98))',
+                '--tooltip-border': 'rgba(14, 35, 48, 0.10)',
+            },
+            cobalt: {
+                '--app-bg': '#06102b',
+                '--panel-bg': '#0d1b46',
+                '--panel-bg-alt': '#132867',
+                '--panel-bg-strong': '#1b3988',
+                '--panel-hover': '#2750ac',
+                '--chart-bg': '#071435',
+                '--chart-bg-alt': '#0d1e49',
+                '--border-color': '#436abf',
+                '--text-primary': '#eef4ff',
+                '--text-secondary': '#c7d8ff',
+                '--text-muted': '#8fa9e7',
+                '--accent-color': '#4aa3ff',
+                '--accent-soft': 'rgba(74, 163, 255, 0.18)',
+                '--slider-color': '#61e6d4',
+                '--toolbar-bg': '#0b173d',
+                '--toolbar-button-bg': '#183171',
+                '--toolbar-button-hover': '#234595',
+                '--toolbar-button-active': '#2d78ff',
+                '--grid-color': '#24427d',
+                '--crosshair-color': '#7ea1ef',
+                '--tooltip-bg': 'linear-gradient(180deg, rgba(18, 35, 82, 0.97), rgba(6, 16, 43, 0.99))',
+                '--match-em-bg': '#17337a',
+                '--match-em-text': '#c8d9ff',
+                '--match-em-border': '#628de5',
+            },
+            forest: {
+                '--app-bg': '#08120b',
+                '--panel-bg': '#112118',
+                '--panel-bg-alt': '#183024',
+                '--panel-bg-strong': '#234435',
+                '--panel-hover': '#315946',
+                '--chart-bg': '#0c1810',
+                '--chart-bg-alt': '#122117',
+                '--border-color': '#3f6a51',
+                '--text-primary': '#eff8f1',
+                '--text-secondary': '#cee3d3',
+                '--text-muted': '#8daf97',
+                '--accent-color': '#8fdc5b',
+                '--accent-soft': 'rgba(143, 220, 91, 0.18)',
+                '--slider-color': '#4be39c',
+                '--good-color': '#4be39c',
+                '--bad-color': '#ff7f7a',
+                '--toolbar-bg': '#0d1b12',
+                '--toolbar-button-bg': '#20382a',
+                '--toolbar-button-hover': '#2d4f3a',
+                '--toolbar-button-active': '#4c9056',
+                '--grid-color': '#263f30',
+                '--crosshair-color': '#76967f',
+                '--tooltip-bg': 'linear-gradient(180deg, rgba(24, 42, 28, 0.97), rgba(8, 18, 11, 0.99))',
+            },
+            sunset: {
+                '--app-bg': '#24110a',
+                '--panel-bg': '#3a1d13',
+                '--panel-bg-alt': '#542a1a',
+                '--panel-bg-strong': '#6e3821',
+                '--panel-hover': '#8a4929',
+                '--chart-bg': '#2c150d',
+                '--chart-bg-alt': '#381b10',
+                '--border-color': '#9b5c35',
+                '--text-primary': '#fff2e7',
+                '--text-secondary': '#f3cfb7',
+                '--text-muted': '#d49d78',
+                '--accent-color': '#ff8a3d',
+                '--accent-soft': 'rgba(255, 138, 61, 0.20)',
+                '--slider-color': '#ffd166',
+                '--good-color': '#ffca6b',
+                '--bad-color': '#ff7c72',
+                '--toolbar-bg': '#31170f',
+                '--toolbar-button-bg': '#60311e',
+                '--toolbar-button-hover': '#7d4127',
+                '--toolbar-button-active': '#c56224',
+                '--grid-color': '#61331f',
+                '--crosshair-color': '#d69369',
+                '--tooltip-bg': 'linear-gradient(180deg, rgba(78, 40, 24, 0.97), rgba(27, 12, 7, 0.99))',
+                '--match-em-bg': '#663317',
+                '--match-em-text': '#ffd4ad',
+                '--match-em-border': '#d47c42',
+                '--match-em-active-bg': '#5a4310',
+                '--match-em-active-text': '#ffe080',
+                '--match-em-active-border': '#e1a62e',
+            },
+            ruby: {
+                '--app-bg': '#17050c',
+                '--panel-bg': '#2a0c17',
+                '--panel-bg-alt': '#3a1021',
+                '--panel-bg-strong': '#531733',
+                '--panel-hover': '#682045',
+                '--chart-bg': '#1e0710',
+                '--chart-bg-alt': '#2b0d18',
+                '--border-color': '#7a3553',
+                '--text-primary': '#fff0f5',
+                '--text-secondary': '#f3c7d6',
+                '--text-muted': '#ce94aa',
+                '--accent-color': '#ff5c93',
+                '--accent-soft': 'rgba(255, 92, 147, 0.18)',
+                '--slider-color': '#ff8e5d',
+                '--good-color': '#ffb067',
+                '--bad-color': '#ff6f8d',
+                '--toolbar-bg': '#230913',
+                '--toolbar-button-bg': '#45152c',
+                '--toolbar-button-hover': '#5d2040',
+                '--toolbar-button-active': '#b52f67',
+                '--grid-color': '#4c1b32',
+                '--crosshair-color': '#bf6f91',
+                '--tooltip-bg': 'linear-gradient(180deg, rgba(68, 18, 39, 0.97), rgba(22, 6, 12, 0.99))',
+            },
+            amber: {
+                '--app-bg': '#151006',
+                '--panel-bg': '#241b0b',
+                '--panel-bg-alt': '#35270f',
+                '--panel-bg-strong': '#4c3612',
+                '--panel-hover': '#664918',
+                '--chart-bg': '#1b1408',
+                '--chart-bg-alt': '#251b0b',
+                '--border-color': '#866325',
+                '--text-primary': '#fff7e4',
+                '--text-secondary': '#f0dda7',
+                '--text-muted': '#c6a960',
+                '--accent-color': '#ffbf2f',
+                '--accent-soft': 'rgba(255, 191, 47, 0.18)',
+                '--slider-color': '#ffd84a',
+                '--good-color': '#ffe169',
+                '--bad-color': '#ff8d5c',
+                '--toolbar-bg': '#1f1708',
+                '--toolbar-button-bg': '#432f11',
+                '--toolbar-button-hover': '#5b4217',
+                '--toolbar-button-active': '#b17d11',
+                '--grid-color': '#4e3915',
+                '--crosshair-color': '#b5944d',
+                '--tooltip-bg': 'linear-gradient(180deg, rgba(71, 51, 16, 0.97), rgba(18, 13, 5, 0.99))',
+            },
+            neon: {
+                '--app-bg': '#040404',
+                '--panel-bg': '#090909',
+                '--panel-bg-alt': '#111111',
+                '--panel-bg-strong': '#171717',
+                '--panel-hover': '#222222',
+                '--chart-bg': '#050505',
+                '--chart-bg-alt': '#0b0b0b',
+                '--border-color': '#3a3a3a',
+                '--text-primary': '#f7fff9',
+                '--text-secondary': '#d8ffe8',
+                '--text-muted': '#82c89b',
+                '--accent-color': '#ff38c7',
+                '--accent-soft': 'rgba(255, 56, 199, 0.22)',
+                '--slider-color': '#7dff3a',
+                '--good-color': '#7dff3a',
+                '--bad-color': '#ff6b9b',
+                '--toolbar-bg': '#090909',
+                '--toolbar-button-bg': '#131313',
+                '--toolbar-button-hover': '#1d1d1d',
+                '--toolbar-button-active': '#7a1f66',
+                '--grid-color': '#1a1a1a',
+                '--crosshair-color': '#595959',
+                '--tooltip-bg': 'linear-gradient(180deg, rgba(19, 19, 19, 0.98), rgba(4, 4, 4, 0.99))',
+                '--match-em-bg': '#1f1513',
+                '--match-em-text': '#ffb57f',
+                '--match-em-border': '#9d5e34',
+                '--match-em-active-bg': '#11240a',
+                '--match-em-active-text': '#a3ff7a',
+                '--match-em-active-border': '#5ecf26',
+                '--floating-button-bg': 'rgba(13, 13, 13, 0.94)',
+                '--floating-button-hover': 'rgba(28, 28, 28, 0.98)',
+            },
+        };
+
+        function getThemePreset(themeName) {
+            return { ...BASE_THEME, ...(THEME_PRESETS[themeName] || {}) };
+        }
+
+        function getThemeValue(name, fallback) {
+            const value = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+            return value || fallback;
+        }
+
+        function getThemeColors() {
+            return {
+                appBg: getThemeValue('--app-bg', '#0f131a'),
+                panelBg: getThemeValue('--panel-bg', '#1a212c'),
+                panelBgAlt: getThemeValue('--panel-bg-alt', '#222b38'),
+                chartBg: getThemeValue('--chart-bg', '#10161f'),
+                borderColor: getThemeValue('--border-color', '#3a4659'),
+                textPrimary: getThemeValue('--text-primary', '#eef3fb'),
+                textSecondary: getThemeValue('--text-secondary', '#c7d1e0'),
+                textMuted: getThemeValue('--text-muted', '#8e9cb1'),
+                accentColor: getThemeValue('--accent-color', '#5ab0ff'),
+                gridColor: getThemeValue('--grid-color', '#2b3748'),
+                crosshairColor: getThemeValue('--crosshair-color', '#607188'),
+            };
+        }
+
+        function buildLightweightThemeOptions() {
+            const theme = getThemeColors();
+            return {
+                layout: {
+                    background: { color: theme.chartBg },
+                    textColor: theme.textSecondary,
+                    fontFamily: 'Arial, sans-serif',
+                },
+                grid: {
+                    vertLines: { color: theme.gridColor },
+                    horzLines: { color: theme.gridColor },
+                },
+                crosshair: {
+                    mode: LightweightCharts.CrosshairMode.Normal,
+                    vertLine: { color: theme.crosshairColor, labelBackgroundColor: theme.panelBgAlt },
+                    horzLine: { color: theme.crosshairColor, labelBackgroundColor: theme.panelBgAlt },
+                },
+                rightPriceScale: { borderColor: theme.borderColor },
+                timeScale: { borderColor: theme.borderColor },
+            };
+        }
+
+        function applyThemeToPlotlyLayout(layout) {
+            const theme = getThemeColors();
+            layout.plot_bgcolor = theme.chartBg;
+            layout.paper_bgcolor = theme.panelBg;
+            layout.font = Object.assign({}, layout.font || {}, { color: theme.textSecondary });
+            if (layout.title) {
+                layout.title.font = Object.assign({}, layout.title.font || {}, { color: theme.textSecondary });
+            }
+            if (layout.legend) {
+                layout.legend.bgcolor = theme.panelBgAlt;
+                layout.legend.font = Object.assign({}, layout.legend.font || {}, { color: theme.textSecondary });
+            }
+            if (layout.hoverlabel) {
+                layout.hoverlabel.bgcolor = theme.panelBgAlt;
+                layout.hoverlabel.bordercolor = theme.borderColor;
+            }
+            ['xaxis', 'yaxis', 'xaxis2', 'yaxis2'].forEach(axisKey => {
+                const axis = layout[axisKey];
+                if (!axis) return;
+                axis.gridcolor = theme.gridColor;
+                axis.linecolor = theme.borderColor;
+                axis.zerolinecolor = theme.gridColor;
+                axis.tickcolor = theme.textMuted;
+                axis.tickfont = Object.assign({}, axis.tickfont || {}, { color: theme.textSecondary });
+                if (axis.title && typeof axis.title === 'object') {
+                    axis.title.font = Object.assign({}, axis.title.font || {}, { color: theme.textSecondary });
+                }
+                if (axis.title_font) {
+                    axis.title_font.color = theme.textSecondary;
+                }
+            });
+        }
+
+        function buildPlotlyThemeRelayout(div) {
+            const theme = getThemeColors();
+            const relayout = {
+                plot_bgcolor: theme.chartBg,
+                paper_bgcolor: theme.panelBg,
+                'font.color': theme.textSecondary,
+                'hoverlabel.bgcolor': theme.panelBgAlt,
+                'hoverlabel.bordercolor': theme.borderColor,
+                'legend.bgcolor': theme.panelBgAlt,
+                'legend.font.color': theme.textSecondary,
+                'title.font.color': theme.textSecondary,
+            };
+            if (!div || !div._fullLayout) return relayout;
+            ['xaxis', 'yaxis', 'xaxis2', 'yaxis2'].forEach(axisKey => {
+                if (!div._fullLayout[axisKey]) return;
+                relayout[`${axisKey}.gridcolor`] = theme.gridColor;
+                relayout[`${axisKey}.linecolor`] = theme.borderColor;
+                relayout[`${axisKey}.zerolinecolor`] = theme.gridColor;
+                relayout[`${axisKey}.tickfont.color`] = theme.textSecondary;
+                relayout[`${axisKey}.tickcolor`] = theme.textMuted;
+                relayout[`${axisKey}.title.font.color`] = theme.textSecondary;
+            });
+            return relayout;
+        }
+
+        function refreshRenderedChartsForTheme() {
+            if (tvPriceChart) {
+                try { tvPriceChart.applyOptions(buildLightweightThemeOptions()); } catch (e) {}
+            }
+            if (tvRsiChart) {
+                try { tvRsiChart.applyOptions(buildLightweightThemeOptions()); } catch (e) {}
+            }
+            if (tvMacdChart) {
+                try { tvMacdChart.applyOptions(buildLightweightThemeOptions()); } catch (e) {}
+            }
+            Object.keys(charts).forEach(key => {
+                const div = document.getElementById(`${key}-chart`);
+                if (!div || !div._fullLayout || key === 'large_trades') return;
+                try {
+                    Plotly.relayout(div, buildPlotlyThemeRelayout(div));
+                    Plotly.Plots.resize(div);
+                } catch (e) {}
+            });
+            scheduleTVHistoricalOverlayDraw();
+        }
+
+        function buildPopoutThemePayload() {
+            const vars = {};
+            Object.keys(BASE_THEME).forEach(key => {
+                vars[key] = getThemeValue(key, BASE_THEME[key]);
+            });
+            return {
+                name: currentTheme,
+                vars,
+            };
+        }
+        window.buildPopoutThemePayload = buildPopoutThemePayload;
+
+        function applyTheme(themeName) {
+            if (!Object.prototype.hasOwnProperty.call(THEME_PRESETS, themeName)) {
+                themeName = 'dark';
+            }
+            const theme = getThemePreset(themeName);
+            const root = document.documentElement;
+            Object.keys(theme).forEach(key => root.style.setProperty(key, theme[key]));
+            currentTheme = themeName;
+            document.body.dataset.theme = themeName;
+            const selector = document.getElementById('theme_select');
+            if (selector && selector.value !== themeName) {
+                selector.value = themeName;
+            }
+            refreshRenderedChartsForTheme();
+            if (typeof emRangeLocked !== 'undefined') {
+                setEmRangeLocked(emRangeLocked);
+            }
+            if (typeof pushAllPopouts === 'function') {
+                pushAllPopouts();
+            }
+        }
 
         // List of Plotly chart div IDs that carry a current-price line shape
         const PLOTLY_PRICE_LINE_CHARTS = [
@@ -6198,40 +7054,41 @@ def index():
 <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"><\\/script>
 <style>
   * { margin:0; padding:0; box-sizing:border-box; }
-  body { background:#1E1E1E; color:#ccc; font-family:Arial,sans-serif; display:flex; flex-direction:column; height:100vh; overflow:hidden; }
-  #popout-logo { position:fixed; top:6px; left:10px; z-index:200; font-size:11px; font-weight:bold; color:#800080; opacity:0.7; pointer-events:none; letter-spacing:0.5px; }
-  #toolbar { background:#1a1a1a; border-bottom:1px solid #333; padding:4px 8px; display:flex; flex-wrap:wrap; gap:4px; align-items:center; flex-shrink:0; z-index:100; }
-  .tv-tb-sep { width:1px; height:20px; background:#444; margin:0 2px; }
-  .tb-btn { background:#2a2a2a; border:1px solid #444; color:#ccc; border-radius:4px; padding:3px 7px; font-size:11px; cursor:pointer; white-space:nowrap; transition:background 0.15s; user-select:none; }
-  .tb-btn:hover  { background:#3a3a3a; color:#fff; }
-  .tb-btn.active { background:#1a5fac; border-color:#4b90e2; color:#fff; }
-  .tb-btn.danger { background:#5c1a1a; border-color:#c0392b; color:#f88; }
+    :root { --app-bg:#1E1E1E; --panel-bg:#1a1a1a; --panel-bg-alt:#2D2D2D; --panel-bg-strong:#2a2a2a; --panel-hover:#3a3a3a; --chart-bg:#1E1E1E; --border-color:#333; --text-primary:#eef2f7; --text-secondary:#ccc; --text-muted:#888; --accent-color:#800080; --grid-color:#2A2A2A; --crosshair-color:#555; --tooltip-bg:linear-gradient(180deg,rgba(30,34,41,0.96),rgba(16,18,23,0.98)); --tooltip-border:rgba(255,255,255,0.08); }
+    body { background:var(--app-bg); color:var(--text-secondary); font-family:Arial,sans-serif; display:flex; flex-direction:column; height:100vh; overflow:hidden; }
+    #popout-logo { position:fixed; top:6px; left:10px; z-index:200; font-size:11px; font-weight:bold; color:var(--accent-color); opacity:0.7; pointer-events:none; letter-spacing:0.5px; }
+    #toolbar { background:var(--panel-bg); border-bottom:1px solid var(--border-color); padding:4px 8px; display:flex; flex-wrap:wrap; gap:4px; align-items:center; flex-shrink:0; z-index:100; }
+    .tv-tb-sep { width:1px; height:20px; background:var(--border-color); margin:0 2px; }
+    .tb-btn { background:var(--panel-bg-strong); border:1px solid var(--border-color); color:var(--text-secondary); border-radius:4px; padding:3px 7px; font-size:11px; cursor:pointer; white-space:nowrap; transition:background 0.15s,color 0.15s,border-color 0.15s; user-select:none; }
+    .tb-btn:hover  { background:var(--panel-hover); color:var(--text-primary); border-color:var(--accent-color); }
+    .tb-btn.active { background:color-mix(in srgb, var(--accent-color) 30%, var(--panel-bg-strong)); border-color:var(--accent-color); color:var(--text-primary); }
+    .tb-btn.danger { background:#5c1a1a; border-color:#c0392b; color:#f88; }
   #chart-area { flex:1; display:flex; flex-direction:column; min-height:0; position:relative; }
   #price-chart { flex:1; min-height:0; position:relative; }
-  .tv-sub-pane { background:#1E1E1E; border-top:1px solid #333; flex-shrink:0; position:relative; }
-  .tv-sub-pane-hdr { position:absolute; top:4px; left:8px; z-index:5; font-size:10px; color:#888; font-weight:bold; pointer-events:none; }
-  .ind-legend { position:absolute; bottom:8px; left:8px; display:flex; flex-wrap:wrap; gap:6px; z-index:15; pointer-events:none; }
-  .ind-item { font-size:10px; color:#ccc; display:flex; align-items:center; gap:4px; }
+    .tv-sub-pane { background:var(--chart-bg); border-top:1px solid var(--border-color); flex-shrink:0; position:relative; }
+    .tv-sub-pane-hdr { position:absolute; top:4px; left:8px; z-index:5; font-size:10px; color:var(--text-muted); font-weight:bold; pointer-events:none; }
+    .ind-legend { position:absolute; bottom:8px; left:8px; display:none; flex-wrap:wrap; gap:6px; z-index:15; pointer-events:none; }
+    .ind-item { font-size:10px; color:var(--text-secondary); display:flex; align-items:center; gap:4px; }
   .ind-swatch { width:14px; height:3px; border-radius:2px; }
-  .title-el { display:inline-block; color:#ccc; font-size:13px; font-weight:bold; padding:2px 8px; pointer-events:none; }
-  .candle-close-timer { font-size:11px; font-family:'Courier New',monospace; padding:3px 7px; border-radius:4px; background:#2a2a2a; border:1px solid #444; color:#ccc; white-space:nowrap; user-select:none; letter-spacing:0.5px; }
-  .tv-ohlc-tooltip { position:absolute; top:8px; left:8px; z-index:50; font-size:11px; font-family:'Courier New',monospace; color:#ccc; pointer-events:none; white-space:nowrap; width:max-content; display:none; line-height:1.6; }
-  .tv-ohlc-tooltip .tt-time { color:#aaa; font-size:10px; margin-bottom:2px; }
+    .title-el { display:inline-block; color:var(--text-secondary); font-size:13px; font-weight:bold; padding:2px 8px; pointer-events:none; }
+    .candle-close-timer { font-size:11px; font-family:'Courier New',monospace; padding:3px 7px; border-radius:4px; background:var(--panel-bg-strong); border:1px solid var(--border-color); color:var(--text-secondary); white-space:nowrap; user-select:none; letter-spacing:0.5px; }
+    .tv-ohlc-tooltip { position:absolute; top:8px; left:8px; z-index:50; font-size:11px; font-family:'Courier New',monospace; color:var(--text-secondary); pointer-events:none; white-space:nowrap; width:max-content; display:none; line-height:1.6; }
+    .tv-ohlc-tooltip .tt-time { color:var(--text-muted); font-size:10px; margin-bottom:2px; }
   .tv-ohlc-tooltip .tt-up { color:#00FF00; }
   .tv-ohlc-tooltip .tt-dn { color:#FF4444; }
     .tv-historical-overlay { position:absolute; inset:0; z-index:4; pointer-events:none; overflow:hidden; }
     .tv-historical-bubble { position:absolute; border-radius:999px; transform:translate(-50%,-50%); box-shadow:0 0 0 1px rgba(0,0,0,0.25); opacity:0.95; pointer-events:auto; cursor:pointer; }
-    .tv-historical-tooltip { position:absolute; z-index:55; display:none; width:auto !important; height:auto !important; min-width:0; max-width:min(240px,calc(100% - 16px)); padding:8px; border:1px solid rgba(255,255,255,0.08); border-radius:10px; background:linear-gradient(180deg,rgba(30,34,41,0.96),rgba(16,18,23,0.98)); color:#eef2f7; font-size:10px; line-height:1.25; pointer-events:none; box-shadow:0 14px 36px rgba(0,0,0,0.38); backdrop-filter:blur(10px); flex:none !important; align-self:flex-start; overflow:hidden; white-space:normal; }
+        .tv-historical-tooltip { position:absolute; z-index:55; display:none; width:auto !important; height:auto !important; min-width:0; max-width:min(240px,calc(100% - 16px)); padding:8px; border:1px solid var(--tooltip-border); border-radius:10px; background:var(--tooltip-bg); color:var(--text-primary); font-size:10px; line-height:1.25; pointer-events:none; box-shadow:0 14px 36px rgba(0,0,0,0.38); backdrop-filter:blur(10px); flex:none !important; align-self:flex-start; overflow:hidden; white-space:normal; }
     .tv-historical-tooltip .tt-head { display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:6px; }
-    .tv-historical-tooltip .tt-badge { padding:2px 6px; border-radius:999px; background:rgba(255,255,255,0.08); color:#c9d1db; font-size:9px; letter-spacing:0.02em; text-transform:uppercase; }
-    .tv-historical-tooltip .tt-time { color:#8f9baa; font-size:9px; margin-bottom:0; }
+        .tv-historical-tooltip .tt-badge { padding:2px 6px; border-radius:999px; background:rgba(255,255,255,0.08); color:var(--text-secondary); font-size:9px; letter-spacing:0.02em; text-transform:uppercase; }
+        .tv-historical-tooltip .tt-time { color:var(--text-muted); font-size:9px; margin-bottom:0; }
     .tv-historical-tooltip .tt-list { display:grid; gap:4px; }
     .tv-historical-tooltip .tt-row { display:flex; align-items:center; gap:6px; min-width:0; }
     .tv-historical-tooltip .tt-dot { width:7px; height:7px; border-radius:999px; box-shadow:0 0 0 1px rgba(255,255,255,0.12); flex:0 0 auto; }
     .tv-historical-tooltip .tt-main { display:flex; justify-content:space-between; align-items:baseline; gap:8px; min-width:0; width:100%; }
-    .tv-historical-tooltip .tt-name { color:#f4f7fb; font-weight:600; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-    .tv-historical-tooltip .tt-value { color:#9fb0c4; font-variant-numeric:tabular-nums; white-space:nowrap; flex:0 0 auto; }
-    .tv-historical-tooltip .tt-more { color:#8190a3; margin-top:4px; padding-top:4px; border-top:1px solid rgba(255,255,255,0.06); font-size:9px; }
+        .tv-historical-tooltip .tt-name { color:var(--text-primary); font-weight:600; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+        .tv-historical-tooltip .tt-value { color:var(--text-secondary); font-variant-numeric:tabular-nums; white-space:nowrap; flex:0 0 auto; }
+        .tv-historical-tooltip .tt-more { color:var(--text-muted); margin-top:4px; padding-top:4px; border-top:1px solid rgba(255,255,255,0.06); font-size:9px; }
 </style></head><body>
 <div id="popout-logo">EzDuz1t Options</div>
 <div id="toolbar">
@@ -6261,10 +7118,36 @@ def index():
   var lineStyleMap={};
   var popoutTimeframe=1;
   var popoutCandleTimerInterval=null;
+    var popoutTheme='dark';
+    var popoutThemeVars={};
     var historicalDomBound=false;
     var tvHistoricalRenderedPoints=[];
         var historicalBubbleDrawPending=false;
         var historicalBubbleMaxVisible=1200;
+
+    function getThemeVar(name,fallback){
+        var value=getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+        return value||fallback;
+    }
+    function buildTVThemeOptions(){
+        return {
+            layout:{background:{color:getThemeVar('--chart-bg','#1E1E1E')},textColor:getThemeVar('--text-secondary','#CCCCCC'),fontFamily:'Arial, sans-serif'},
+            grid:{vertLines:{color:getThemeVar('--grid-color','#2A2A2A')},horzLines:{color:getThemeVar('--grid-color','#2A2A2A')}},
+            crosshair:{mode:LightweightCharts.CrosshairMode.Normal,vertLine:{color:getThemeVar('--crosshair-color','#555'),labelBackgroundColor:getThemeVar('--panel-bg-alt','#2D2D2D')},horzLine:{color:getThemeVar('--crosshair-color','#555'),labelBackgroundColor:getThemeVar('--panel-bg-alt','#2D2D2D')}},
+            rightPriceScale:{borderColor:getThemeVar('--border-color','#333')},
+            timeScale:{borderColor:getThemeVar('--border-color','#333')}
+        };
+    }
+    function applyPopoutTheme(themePayload){
+        if(!themePayload||!themePayload.vars)return;
+        popoutTheme=themePayload.name||'dark';
+        popoutThemeVars=themePayload.vars||{};
+        Object.keys(popoutThemeVars).forEach(function(key){document.documentElement.style.setProperty(key,popoutThemeVars[key]);});
+        document.body.dataset.theme=popoutTheme;
+        if(tvChart){try{tvChart.applyOptions(buildTVThemeOptions());}catch(e){}}
+        if(tvRsiChart){try{tvRsiChart.applyOptions(buildTVThemeOptions());}catch(e){}}
+        if(tvMacdChart){try{tvMacdChart.applyOptions(buildTVThemeOptions());}catch(e){}}
+    }
 
   // ── Candle close timer (popout) ────────────────────────────────────────────
   function startCandleCloseTimer(){
@@ -6296,7 +7179,7 @@ def index():
   function calcMACD(c,fast,slow,sig){fast=fast||12;slow=slow||26;sig=sig||9;var ef=calcEMA(c,fast),es=calcEMA(c,slow);var ml=ef.map(function(v,i){return(v!==null&&es[i]!==null)?v-es[i]:null;});var sl=[],es2=null,vi=0,k=2/(sig+1);for(var i=0;i<ml.length;i++){if(ml[i]===null){sl.push(null);continue;}if(vi<sig-1){sl.push(null);vi++;continue;}if(es2===null){var piece=ml.filter(function(v){return v!==null;}).slice(0,sig);es2=piece.reduce(function(a,b){return a+b;},0)/sig;}else{es2=ml[i]*k+es2*(1-k);}sl.push(es2);vi++;}return{macd:ml,signal:sl,histogram:ml.map(function(v,i){return(v!==null&&sl[i]!==null)?v-sl[i]:null;})};}
 
   // ── Sub-pane chart factory ─────────────────────────────────────────────────
-  function mkSubChart(el,h){return LightweightCharts.createChart(el,{autoSize:true,height:h,layout:{background:{color:'#1E1E1E'},textColor:'#CCCCCC',fontFamily:'Arial,sans-serif'},grid:{vertLines:{color:'#2A2A2A'},horzLines:{color:'#2A2A2A'}},crosshair:{mode:LightweightCharts.CrosshairMode.Normal,vertLine:{color:'#555',labelBackgroundColor:'#2D2D2D'},horzLine:{color:'#555',labelBackgroundColor:'#2D2D2D'}},rightPriceScale:{borderColor:'#333',scaleMargins:{top:0.1,bottom:0.1}},timeScale:{borderColor:'#333',timeVisible:false,secondsVisible:false,fixLeftEdge:true,fixRightEdge:false},handleScale:{mouseWheel:true,pinch:true,axisPressedMouseMove:true},handleScroll:{mouseWheel:true,pressedMouseMove:true,horzTouchDrag:true,vertTouchDrag:false}});}
+    function mkSubChart(el,h){return LightweightCharts.createChart(el,Object.assign({},buildTVThemeOptions(),{autoSize:true,height:h,rightPriceScale:{borderColor:getThemeVar('--border-color','#333'),scaleMargins:{top:0.1,bottom:0.1}},timeScale:{borderColor:getThemeVar('--border-color','#333'),timeVisible:false,secondsVisible:false,fixLeftEdge:true,fixRightEdge:false},handleScale:{mouseWheel:true,pinch:true,axisPressedMouseMove:true},handleScroll:{mouseWheel:true,pressedMouseMove:true,horzTouchDrag:true,vertTouchDrag:false}}));}
 
   // ── Time-scale sync ────────────────────────────────────────────────────────
   function setupSync(){tvSyncHandlers.forEach(function(h){try{h.chart.timeScale().unsubscribeVisibleLogicalRangeChange(h.handler);}catch(e){}});tvSyncHandlers=[];var all=[tvChart,tvRsiChart,tvMacdChart].filter(Boolean);if(all.length<2)return;all.forEach(function(src){var others=all.filter(function(c){return c!==src;});var h=function(range){if(tvSyncingTS||!range)return;tvSyncingTS=true;others.forEach(function(c){try{c.timeScale().setVisibleLogicalRange(range);}catch(e){}});tvSyncingTS=false;};try{src.timeScale().subscribeVisibleLogicalRangeChange(h);}catch(e){}tvSyncHandlers.push({chart:src,handler:h});});if(tvChart){try{var r=tvChart.timeScale().getVisibleLogicalRange();if(r)[tvRsiChart,tvMacdChart].filter(Boolean).forEach(function(c){try{c.timeScale().setVisibleLogicalRange(r);}catch(e){}});}catch(e){}}}
@@ -6418,7 +7301,7 @@ def index():
     lineStyleMap={dashed:LightweightCharts.LineStyle.Dashed,dotted:LightweightCharts.LineStyle.Dotted,large_dashed:LightweightCharts.LineStyle.LargeDashed};
     if(!tvChart){
       var el=document.getElementById('price-chart');
-      tvChart=LightweightCharts.createChart(el,{autoSize:true,layout:{background:{color:'#1E1E1E'},textColor:'#CCCCCC',fontFamily:'Arial,sans-serif'},grid:{vertLines:{color:'#2A2A2A'},horzLines:{color:'#2A2A2A'}},crosshair:{mode:LightweightCharts.CrosshairMode.Normal,vertLine:{color:'#555',labelBackgroundColor:'#2D2D2D'},horzLine:{color:'#555',labelBackgroundColor:'#2D2D2D'}},rightPriceScale:{borderColor:'#333',scaleMargins:{top:0.04,bottom:0.15}},localization:{timeFormatter:function(time){var d=new Date(time*1000);return d.toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit',hour12:false,timeZone:'America/New_York'});}},timeScale:{borderColor:'#333',timeVisible:true,secondsVisible:false,fixLeftEdge:false,fixRightEdge:false,tickMarkFormatter:function(time){var d=new Date(time*1000);return d.toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit',hour12:false,timeZone:'America/New_York'});}},handleScale:{mouseWheel:true,pinch:true,axisPressedMouseMove:true},handleScroll:{mouseWheel:true,pressedMouseMove:true,horzTouchDrag:true,vertTouchDrag:false}});
+    tvChart=LightweightCharts.createChart(el,Object.assign({},buildTVThemeOptions(),{autoSize:true,rightPriceScale:{borderColor:getThemeVar('--border-color','#333'),scaleMargins:{top:0.04,bottom:0.15}},localization:{timeFormatter:function(time){var d=new Date(time*1000);return d.toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit',hour12:false,timeZone:'America/New_York'});}},timeScale:{borderColor:getThemeVar('--border-color','#333'),timeVisible:true,secondsVisible:false,fixLeftEdge:false,fixRightEdge:false,tickMarkFormatter:function(time){var d=new Date(time*1000);return d.toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit',hour12:false,timeZone:'America/New_York'});}},handleScale:{mouseWheel:true,pinch:true,axisPressedMouseMove:true},handleScroll:{mouseWheel:true,pressedMouseMove:true,horzTouchDrag:true,vertTouchDrag:false}}));
       tvCandle=tvChart.addCandlestickSeries({upColor:upColor,downColor:downColor,borderVisible:false,wickUpColor:upColor,wickDownColor:downColor});
       tvVol=tvChart.addHistogramSeries({priceFormat:{type:'volume'},priceScaleId:'volume',lastValueVisible:false,priceLineVisible:false});
       tvChart.priceScale('volume').applyOptions({scaleMargins:{top:0.88,bottom:0}});
@@ -6439,10 +7322,11 @@ def index():
         var fv=function(v){return v>=1e6?(v/1e6).toFixed(2)+'M':v>=1e3?(v/1e3).toFixed(0)+'K':(v||0).toString();};
         tip.innerHTML='<div class="tt-time">'+ts+'</div>'
           +'<span class="'+cls+'">O <b>'+fmt(bar.open)+'</b>  H <b>'+fmt(bar.high)+'</b>  L <b>'+fmt(bar.low)+'</b>  C <b>'+fmt(bar.close)+'</b>  '+(chg>=0?'+':'')+chg+'%</span>'
-          +'<br><span style="color:#888">Vol <b>'+fv(bar.volume)+'</b></span>';
+                    +'<br><span style="color:'+getThemeVar('--text-muted','#888')+'">Vol <b>'+fv(bar.volume)+'</b></span>';
         tip.style.display='block';
       });
     } else {
+            try{tvChart.applyOptions(buildTVThemeOptions());}catch(e){}
       tvCandle.applyOptions({upColor:upColor,downColor:downColor,wickUpColor:upColor,wickDownColor:downColor});
     }
     tvCandle.setData(candles);
@@ -6512,13 +7396,16 @@ def index():
       var ticker=val('ticker');if(!ticker)return null;
       var levelsTypes=[];
       try{levelsTypes=Array.from(d.querySelectorAll('.levels-option input:checked')).map(function(cb){return cb.value;});}catch(e){}
-      return{ticker:ticker,timeframe:val('timeframe')||'1',call_color:val('call_color')||'#00ff00',put_color:val('put_color')||'#ff0000',levels_types:levelsTypes,levels_count:parseInt(val('levels_count'))||3,use_heikin_ashi:chk('use_heikin_ashi'),strike_range:parseFloat(val('strike_range'))/100||0.1,highlight_max_level:chk('highlight_max_level'),max_level_color:val('max_level_color')||'#800080',coloring_mode:val('coloring_mode')||'Linear Intensity'};
+            var themePayload=null;
+            try{if(op.buildPopoutThemePayload)themePayload=op.buildPopoutThemePayload();}catch(e){}
+            return{ticker:ticker,timeframe:val('timeframe')||'1',call_color:val('call_color')||'#00ff00',put_color:val('put_color')||'#ff0000',levels_types:levelsTypes,levels_count:parseInt(val('levels_count'))||3,use_heikin_ashi:chk('use_heikin_ashi'),strike_range:parseFloat(val('strike_range'))/100||0.1,highlight_max_level:chk('highlight_max_level'),max_level_color:val('max_level_color')||'#800080',coloring_mode:val('coloring_mode')||'Linear Intensity',theme_payload:themePayload};
     }catch(e){return null;}
   }
   function loadInitialData(){
     if(popoutFetching)return;
     var settings=getSettingsFromOpener();
     if(!settings||!settings.ticker)return;
+        if(settings.theme_payload)applyPopoutTheme(settings.theme_payload);
     popoutFetching=true;
     fetch('/update_price',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(settings)})
       .then(function(r){return r.json();})
@@ -6539,6 +7426,7 @@ def index():
   var popoutExpLevelTimer=null;
   function tickerWatchLoop(){
     var settings=getSettingsFromOpener();
+        if(settings&&settings.theme_payload)applyPopoutTheme(settings.theme_payload);
     var ticker=settings?settings.ticker:null;
     if(ticker&&ticker!==popoutCurrentTicker){
       popoutCurrentTicker=ticker;
@@ -6580,7 +7468,8 @@ def index():
 
   // Entry point kept for compatibility with pushDataToPopout
   window.updatePopoutChart=function(priceDataJSON){
-    try{var priceData=typeof priceDataJSON==='string'?JSON.parse(priceDataJSON):priceDataJSON;if(!priceData||priceData.error)return;renderPriceChart(priceData);}catch(e){console.error('Popout price chart error:',e);}
+        var themePayload=arguments.length>2?arguments[2]:null;
+        try{if(themePayload)applyPopoutTheme(themePayload);var priceData=typeof priceDataJSON==='string'?JSON.parse(priceDataJSON):priceDataJSON;if(!priceData||priceData.error)return;renderPriceChart(priceData);}catch(e){console.error('Popout price chart error:',e);}
   };
   window.addEventListener('resize',function(){if(tvChart&&tvAutoRange){try{tvChart.timeScale().fitContent();}catch(e){}}});
   window.addEventListener('beforeunload',function(){if(popoutEvtSource){try{popoutEvtSource.close();}catch(e){}}});
@@ -6591,24 +7480,102 @@ def index():
 <script src="https://cdn.plot.ly/plotly-latest.min.js"><\\/script>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
-  body { background: #1E1E1E; overflow: hidden; position: relative; }
-  #popout-logo { position: fixed; top: 6px; left: 10px; z-index: 100; font-family: Arial, sans-serif; font-size: 11px; font-weight: bold; color: #800080; opacity: 0.7; pointer-events: none; letter-spacing: 0.5px; }
+    :root { --app-bg:#1E1E1E; --panel-bg:#1a1a1a; --panel-bg-alt:#2D2D2D; --chart-bg:#1E1E1E; --border-color:#333; --text-primary:#eef2f7; --text-secondary:#ccc; --text-muted:#888; --accent-color:#800080; --grid-color:#2A2A2A; }
+    body { background: var(--app-bg); color: var(--text-secondary); overflow: hidden; position: relative; }
+    #popout-logo { position: fixed; top: 6px; left: 10px; z-index: 100; font-family: Arial, sans-serif; font-size: 11px; font-weight: bold; color: var(--accent-color); opacity: 0.7; pointer-events: none; letter-spacing: 0.5px; }
   #popout-plot { width: 100vw; height: 100vh; }
-  #popout-html { width: 100vw; height: 100vh; overflow: auto; background: #1E1E1E; color: white; font-family: Arial, sans-serif; }
+    #popout-html { width: 100vw; height: 100vh; overflow: auto; background: var(--chart-bg); color: var(--text-primary); font-family: Arial, sans-serif; }
 </style></head><body>
 <div id="popout-logo">EzDuz1t Options</div>
 <div id="popout-plot"></div>
 <div id="popout-html" style="display:none;"></div>
 <script>
   let plotInited = false;
-  window.updatePopoutChart = function(chartDataJSON, isHtml) {
+    function getThemeVar(name, fallback) {
+        const value = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+        return value || fallback;
+    }
+    function applyPlotlyThemeToLayout(layout) {
+        const chartBg = getThemeVar('--chart-bg', '#1E1E1E');
+        const panelBg = getThemeVar('--panel-bg', '#1a1a1a');
+        const panelBgAlt = getThemeVar('--panel-bg-alt', '#2D2D2D');
+        const textSecondary = getThemeVar('--text-secondary', '#ccc');
+        const textMuted = getThemeVar('--text-muted', '#888');
+        const borderColor = getThemeVar('--border-color', '#333');
+        const gridColor = getThemeVar('--grid-color', '#2A2A2A');
+        layout.plot_bgcolor = chartBg;
+        layout.paper_bgcolor = panelBg;
+        layout.font = Object.assign({}, layout.font || {}, { color: textSecondary });
+        if (layout.title) {
+            layout.title.font = Object.assign({}, layout.title.font || {}, { color: textSecondary });
+        }
+        if (layout.legend) {
+            layout.legend.bgcolor = panelBgAlt;
+            layout.legend.font = Object.assign({}, layout.legend.font || {}, { color: textSecondary });
+        }
+        if (layout.hoverlabel) {
+            layout.hoverlabel.bgcolor = panelBgAlt;
+            layout.hoverlabel.bordercolor = borderColor;
+            layout.hoverlabel.font = Object.assign({}, layout.hoverlabel.font || {}, { color: textSecondary });
+        }
+        ['xaxis', 'yaxis', 'xaxis2', 'yaxis2'].forEach(axisKey => {
+            const axis = layout[axisKey];
+            if (!axis) return;
+            axis.gridcolor = gridColor;
+            axis.linecolor = borderColor;
+            axis.zerolinecolor = gridColor;
+            axis.tickcolor = textMuted;
+            axis.tickfont = Object.assign({}, axis.tickfont || {}, { color: textSecondary });
+            if (axis.title && typeof axis.title === 'object') {
+                axis.title.font = Object.assign({}, axis.title.font || {}, { color: textSecondary });
+            }
+            if (axis.title_font) {
+                axis.title_font.color = textSecondary;
+            }
+        });
+    }
+    function applyPopoutTheme(themePayload) {
+        if (!themePayload || !themePayload.vars) return;
+        Object.keys(themePayload.vars).forEach(key => document.documentElement.style.setProperty(key, themePayload.vars[key]));
+        document.body.dataset.theme = themePayload.name || 'dark';
+        const plotDiv = document.getElementById('popout-plot');
+        if (plotDiv && plotDiv.querySelector('.js-plotly-plot')) {
+            try {
+                Plotly.relayout(plotDiv, {
+                    plot_bgcolor: getThemeVar('--chart-bg', '#1E1E1E'),
+                    paper_bgcolor: getThemeVar('--panel-bg', '#1a1a1a'),
+                    'font.color': getThemeVar('--text-secondary', '#ccc'),
+                    'hoverlabel.bgcolor': getThemeVar('--panel-bg-alt', '#2D2D2D'),
+                    'hoverlabel.bordercolor': getThemeVar('--border-color', '#333'),
+                    'legend.bgcolor': getThemeVar('--panel-bg-alt', '#2D2D2D'),
+                    'legend.font.color': getThemeVar('--text-secondary', '#ccc'),
+                    'title.font.color': getThemeVar('--text-secondary', '#ccc'),
+                    'xaxis.gridcolor': getThemeVar('--grid-color', '#2A2A2A'),
+                    'xaxis.linecolor': getThemeVar('--border-color', '#333'),
+                    'xaxis.zerolinecolor': getThemeVar('--grid-color', '#2A2A2A'),
+                    'xaxis.tickfont.color': getThemeVar('--text-secondary', '#ccc'),
+                    'yaxis.gridcolor': getThemeVar('--grid-color', '#2A2A2A'),
+                    'yaxis.linecolor': getThemeVar('--border-color', '#333'),
+                    'yaxis.zerolinecolor': getThemeVar('--grid-color', '#2A2A2A'),
+                    'yaxis.tickfont.color': getThemeVar('--text-secondary', '#ccc')
+                });
+            } catch (e) {}
+        }
+    }
+    window.updatePopoutChart = function(chartDataJSON, isHtml, themePayload) {
+        if (themePayload) {
+            applyPopoutTheme(themePayload);
+        }
     if (isHtml) {
       document.getElementById('popout-plot').style.display = 'none';
       const htmlDiv = document.getElementById('popout-html');
       htmlDiv.style.display = 'block';
-      htmlDiv.innerHTML = chartDataJSON;
+            htmlDiv.innerHTML = chartDataJSON || '';
       return;
     }
+        if (!chartDataJSON) {
+            return;
+        }
     document.getElementById('popout-html').style.display = 'none';
     const plotDiv = document.getElementById('popout-plot');
     plotDiv.style.display = 'block';
@@ -6617,7 +7584,8 @@ def index():
       chartData.layout.autosize = true;
       chartData.layout.width = null;
       chartData.layout.height = null;
-      chartData.layout.margin = { l: 60, r: 130, t: 60, b: 40 };
+    chartData.layout.margin = chartData.layout.margin || { l: 60, r: 60, t: 60, b: 40 };
+            applyPlotlyThemeToLayout(chartData.layout);
       const config = { responsive: true, displayModeBar: true, modeBarButtonsToRemove: ['lasso2d','select2d'], displaylogo: false, scrollZoom: true };
       if (plotInited) {
         Plotly.react('popout-plot', chartData.data, chartData.layout, config);
@@ -6658,11 +7626,10 @@ def index():
             const dataKey = chartId.replace('-chart', '');
             // Price data is stored separately since it's fetched via /update_price
             const chartPayload = (dataKey === 'price') ? lastPriceData : lastData[dataKey];
-            if (!chartPayload) return;
 
             const isHtml = (dataKey === 'large_trades');
             try {
-                popup.updatePopoutChart(chartPayload, isHtml);
+                popup.updatePopoutChart(chartPayload || null, isHtml, buildPopoutThemePayload());
             } catch(e) {
                 // popup may have navigated away or been closed
                 console.warn('Could not push to popout:', e);
@@ -6760,17 +7727,10 @@ def index():
         function setEmRangeLocked(locked) {
             emRangeLocked = locked;
             const btn = document.getElementById('match_em_range');
-            if (locked) {
-                btn.style.background = '#1a4a1a';
-                btn.style.color = '#00ff88';
-                btn.style.borderColor = '#00aa55';
-                btn.title = 'EM Range Lock ON — click to disable';
-            } else {
-                btn.style.background = '#2a2a2a';
-                btn.style.color = '#888888';
-                btn.style.borderColor = '#555555';
-                btn.title = 'Toggle: auto-sync strike range to Expected Move (ATM straddle) + 0.5% wiggle room';
-            }
+            btn.classList.toggle('active', locked);
+            btn.title = locked
+                ? 'EM Range Lock ON — click to disable'
+                : 'Toggle: auto-sync strike range to Expected Move (ATM straddle) + 0.5% wiggle room';
         }
 
         // Match EM range button: toggle auto-sync of strike range to EM
@@ -7230,24 +8190,17 @@ def index():
         // ── Sub-pane chart helper functions ──────────────────────────────────
         function createSubPaneChart(element, height) {
             if (!element) return null;
-            return LightweightCharts.createChart(element, {
+            return LightweightCharts.createChart(element, Object.assign({}, buildLightweightThemeOptions(), {
                 autoSize: true,
                 height: height,
-                layout: { background: { color: '#1E1E1E' }, textColor: '#CCCCCC', fontFamily: 'Arial, sans-serif' },
-                grid: { vertLines: { color: '#2A2A2A' }, horzLines: { color: '#2A2A2A' } },
-                crosshair: {
-                    mode: LightweightCharts.CrosshairMode.Normal,
-                    vertLine: { color: '#555555', labelBackgroundColor: '#2D2D2D' },
-                    horzLine: { color: '#555555', labelBackgroundColor: '#2D2D2D' },
-                },
-                rightPriceScale: { borderColor: '#333333', scaleMargins: { top: 0.1, bottom: 0.1 } },
+                rightPriceScale: { borderColor: getThemeValue('--border-color', '#333333'), scaleMargins: { top: 0.1, bottom: 0.1 } },
                 timeScale: {
-                    borderColor: '#333333', timeVisible: false, secondsVisible: false,
+                    borderColor: getThemeValue('--border-color', '#333333'), timeVisible: false, secondsVisible: false,
                     fixLeftEdge: true, fixRightEdge: false,
                 },
                 handleScale: { mouseWheel: true, pinch: true, axisPressedMouseMove: true },
                 handleScroll: { mouseWheel: true, pressedMouseMove: true, horzTouchDrag: true, vertTouchDrag: false },
-            });
+            }));
         }
 
         function setupTimeScaleSync() {
@@ -7916,24 +8869,10 @@ def index():
                 const _tc = document.getElementById('tv-toolbar-container');
                 if (_tc) _tc.innerHTML = '';
 
-                tvPriceChart = LightweightCharts.createChart(container, {
+                tvPriceChart = LightweightCharts.createChart(container, Object.assign({}, buildLightweightThemeOptions(), {
                     autoSize: true,
-                    layout: {
-                        background: { color: '#1E1E1E' },
-                        textColor:   '#CCCCCC',
-                        fontFamily:  'Arial, sans-serif',
-                    },
-                    grid: {
-                        vertLines: { color: '#2A2A2A' },
-                        horzLines: { color: '#2A2A2A' },
-                    },
-                    crosshair: {
-                        mode: LightweightCharts.CrosshairMode.Normal,
-                        vertLine: { color: '#555555', labelBackgroundColor: '#2D2D2D' },
-                        horzLine: { color: '#555555', labelBackgroundColor: '#2D2D2D' },
-                    },
                     rightPriceScale: {
-                        borderColor:  '#333333',
+                        borderColor:  getThemeValue('--border-color', '#333333'),
                         scaleMargins: { top: 0.04, bottom: 0.15 },
                     },
                     localization: {
@@ -7946,7 +8885,7 @@ def index():
                         }
                     },
                     timeScale: {
-                        borderColor:      '#333333',
+                        borderColor:      getThemeValue('--border-color', '#333333'),
                         timeVisible:      true,
                         secondsVisible:   false,
                         fixLeftEdge:      false,
@@ -7961,7 +8900,7 @@ def index():
                     },
                     handleScale:  { mouseWheel: true, pinch: true, axisPressedMouseMove: true },
                     handleScroll: { mouseWheel: true, pressedMouseMove: true, horzTouchDrag: true, vertTouchDrag: false },
-                });
+                }));
 
                 tvCandleSeries = tvPriceChart.addCandlestickSeries({
                     upColor, downColor,
@@ -8033,7 +8972,7 @@ def index():
                         +'C <b>'+fmt(bar.close)+'</b>  '
                         +(chg>=0?'+':'')+chg+'%'
                         +'</span>'
-                        +'<br><span style="color:#888">Vol <b>'+fmtVol(bar.volume)+'</b></span>';
+                        +'<br><span style="color:'+getThemeValue('--text-muted', '#888')+'">Vol <b>'+fmtVol(bar.volume)+'</b></span>';
                     tip.style.display = 'block';
                 });
             }
@@ -8041,6 +8980,7 @@ def index():
             // ── Every render: update data and overlays in place ───────────────
 
             // Update candle colors in case they changed
+            try { tvPriceChart.applyOptions(buildLightweightThemeOptions()); } catch (e) {}
             tvCandleSeries.applyOptions({
                 upColor, downColor,
                 wickUpColor: upColor, wickDownColor: downColor,
@@ -8199,6 +9139,20 @@ def index():
                 premium: document.getElementById('premium').checked,
                 centroid: document.getElementById('centroid').checked
             };
+
+            function resizeRegularCharts() {
+                requestAnimationFrame(() => {
+                    Object.keys(charts).forEach(chartKey => {
+                        const chartElement = document.getElementById(`${chartKey}-chart`);
+                        if (!chartElement || chartKey === 'large_trades') return;
+                        try {
+                            Plotly.Plots.resize(chartElement);
+                        } catch (error) {
+                            console.error(`Error resizing ${chartKey} chart:`, error);
+                        }
+                    });
+                });
+            }
             
             // Handle price chart separately (TradingView Lightweight Charts)
             if (selectedCharts.price && data.price) {
@@ -8328,12 +9282,13 @@ def index():
                             }
                         } else {
                             const chartData = JSON.parse(data[key]);
+                            const baseMargins = chartData.layout.margin || {l: 44, r: 28, t: 44, b: 28};
                             
                             // Configure chart sizing to fill container
                             chartData.layout.autosize = true;
                             chartData.layout.width = null;
                             chartData.layout.height = null;
-                            chartData.layout.margin = getChartMargins(`${key}-chart`, {l: 50, r: 50, t: 40, b: 20});
+                            chartData.layout.margin = getChartMargins(`${key}-chart`, baseMargins);
                             
                             // Ensure axes auto-scale with new data
                             if (chartData.layout.xaxis) {
@@ -8342,17 +9297,14 @@ def index():
                             if (chartData.layout.yaxis) {
                                 chartData.layout.yaxis.autorange = true;
                             }
-                            
-                            chartData.layout.plot_bgcolor = '#1E1E1E';
-                            chartData.layout.paper_bgcolor = '#1E1E1E';
+                            applyThemeToPlotlyLayout(chartData.layout);
                             
                             const config = {
                                 responsive: true,
                                 displayModeBar: true,
                                 modeBarButtonsToRemove: ['lasso2d', 'select2d'],
                                 displaylogo: false,
-                                useResizeHandler: true,
-                                style: {width: "100%", height: "100%"}
+                                scrollZoom: true
                             };
                             
                             if (charts[key]) {
@@ -8365,6 +9317,8 @@ def index():
                         console.error(`Error rendering ${key} chart:`, error);
                     }
                 });
+
+                resizeRegularCharts();
             }
             
             // Clean up disabled regular charts from charts object
@@ -8656,6 +9610,8 @@ def index():
             selectExpiriesUpTo(cutoff);
         });
 
+        applyTheme('dark');
+
         // Initial load - automatically load saved settings, or use defaults
         loadSettings(false);
 
@@ -8706,6 +9662,7 @@ def index():
         function gatherSettings() {
             return {
                 ticker: document.getElementById('ticker').value,
+                theme: document.getElementById('theme_select').value,
                 timeframe: document.getElementById('timeframe').value,
                 strike_range: document.getElementById('strike_range').value,
                 exposure_metric: document.getElementById('exposure_metric').value,
@@ -8750,6 +9707,7 @@ def index():
         
         function applySettings(settings) {
             if (settings.ticker) document.getElementById('ticker').value = settings.ticker;
+            applyTheme(settings.theme || 'dark');
             if (settings.timeframe) document.getElementById('timeframe').value = settings.timeframe;
             if (settings.strike_range) {
                 document.getElementById('strike_range').value = settings.strike_range;
@@ -8876,6 +9834,9 @@ def index():
         
         document.getElementById('saveSettings').addEventListener('click', saveSettings);
         document.getElementById('loadSettings').addEventListener('click', loadSettings);
+        document.getElementById('theme_select').addEventListener('change', function(e) {
+            applyTheme(e.target.value);
+        });
 
         // Add event listener for ticker input
         document.getElementById('ticker').addEventListener('input', function(e) {
