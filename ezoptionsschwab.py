@@ -3162,6 +3162,21 @@ def build_historical_levels_overlay(ticker, display_date, chart_times, latest_pr
                 'reference_price': f"${row['price']:.2f}",
             })
 
+    overlap_groups = {}
+    for point in historical_points:
+        overlap_key = (
+            point['time'],
+            round(point['price'], 4),
+            point.get('kind', 'exposure'),
+        )
+        overlap_groups.setdefault(overlap_key, []).append(point)
+
+    for group_points in overlap_groups.values():
+        total_points = len(group_points)
+        for index, point in enumerate(group_points):
+            point['overlap_slot'] = index
+            point['overlap_count'] = total_points
+
     historical_points.sort(
         key=lambda point: (
             point['time'],
@@ -5165,6 +5180,102 @@ def index():
         .tv-tb-btn:hover  { background: #3a3a3a; color: #fff; }
         .tv-tb-btn.active { background: #1a5fac; border-color: #4b90e2; color: #fff; }
         .tv-tb-btn.danger { background: #5c1a1a; border-color: #c0392b; color: #f88; }
+        .tv-indicator-picker {
+            position: relative;
+        }
+        .tv-indicator-summary {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            list-style: none;
+        }
+        .tv-indicator-summary::-webkit-details-marker {
+            display: none;
+        }
+        .tv-indicator-summary::marker {
+            content: '';
+        }
+        .tv-indicator-badge {
+            display: none;
+            min-width: 18px;
+            padding: 1px 6px;
+            border-radius: 999px;
+            background: #3b4758;
+            color: #eef2f7;
+            font-size: 10px;
+            line-height: 1.3;
+            text-align: center;
+        }
+        .tv-indicator-menu {
+            position: absolute;
+            top: calc(100% + 6px);
+            left: 0;
+            width: min(320px, calc(100vw - 32px));
+            padding: 8px;
+            border: 1px solid #444;
+            border-radius: 10px;
+            background: #1c1c1c;
+            box-shadow: 0 12px 28px rgba(0, 0, 0, 0.35);
+            z-index: 130;
+        }
+        .tv-indicator-search {
+            width: 100%;
+            border: 1px solid #444;
+            border-radius: 8px;
+            background: #121212;
+            color: #eee;
+            padding: 7px 10px;
+            font-size: 12px;
+            outline: none;
+        }
+        .tv-indicator-search:focus {
+            border-color: #4b90e2;
+        }
+        .tv-indicator-options {
+            display: grid;
+            gap: 4px;
+            margin-top: 8px;
+            max-height: 240px;
+            overflow: auto;
+        }
+        .tv-indicator-option {
+            width: 100%;
+            border: 1px solid #333;
+            border-radius: 8px;
+            background: #242424;
+            color: #ccc;
+            padding: 7px 9px;
+            text-align: left;
+            cursor: pointer;
+            display: grid;
+            gap: 2px;
+        }
+        .tv-indicator-option:hover {
+            background: #2f2f2f;
+            border-color: #4b90e2;
+        }
+        .tv-indicator-option.active {
+            background: #173a63;
+            border-color: #4b90e2;
+            color: #fff;
+        }
+        .tv-indicator-option-name {
+            font-size: 12px;
+            font-weight: 600;
+        }
+        .tv-indicator-option-desc {
+            font-size: 10px;
+            color: #9ea7b3;
+        }
+        .tv-indicator-option.active .tv-indicator-option-desc {
+            color: #d7e4f3;
+        }
+        .tv-indicator-option-empty {
+            padding: 8px;
+            font-size: 11px;
+            color: #888;
+            text-align: center;
+        }
         /* Indicator legend — inside canvas, pointer-events none so it doesn't block */
         .tv-indicator-legend {
             position: absolute;
@@ -7424,9 +7535,25 @@ def index():
     #toolbar { background:var(--panel-bg); border-bottom:1px solid var(--border-color); padding:4px 8px; display:flex; flex-wrap:wrap; gap:4px; align-items:center; flex-shrink:0; z-index:100; }
     .tv-tb-sep { width:1px; height:20px; background:var(--border-color); margin:0 2px; }
     .tb-btn { background:var(--panel-bg-strong); border:1px solid var(--border-color); color:var(--text-secondary); border-radius:4px; padding:3px 7px; font-size:11px; cursor:pointer; white-space:nowrap; transition:background 0.15s,color 0.15s,border-color 0.15s; user-select:none; }
-    .tb-btn:hover  { background:var(--panel-hover); color:var(--text-primary); border-color:var(--accent-color); }
-    .tb-btn.active { background:color-mix(in srgb, var(--accent-color) 30%, var(--panel-bg-strong)); border-color:var(--accent-color); color:var(--text-primary); }
-    .tb-btn.danger { background:#5c1a1a; border-color:#c0392b; color:#f88; }
+        .tb-btn:hover  { background:var(--panel-hover); color:var(--text-primary); border-color:var(--accent-color); }
+        .tb-btn.active { background:color-mix(in srgb, var(--accent-color) 30%, var(--panel-bg-strong)); border-color:var(--accent-color); color:var(--text-primary); }
+        .tb-btn.danger { background:#5c1a1a; border-color:#c0392b; color:#f88; }
+        .tv-indicator-picker { position:relative; }
+        .tv-indicator-summary { display:inline-flex; align-items:center; gap:6px; list-style:none; }
+        .tv-indicator-summary::-webkit-details-marker { display:none; }
+        .tv-indicator-summary::marker { content:''; }
+        .tv-indicator-badge { display:none; min-width:18px; padding:1px 6px; border-radius:999px; background:rgba(255,255,255,0.12); color:var(--text-primary); font-size:10px; line-height:1.3; text-align:center; }
+        .tv-indicator-menu { position:absolute; top:calc(100% + 6px); left:0; width:min(320px,calc(100vw - 32px)); padding:8px; border:1px solid var(--border-color); border-radius:10px; background:var(--panel-bg); box-shadow:0 12px 28px rgba(0,0,0,0.35); z-index:130; }
+        .tv-indicator-search { width:100%; border:1px solid var(--border-color); border-radius:8px; background:var(--panel-bg-strong); color:var(--text-primary); padding:7px 10px; font-size:12px; outline:none; }
+        .tv-indicator-search:focus { border-color:var(--accent-color); }
+        .tv-indicator-options { display:grid; gap:4px; margin-top:8px; max-height:240px; overflow:auto; }
+        .tv-indicator-option { width:100%; border:1px solid var(--border-color); border-radius:8px; background:var(--panel-bg-strong); color:var(--text-secondary); padding:7px 9px; text-align:left; cursor:pointer; display:grid; gap:2px; }
+        .tv-indicator-option:hover { background:var(--panel-hover); border-color:var(--accent-color); color:var(--text-primary); }
+        .tv-indicator-option.active { background:color-mix(in srgb, var(--accent-color) 24%, var(--panel-bg-strong)); border-color:var(--accent-color); color:var(--text-primary); }
+        .tv-indicator-option-name { font-size:12px; font-weight:600; }
+        .tv-indicator-option-desc { font-size:10px; color:var(--text-muted); }
+        .tv-indicator-option.active .tv-indicator-option-desc { color:var(--text-secondary); }
+        .tv-indicator-option-empty { padding:8px; font-size:11px; color:var(--text-muted); text-align:center; }
   #chart-area { flex:1; display:flex; flex-direction:column; min-height:0; position:relative; }
   #price-chart { flex:1; min-height:0; position:relative; }
     .tv-sub-pane { background:var(--chart-bg); border-top:1px solid var(--border-color); flex-shrink:0; position:relative; }
@@ -7539,14 +7666,15 @@ def index():
   // ── Math helpers ───────────────────────────────────────────────────────────
   function calcSMA(c,p){return c.map(function(_,i){if(i<p-1)return null;var s=c.slice(i-p+1,i+1);return s.reduce(function(a,b){return a+b;},0)/p;});}
   function calcEMA(c,p){var k=2/(p+1),r=[],e=null;for(var i=0;i<c.length;i++){if(i<p-1){r.push(null);continue;}if(e===null){e=c.slice(0,p).reduce(function(a,b){return a+b;},0)/p;}else{e=c[i]*k+e*(1-k);}r.push(e);}return r;}
+    function calcWMA(c,p){var r=[],d=p*(p+1)/2;for(var i=0;i<c.length;i++){if(i<p-1){r.push(null);continue;}var ws=0;for(var w=1;w<=p;w++){ws+=c[i-p+w]*w;}r.push(ws/d);}return r;}
   function calcVWAP(cs){var cp=0,cv=0;return cs.map(function(c){var t=(c.high+c.low+c.close)/3;cp+=t*c.volume;cv+=c.volume;return cv>0?cp/cv:c.close;});}
   function calcBB(c,p,m){p=p||20;m=m||2;var s=calcSMA(c,p);return s.map(function(mid,i){if(mid===null)return{upper:null,mid:null,lower:null};var sl=c.slice(Math.max(0,i-p+1),i+1),v=sl.reduce(function(a,b){return a+(b-mid)*(b-mid);},0)/sl.length,sd=Math.sqrt(v);return{upper:mid+m*sd,mid:mid,lower:mid-m*sd};});}
   function calcRSI(c,p){p=p||14;var r=[];for(var i=0;i<c.length;i++){if(i<p){r.push(null);continue;}var g=0,l=0;for(var j=i-p+1;j<=i;j++){var d=c[j]-c[j-1];if(d>0)g+=d;else l-=d;}var ag=g/p,al=l/p;r.push(al===0?100:100-100/(1+ag/al));}return r;}
   function calcATR(candles,p){p=p||14;var r=[];for(var i=0;i<candles.length;i++){var tr;if(i===0){tr=candles[i].high-candles[i].low;}else{tr=Math.max(candles[i].high-candles[i].low,Math.abs(candles[i].high-candles[i-1].close),Math.abs(candles[i].low-candles[i-1].close));}if(i<p-1){r.push(null);continue;}if(r.length===0||r[r.length-1]===null){var sum=0;for(var j=i-p+1;j<=i;j++){var t2;if(j===0){t2=candles[j].high-candles[j].low;}else{t2=Math.max(candles[j].high-candles[j].low,Math.abs(candles[j].high-candles[j-1].close),Math.abs(candles[j].low-candles[j-1].close));}sum+=t2;}r.push(sum/p);}else{r.push((r[r.length-1]*(p-1)+tr)/p);}}return r;}
   function calcMACD(c,fast,slow,sig){fast=fast||12;slow=slow||26;sig=sig||9;var ef=calcEMA(c,fast),es=calcEMA(c,slow);var ml=ef.map(function(v,i){return(v!==null&&es[i]!==null)?v-es[i]:null;});var sl=[],es2=null,vi=0,k=2/(sig+1);for(var i=0;i<ml.length;i++){if(ml[i]===null){sl.push(null);continue;}if(vi<sig-1){sl.push(null);vi++;continue;}if(es2===null){var piece=ml.filter(function(v){return v!==null;}).slice(0,sig);es2=piece.reduce(function(a,b){return a+b;},0)/sig;}else{es2=ml[i]*k+es2*(1-k);}sl.push(es2);vi++;}return{macd:ml,signal:sl,histogram:ml.map(function(v,i){return(v!==null&&sl[i]!==null)?v-sl[i]:null;})};}
 
-  // ── Sub-pane chart factory ─────────────────────────────────────────────────
-    function mkSubChart(el,h){return LightweightCharts.createChart(el,Object.assign({},buildTVThemeOptions(),{autoSize:true,height:h,rightPriceScale:{borderColor:getThemeVar('--border-color','#333'),scaleMargins:{top:0.1,bottom:0.1}},timeScale:{borderColor:getThemeVar('--border-color','#333'),timeVisible:false,secondsVisible:false,fixLeftEdge:true,fixRightEdge:false},handleScale:{mouseWheel:true,pinch:true,axisPressedMouseMove:true},handleScroll:{mouseWheel:true,pressedMouseMove:true,horzTouchDrag:true,vertTouchDrag:false}}));}
+    // ── Sub-pane chart factory ─────────────────────────────────────────────────
+        function mkSubChart(el,h){return LightweightCharts.createChart(el,Object.assign({},buildTVThemeOptions(),{autoSize:true,height:h,rightPriceScale:{borderColor:getThemeVar('--border-color','#333'),scaleMargins:{top:0.1,bottom:0.1},minimumWidth:72},localization:{timeFormatter:function(time){var d=new Date(time*1000);return d.toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit',hour12:false,timeZone:'America/New_York'});}},timeScale:{borderColor:getThemeVar('--border-color','#333'),timeVisible:true,secondsVisible:false,fixLeftEdge:false,fixRightEdge:false,tickMarkFormatter:function(time){var d=new Date(time*1000);return d.toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit',hour12:false,timeZone:'America/New_York'});}},handleScale:{mouseWheel:true,pinch:true,axisPressedMouseMove:true},handleScroll:{mouseWheel:true,pressedMouseMove:true,horzTouchDrag:true,vertTouchDrag:false}}));}
 
   // ── Time-scale sync ────────────────────────────────────────────────────────
   function setupSync(){tvSyncHandlers.forEach(function(h){try{h.chart.timeScale().unsubscribeVisibleLogicalRangeChange(h.handler);}catch(e){}});tvSyncHandlers=[];var all=[tvChart,tvRsiChart,tvMacdChart].filter(Boolean);if(all.length<2)return;all.forEach(function(src){var others=all.filter(function(c){return c!==src;});var h=function(range){if(tvSyncingTS||!range)return;tvSyncingTS=true;others.forEach(function(c){try{c.timeScale().setVisibleLogicalRange(range);}catch(e){}});tvSyncingTS=false;};try{src.timeScale().subscribeVisibleLogicalRangeChange(h);}catch(e){}tvSyncHandlers.push({chart:src,handler:h});});if(tvChart){try{var r=tvChart.timeScale().getVisibleLogicalRange();if(r)[tvRsiChart,tvMacdChart].filter(Boolean).forEach(function(c){try{c.timeScale().setVisibleLogicalRange(r);}catch(e){}});}catch(e){}}}
@@ -7558,15 +7686,21 @@ def index():
     function mkLine(col,lw,title){return tvChart.addLineSeries({color:col,lineWidth:lw||1,priceScaleId:'right',lastValueVisible:true,priceLineVisible:false,title:title||''});}
     // Remove deactivated
     Object.keys(tvIndSeries).forEach(function(k){if(!activeInds.has(k)){var s=tvIndSeries[k];if(Array.isArray(s))s.forEach(function(x){try{tvChart.removeSeries(x);}catch(e){}});else{try{tvChart.removeSeries(s);}catch(e){};}delete tvIndSeries[k];}});
-    // Add activated
-    if(activeInds.has('sma20')&&!tvIndSeries['sma20']){var s=mkLine('#f0c040',1,'SMA20');s.setData(calcSMA(closes,20).map(function(v,i){return v!==null?{time:times[i],value:v}:null;}).filter(Boolean));tvIndSeries['sma20']=s;}
-    if(activeInds.has('sma50')&&!tvIndSeries['sma50']){var s=mkLine('#40a0f0',1,'SMA50');s.setData(calcSMA(closes,50).map(function(v,i){return v!==null?{time:times[i],value:v}:null;}).filter(Boolean));tvIndSeries['sma50']=s;}
-    if(activeInds.has('sma200')&&!tvIndSeries['sma200']){var s=mkLine('#e040fb',1,'SMA200');s.setData(calcSMA(closes,200).map(function(v,i){return v!==null?{time:times[i],value:v}:null;}).filter(Boolean));tvIndSeries['sma200']=s;}
-    if(activeInds.has('ema9')&&!tvIndSeries['ema9']){var s=mkLine('#ff9900',1,'EMA9');s.setData(calcEMA(closes,9).map(function(v,i){return v!==null?{time:times[i],value:v}:null;}).filter(Boolean));tvIndSeries['ema9']=s;}
-    if(activeInds.has('ema21')&&!tvIndSeries['ema21']){var s=mkLine('#00e5ff',1,'EMA21');s.setData(calcEMA(closes,21).map(function(v,i){return v!==null?{time:times[i],value:v}:null;}).filter(Boolean));tvIndSeries['ema21']=s;}
-    if(activeInds.has('vwap')&&!tvIndSeries['vwap']){var vv=calcVWAP(candles.map(function(c,i){return{high:candles[i].high,low:candles[i].low,close:candles[i].close,volume:c.volume||0};}));var s=mkLine('#ffffff',1,'VWAP');s.setData(vv.map(function(v,i){return{time:times[i],value:v};}));tvIndSeries['vwap']=s;}
-    if(activeInds.has('bb')&&!tvIndSeries['bb']){var bb=calcBB(closes);var u=mkLine('rgba(100,180,255,0.8)',1,'BB U'),m=mkLine('rgba(100,180,255,0.5)',1,'BB M'),l=mkLine('rgba(100,180,255,0.8)',1,'BB L');u.setData(bb.map(function(v,i){return v.upper!==null?{time:times[i],value:v.upper}:null;}).filter(Boolean));m.setData(bb.map(function(v,i){return v.mid!==null?{time:times[i],value:v.mid}:null;}).filter(Boolean));l.setData(bb.map(function(v,i){return v.lower!==null?{time:times[i],value:v.lower}:null;}).filter(Boolean));tvIndSeries['bb']=[u,m,l];}
-    if(activeInds.has('atr')&&!tvIndSeries['atr']){var atrV=calcATR(candles),e20=calcEMA(closes,20),mult=1.5;var au=mkLine('rgba(255,152,0,0.8)',1,'ATR U'),al=mkLine('rgba(255,152,0,0.8)',1,'ATR L');au.setData(e20.map(function(v,i){return(v!==null&&atrV[i]!==null)?{time:times[i],value:v+mult*atrV[i]}:null;}).filter(Boolean));al.setData(e20.map(function(v,i){return(v!==null&&atrV[i]!==null)?{time:times[i],value:v-mult*atrV[i]}:null;}).filter(Boolean));tvIndSeries['atr']=[au,al];}
+        if(activeInds.has('sma9')){if(!tvIndSeries['sma9'])tvIndSeries['sma9']=mkLine('#ffe082',1,'SMA9');tvIndSeries['sma9'].setData(calcSMA(closes,9).map(function(v,i){return v!==null?{time:times[i],value:v}:null;}).filter(Boolean));}
+        if(activeInds.has('sma20')){if(!tvIndSeries['sma20'])tvIndSeries['sma20']=mkLine('#f0c040',1,'SMA20');tvIndSeries['sma20'].setData(calcSMA(closes,20).map(function(v,i){return v!==null?{time:times[i],value:v}:null;}).filter(Boolean));}
+        if(activeInds.has('sma50')){if(!tvIndSeries['sma50'])tvIndSeries['sma50']=mkLine('#40a0f0',1,'SMA50');tvIndSeries['sma50'].setData(calcSMA(closes,50).map(function(v,i){return v!==null?{time:times[i],value:v}:null;}).filter(Boolean));}
+        if(activeInds.has('sma100')){if(!tvIndSeries['sma100'])tvIndSeries['sma100']=mkLine('#7fd1ff',1,'SMA100');tvIndSeries['sma100'].setData(calcSMA(closes,100).map(function(v,i){return v!==null?{time:times[i],value:v}:null;}).filter(Boolean));}
+        if(activeInds.has('sma200')){if(!tvIndSeries['sma200'])tvIndSeries['sma200']=mkLine('#e040fb',1,'SMA200');tvIndSeries['sma200'].setData(calcSMA(closes,200).map(function(v,i){return v!==null?{time:times[i],value:v}:null;}).filter(Boolean));}
+        if(activeInds.has('ema9')){if(!tvIndSeries['ema9'])tvIndSeries['ema9']=mkLine('#ff9900',1,'EMA9');tvIndSeries['ema9'].setData(calcEMA(closes,9).map(function(v,i){return v!==null?{time:times[i],value:v}:null;}).filter(Boolean));}
+        if(activeInds.has('ema21')){if(!tvIndSeries['ema21'])tvIndSeries['ema21']=mkLine('#00e5ff',1,'EMA21');tvIndSeries['ema21'].setData(calcEMA(closes,21).map(function(v,i){return v!==null?{time:times[i],value:v}:null;}).filter(Boolean));}
+        if(activeInds.has('ema50')){if(!tvIndSeries['ema50'])tvIndSeries['ema50']=mkLine('#ff7096',1,'EMA50');tvIndSeries['ema50'].setData(calcEMA(closes,50).map(function(v,i){return v!==null?{time:times[i],value:v}:null;}).filter(Boolean));}
+        if(activeInds.has('ema100')){if(!tvIndSeries['ema100'])tvIndSeries['ema100']=mkLine('#b388ff',1,'EMA100');tvIndSeries['ema100'].setData(calcEMA(closes,100).map(function(v,i){return v!==null?{time:times[i],value:v}:null;}).filter(Boolean));}
+        if(activeInds.has('ema200')){if(!tvIndSeries['ema200'])tvIndSeries['ema200']=mkLine('#00c853',1,'EMA200');tvIndSeries['ema200'].setData(calcEMA(closes,200).map(function(v,i){return v!==null?{time:times[i],value:v}:null;}).filter(Boolean));}
+        if(activeInds.has('wma20')){if(!tvIndSeries['wma20'])tvIndSeries['wma20']=mkLine('#ffd166',1,'WMA20');tvIndSeries['wma20'].setData(calcWMA(closes,20).map(function(v,i){return v!==null?{time:times[i],value:v}:null;}).filter(Boolean));}
+        if(activeInds.has('wma50')){if(!tvIndSeries['wma50'])tvIndSeries['wma50']=mkLine('#8ecae6',1,'WMA50');tvIndSeries['wma50'].setData(calcWMA(closes,50).map(function(v,i){return v!==null?{time:times[i],value:v}:null;}).filter(Boolean));}
+        if(activeInds.has('vwap')){if(!tvIndSeries['vwap'])tvIndSeries['vwap']=mkLine('#ffffff',1,'VWAP');var vv=calcVWAP(candles.map(function(c,i){return{high:candles[i].high,low:candles[i].low,close:candles[i].close,volume:c.volume||0};}));tvIndSeries['vwap'].setData(vv.map(function(v,i){return{time:times[i],value:v};}));}
+        if(activeInds.has('bb')){var bb=calcBB(closes);if(!tvIndSeries['bb']){tvIndSeries['bb']=[mkLine('rgba(100,180,255,0.8)',1,'BB U'),mkLine('rgba(100,180,255,0.5)',1,'BB M'),mkLine('rgba(100,180,255,0.8)',1,'BB L')];}var bbSeries=tvIndSeries['bb'];bbSeries[0].setData(bb.map(function(v,i){return v.upper!==null?{time:times[i],value:v.upper}:null;}).filter(Boolean));bbSeries[1].setData(bb.map(function(v,i){return v.mid!==null?{time:times[i],value:v.mid}:null;}).filter(Boolean));bbSeries[2].setData(bb.map(function(v,i){return v.lower!==null?{time:times[i],value:v.lower}:null;}).filter(Boolean));}
+        if(activeInds.has('atr')){var atrV=calcATR(candles),e20=calcEMA(closes,20),mult=1.5;if(!tvIndSeries['atr']){tvIndSeries['atr']=[mkLine('rgba(255,152,0,0.8)',1,'ATR U'),mkLine('rgba(255,152,0,0.8)',1,'ATR L')];}var atrSeries=tvIndSeries['atr'];atrSeries[0].setData(e20.map(function(v,i){return(v!==null&&atrV[i]!==null)?{time:times[i],value:v+mult*atrV[i]}:null;}).filter(Boolean));atrSeries[1].setData(e20.map(function(v,i){return(v!==null&&atrV[i]!==null)?{time:times[i],value:v-mult*atrV[i]}:null;}).filter(Boolean));}
     if(activeInds.has('rsi'))applyRsiPane(candles,times);else destroyRsiPane();
     if(activeInds.has('macd'))applyMacdPane(candles,times);else destroyMacdPane();
     updateLegend();
@@ -7595,8 +7729,8 @@ def index():
   function updateLegend(){
     var cont=document.getElementById('price-chart');if(!cont)return;
     var leg=cont.querySelector('.ind-legend');if(!leg){leg=document.createElement('div');leg.className='ind-legend';cont.appendChild(leg);}
-    var cols={sma20:'#f0c040',sma50:'#40a0f0',sma200:'#e040fb',ema9:'#ff9900',ema21:'#00e5ff',vwap:'#ffffff',bb:'rgba(100,180,255,0.8)',rsi:'#e91e63',macd:'#2196f3',atr:'rgba(255,152,0,0.8)'};
-    var lbls={sma20:'SMA20',sma50:'SMA50',sma200:'SMA200',ema9:'EMA9',ema21:'EMA21',vwap:'VWAP',bb:'BB(20,2)',rsi:'RSI14',macd:'MACD',atr:'ATR Bands'};
+    var cols={sma9:'#ffe082',sma20:'#f0c040',sma50:'#40a0f0',sma100:'#7fd1ff',sma200:'#e040fb',ema9:'#ff9900',ema21:'#00e5ff',ema50:'#ff7096',ema100:'#b388ff',ema200:'#00c853',wma20:'#ffd166',wma50:'#8ecae6',vwap:'#ffffff',bb:'rgba(100,180,255,0.8)',rsi:'#e91e63',macd:'#2196f3',atr:'rgba(255,152,0,0.8)'};
+    var lbls={sma9:'SMA9',sma20:'SMA20',sma50:'SMA50',sma100:'SMA100',sma200:'SMA200',ema9:'EMA9',ema21:'EMA21',ema50:'EMA50',ema100:'EMA100',ema200:'EMA200',wma20:'WMA20',wma50:'WMA50',vwap:'VWAP',bb:'BB(20,2)',rsi:'RSI14',macd:'MACD',atr:'ATR Bands'};
     leg.innerHTML=Object.keys(tvIndSeries).map(function(k){return '<div class="ind-item"><div class="ind-swatch" style="background:'+( cols[k]||'#888')+'"></div>'+(lbls[k]||k)+'</div>';}).join('');
   }
 
@@ -7623,9 +7757,20 @@ def index():
     while(tb.children.length>2)tb.removeChild(tb.lastChild);
     function btn(text,title,onClick,extra){var b=document.createElement('button');b.className='tb-btn'+(extra?' '+extra:'');b.textContent=text;b.title=title;b.addEventListener('click',onClick);return b;}
     function sep(){var d=document.createElement('div');d.className='tv-tb-sep';return d;}
-    // Indicator toggles
-    var inds=[{k:'sma20',l:'SMA20',t:'SMA 20'},{k:'sma50',l:'SMA50',t:'SMA 50'},{k:'sma200',l:'SMA200',t:'SMA 200'},{k:'ema9',l:'EMA9',t:'EMA 9'},{k:'ema21',l:'EMA21',t:'EMA 21'},{k:'vwap',l:'VWAP',t:'VWAP'},{k:'bb',l:'BB',t:'Bollinger Bands (20,2)'},{k:'rsi',l:'RSI',t:'RSI 14 — sub-pane'},{k:'macd',l:'MACD',t:'MACD (12,26,9) — sub-pane'},{k:'atr',l:'ATR',t:'Average True Range 14 — sub-pane'}];
-    inds.forEach(function(def){var b=btn(def.l,def.t,function(){if(activeInds.has(def.k))activeInds.delete(def.k);else activeInds.add(def.k);b.classList.toggle('active',activeInds.has(def.k));applyIndicators(tvLastCandles);});if(activeInds.has(def.k))b.classList.add('active');tb.appendChild(b);});
+        var inds=[{k:'sma9',l:'SMA9',t:'Simple Moving Average (9)'},{k:'sma20',l:'SMA20',t:'Simple Moving Average (20)'},{k:'sma50',l:'SMA50',t:'Simple Moving Average (50)'},{k:'sma100',l:'SMA100',t:'Simple Moving Average (100)'},{k:'sma200',l:'SMA200',t:'Simple Moving Average (200)'},{k:'ema9',l:'EMA9',t:'Exponential Moving Average (9)'},{k:'ema21',l:'EMA21',t:'Exponential Moving Average (21)'},{k:'ema50',l:'EMA50',t:'Exponential Moving Average (50)'},{k:'ema100',l:'EMA100',t:'Exponential Moving Average (100)'},{k:'ema200',l:'EMA200',t:'Exponential Moving Average (200)'},{k:'wma20',l:'WMA20',t:'Weighted Moving Average (20)'},{k:'wma50',l:'WMA50',t:'Weighted Moving Average (50)'},{k:'vwap',l:'VWAP',t:'Volume Weighted Average Price'},{k:'bb',l:'BB',t:'Bollinger Bands (20, 2)'},{k:'rsi',l:'RSI',t:'Relative Strength Index (14) — sub-pane'},{k:'macd',l:'MACD',t:'MACD (12, 26, 9) — sub-pane'},{k:'atr',l:'ATR',t:'Average True Range (14)'}];
+        var indPicker=document.createElement('details');indPicker.className='tv-indicator-picker';
+        var indSummary=document.createElement('summary');indSummary.className='tb-btn tv-indicator-summary';indSummary.title='Search and toggle indicators';
+        var indLabel=document.createElement('span');indLabel.textContent='Indicators';
+        var indBadge=document.createElement('span');indBadge.className='tv-indicator-badge';
+        indSummary.appendChild(indLabel);indSummary.appendChild(indBadge);indPicker.appendChild(indSummary);
+        var indMenu=document.createElement('div');indMenu.className='tv-indicator-menu';
+        var indSearch=document.createElement('input');indSearch.type='search';indSearch.className='tv-indicator-search';indSearch.placeholder='Search indicators';indSearch.autocomplete='off';
+        var indOptions=document.createElement('div');indOptions.className='tv-indicator-options';
+        function syncIndicatorSummary(){var count=activeInds.size;indBadge.textContent=String(count);indBadge.style.display=count?'inline-flex':'none';}
+        function renderIndicatorOptions(){var query=(indSearch.value||'').trim().toLowerCase();indOptions.innerHTML='';var matches=inds.filter(function(def){return def.l.toLowerCase().indexOf(query)!==-1||def.t.toLowerCase().indexOf(query)!==-1;});if(!matches.length){var empty=document.createElement('div');empty.className='tv-indicator-option-empty';empty.textContent='No matching indicators';indOptions.appendChild(empty);return;}matches.forEach(function(def){var option=document.createElement('button');option.type='button';option.className='tv-indicator-option';if(activeInds.has(def.k))option.classList.add('active');var name=document.createElement('span');name.className='tv-indicator-option-name';name.textContent=def.l;var desc=document.createElement('span');desc.className='tv-indicator-option-desc';desc.textContent=def.t;option.appendChild(name);option.appendChild(desc);option.addEventListener('click',function(){if(activeInds.has(def.k))activeInds.delete(def.k);else activeInds.add(def.k);syncIndicatorSummary();renderIndicatorOptions();applyIndicators(tvLastCandles);});indOptions.appendChild(option);});}
+        indSearch.addEventListener('input',renderIndicatorOptions);
+        indPicker.addEventListener('toggle',function(){if(indPicker.open){setTimeout(function(){indSearch.focus();indSearch.select();},0);}else{indSearch.value='';renderIndicatorOptions();}});
+        indMenu.appendChild(indSearch);indMenu.appendChild(indOptions);indPicker.appendChild(indMenu);syncIndicatorSummary();renderIndicatorOptions();tb.appendChild(indPicker);
     tb.appendChild(sep());
     // Drawing tools
     var draws=[{k:'hline',l:'— H-Line',t:'Horizontal price line'},{k:'trendline',l:'↗ Trend',t:'Trend line'},{k:'rect',l:'▭ Box',t:'Rectangle'},{k:'text',l:'T Label',t:'Price label'}];
@@ -7660,7 +7805,7 @@ def index():
     function findHistHoverPoints(e){var c=document.getElementById('price-chart');if(!c||!tvHistoricalRenderedPoints.length)return[];var b=c.getBoundingClientRect(),cx=e.clientX-b.left,cy=e.clientY-b.top;return getHistHoverCandidates(cx,cy).filter(function(p){var dx=cx-p.x,dy=cy-p.y,r=Math.max(8,(p.size||8)/2+5);return(dx*dx+dy*dy)<=(r*r);}).sort(function(a,bp){var ad=(cx-a.x)*(cx-a.x)+(cy-a.y)*(cy-a.y),bd=(cx-bp.x)*(cx-bp.x)+(cy-bp.y)*(cy-bp.y);return ad-bd;});}
     function updateHistTip(e){var t=ensureHistTip();if(!t)return;if(e&&e.buttons){t.style.display='none';return;}var pts=findHistHoverPoints(e);if(!pts.length){t.style.display='none';return;}var topPts=pts.slice(0,5),anchorTime=topPts[0].time;t.innerHTML='<div class="tt-head"><span class="tt-badge">'+pts.length+' bubble'+(pts.length===1?'':'s')+'</span><div class="tt-time">'+fmtHistTime(anchorTime)+'</div></div><div class="tt-list">'+topPts.map(function(p){return histTipHtml(p);}).join('')+'</div>'+(pts.length>topPts.length?'<div class="tt-more">+'+(pts.length-topPts.length)+' more</div>':'');t.style.display='block';posHistTip(t,e);}
     function getVisibleHistoricalBubblePoints(){if(!tvHistoricalPoints.length)return[];var pts=tvHistoricalPoints;try{var range=tvChart.timeScale().getVisibleLogicalRange();if(range&&tvLastCandles.length){var li=Math.max(0,Math.floor(range.from)-2),ri=Math.min(tvLastCandles.length-1,Math.ceil(range.to)+2),left=tvLastCandles[li],right=tvLastCandles[ri];if(left&&right){var span=tvLastCandles.length>1?Math.max(60,tvLastCandles[1].time-tvLastCandles[0].time):60,minTime=left.time-(span*2),maxTime=right.time+(span*2);pts=tvHistoricalPoints.filter(function(p){return p.time>=minTime&&p.time<=maxTime;});}}}catch(e){}if(pts.length<=historicalBubbleMaxVisible)return pts;var priority=[],secondary=[];pts.forEach(function(p){if(p.kind==='expected-move'||p.rank===1)priority.push(p);else secondary.push(p);});if(priority.length>=historicalBubbleMaxVisible){var pStride=Math.ceil(priority.length/historicalBubbleMaxVisible);return priority.filter(function(_,i){return i%pStride===0;});}var slots=Math.max(0,historicalBubbleMaxVisible-priority.length);if(!secondary.length||slots===0)return priority;var stride=Math.ceil(secondary.length/slots);return priority.concat(secondary.filter(function(_,i){return i%stride===0;}));}
-    function drawHistoricalBubbles(){var o=ensureHistOverlay(),canvas=ensureHistCanvas(),t=ensureHistTip();if(!o||!canvas||!tvChart||!tvCandle)return;tvHistoricalRenderedPoints=[];tvHistoricalHoverBuckets=new Map();var canvasState=syncHistCanvas(canvas,o);if(!canvasState){o.style.display='none';if(t)t.style.display='none';return;}var ctx=canvasState.ctx,width=canvasState.width,height=canvasState.height;if(!tvHistoricalPoints.length){o.style.display='none';if(t)t.style.display='none';return;}var points=getVisibleHistoricalBubblePoints();if(!points.length){o.style.display='none';if(t)t.style.display='none';return;}var visible=0;points.forEach(function(p){var x=tvChart.timeScale().timeToCoordinate(p.time),y=tvCandle.priceToCoordinate(p.price);if(x==null||y==null||Number.isNaN(x)||Number.isNaN(y))return;var size=p.size||8,radius=size/2,hoverRadius=Math.max(8,radius+5);if(x<-hoverRadius||x>width+hoverRadius||y<-hoverRadius||y>height+hoverRadius)return;ctx.save();ctx.globalAlpha=0.95;ctx.fillStyle=p.color||'rgba(255,255,255,0.6)';ctx.beginPath();ctx.arc(x,y,radius,0,Math.PI*2);ctx.fill();ctx.globalAlpha=1;ctx.strokeStyle='rgba(0,0,0,0.25)';ctx.lineWidth=1;ctx.beginPath();ctx.arc(x,y,radius+1,0,Math.PI*2);ctx.stroke();ctx.strokeStyle=p.border_color||p.color||'#fff';ctx.lineWidth=p.border_width||1;ctx.beginPath();ctx.arc(x,y,Math.max(0.5,radius-((p.border_width||1)/2)),0,Math.PI*2);ctx.stroke();ctx.restore();var renderedPoint=Object.assign({},p,{x:x,y:y});tvHistoricalRenderedPoints.push(renderedPoint);addHistHoverPoint(renderedPoint);visible++;});o.style.display=visible>0?'block':'none';}
+    function drawHistoricalBubbles(){var o=ensureHistOverlay(),canvas=ensureHistCanvas(),t=ensureHistTip();if(!o||!canvas||!tvChart||!tvCandle)return;tvHistoricalRenderedPoints=[];tvHistoricalHoverBuckets=new Map();var canvasState=syncHistCanvas(canvas,o);if(!canvasState){o.style.display='none';if(t)t.style.display='none';return;}var ctx=canvasState.ctx,width=canvasState.width,height=canvasState.height;if(!tvHistoricalPoints.length){o.style.display='none';if(t)t.style.display='none';return;}var points=getVisibleHistoricalBubblePoints();if(!points.length){o.style.display='none';if(t)t.style.display='none';return;}var visible=0;points.forEach(function(p){var x=tvChart.timeScale().timeToCoordinate(p.time),y=tvCandle.priceToCoordinate(p.price);if(x==null||y==null||Number.isNaN(x)||Number.isNaN(y))return;var size=p.size||8,radius=size/2,overlapCount=Math.max(1,p.overlap_count||1),overlapSlot=Math.max(0,Math.min(overlapCount-1,p.overlap_slot||0)),offsetStep=Math.max(4,Math.min(10,radius*0.9)),offsetX=overlapCount>1?(overlapSlot-((overlapCount-1)/2))*offsetStep:0,drawX=x+offsetX,hoverRadius=Math.max(8,radius+5);if(drawX<-hoverRadius||drawX>width+hoverRadius||y<-hoverRadius||y>height+hoverRadius)return;ctx.save();ctx.globalAlpha=0.95;ctx.fillStyle=p.color||'rgba(255,255,255,0.6)';ctx.beginPath();ctx.arc(drawX,y,radius,0,Math.PI*2);ctx.fill();ctx.globalAlpha=1;ctx.strokeStyle='rgba(0,0,0,0.25)';ctx.lineWidth=1;ctx.beginPath();ctx.arc(drawX,y,radius+1,0,Math.PI*2);ctx.stroke();ctx.strokeStyle=p.border_color||p.color||'#fff';ctx.lineWidth=p.border_width||1;ctx.beginPath();ctx.arc(drawX,y,Math.max(0.5,radius-((p.border_width||1)/2)),0,Math.PI*2);ctx.stroke();ctx.restore();var renderedPoint=Object.assign({},p,{x:drawX,y:y});tvHistoricalRenderedPoints.push(renderedPoint);addHistHoverPoint(renderedPoint);visible++;});o.style.display=visible>0?'block':'none';}
     function scheduleHistoricalBubbleDraw(){if(historicalBubbleDrawPending)return;historicalBubbleDrawPending=true;requestAnimationFrame(function(){historicalBubbleDrawPending=false;drawHistoricalBubbles();});}
 
   // ── Main renderer ──────────────────────────────────────────────────────────
@@ -7672,7 +7817,7 @@ def index():
     lineStyleMap={dashed:LightweightCharts.LineStyle.Dashed,dotted:LightweightCharts.LineStyle.Dotted,large_dashed:LightweightCharts.LineStyle.LargeDashed};
     if(!tvChart){
       var el=document.getElementById('price-chart');
-    tvChart=LightweightCharts.createChart(el,Object.assign({},buildTVThemeOptions(),{autoSize:true,rightPriceScale:{borderColor:getThemeVar('--border-color','#333'),scaleMargins:{top:0.04,bottom:0.15}},localization:{timeFormatter:function(time){var d=new Date(time*1000);return d.toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit',hour12:false,timeZone:'America/New_York'});}},timeScale:{borderColor:getThemeVar('--border-color','#333'),timeVisible:true,secondsVisible:false,fixLeftEdge:false,fixRightEdge:false,tickMarkFormatter:function(time){var d=new Date(time*1000);return d.toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit',hour12:false,timeZone:'America/New_York'});}},handleScale:{mouseWheel:true,pinch:true,axisPressedMouseMove:true},handleScroll:{mouseWheel:true,pressedMouseMove:true,horzTouchDrag:true,vertTouchDrag:false}}));
+    tvChart=LightweightCharts.createChart(el,Object.assign({},buildTVThemeOptions(),{autoSize:true,rightPriceScale:{borderColor:getThemeVar('--border-color','#333'),scaleMargins:{top:0.04,bottom:0.15},minimumWidth:72},localization:{timeFormatter:function(time){var d=new Date(time*1000);return d.toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit',hour12:false,timeZone:'America/New_York'});}},timeScale:{borderColor:getThemeVar('--border-color','#333'),timeVisible:true,secondsVisible:false,fixLeftEdge:false,fixRightEdge:false,tickMarkFormatter:function(time){var d=new Date(time*1000);return d.toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit',hour12:false,timeZone:'America/New_York'});}},handleScale:{mouseWheel:true,pinch:true,axisPressedMouseMove:true},handleScroll:{mouseWheel:true,pressedMouseMove:true,horzTouchDrag:true,vertTouchDrag:false}}));
       tvCandle=tvChart.addCandlestickSeries({upColor:upColor,downColor:downColor,borderVisible:false,wickUpColor:upColor,wickDownColor:downColor});
       tvVol=tvChart.addHistogramSeries({priceFormat:{type:'volume'},priceScaleId:'volume',lastValueVisible:false,priceLineVisible:false});
       tvChart.priceScale('volume').applyOptions({scaleMargins:{top:0.88,bottom:0}});
@@ -8341,6 +8486,19 @@ def index():
             }
             return result;
         }
+        function calcWMA(closes, period) {
+            const result = [];
+            const denominator = period * (period + 1) / 2;
+            for (let i = 0; i < closes.length; i++) {
+                if (i < period - 1) { result.push(null); continue; }
+                let weightedSum = 0;
+                for (let weight = 1; weight <= period; weight++) {
+                    weightedSum += closes[i - period + weight] * weight;
+                }
+                result.push(weightedSum / denominator);
+            }
+            return result;
+        }
         function calcVWAP(candles) {
             let cumPV = 0, cumVol = 0;
             return candles.map(c => {
@@ -8438,8 +8596,6 @@ def index():
             if (!tvPriceChart || !tvCandleSeries) return;
             const times  = candles.map(c => c.time);
             const closes = candles.map(c => c.close);
-            const highs  = candles.map(c => c.high);
-            const lows   = candles.map(c => c.low);
 
             // Remove deactivated indicators
             Object.keys(tvIndicatorSeries).forEach(key => {
@@ -8468,9 +8624,17 @@ def index():
                 if (!tvIndicatorSeries['sma20']) tvIndicatorSeries['sma20'] = mkLineSeries('#f0c040', 1, 'right', 'SMA20');
                 tvIndicatorSeries['sma20'].setData(todayOnly(calcSMA(closes, 20).map((v,i) => v!==null ? {time:times[i], value:v} : null)));
             }
+            if (activeInds.has('sma9')) {
+                if (!tvIndicatorSeries['sma9']) tvIndicatorSeries['sma9'] = mkLineSeries('#ffe082', 1, 'right', 'SMA9');
+                tvIndicatorSeries['sma9'].setData(todayOnly(calcSMA(closes, 9).map((v,i) => v!==null ? {time:times[i], value:v} : null)));
+            }
             if (activeInds.has('sma50')) {
                 if (!tvIndicatorSeries['sma50']) tvIndicatorSeries['sma50'] = mkLineSeries('#40a0f0', 1, 'right', 'SMA50');
                 tvIndicatorSeries['sma50'].setData(todayOnly(calcSMA(closes, 50).map((v,i) => v!==null ? {time:times[i], value:v} : null)));
+            }
+            if (activeInds.has('sma100')) {
+                if (!tvIndicatorSeries['sma100']) tvIndicatorSeries['sma100'] = mkLineSeries('#7fd1ff', 1, 'right', 'SMA100');
+                tvIndicatorSeries['sma100'].setData(todayOnly(calcSMA(closes, 100).map((v,i) => v!==null ? {time:times[i], value:v} : null)));
             }
             if (activeInds.has('sma200')) {
                 if (!tvIndicatorSeries['sma200']) tvIndicatorSeries['sma200'] = mkLineSeries('#e040fb', 1, 'right', 'SMA200');
@@ -8483,6 +8647,26 @@ def index():
             if (activeInds.has('ema21')) {
                 if (!tvIndicatorSeries['ema21']) tvIndicatorSeries['ema21'] = mkLineSeries('#00e5ff', 1, 'right', 'EMA21');
                 tvIndicatorSeries['ema21'].setData(todayOnly(calcEMA(closes, 21).map((v,i) => v!==null ? {time:times[i], value:v} : null)));
+            }
+            if (activeInds.has('ema50')) {
+                if (!tvIndicatorSeries['ema50']) tvIndicatorSeries['ema50'] = mkLineSeries('#ff7096', 1, 'right', 'EMA50');
+                tvIndicatorSeries['ema50'].setData(todayOnly(calcEMA(closes, 50).map((v,i) => v!==null ? {time:times[i], value:v} : null)));
+            }
+            if (activeInds.has('ema100')) {
+                if (!tvIndicatorSeries['ema100']) tvIndicatorSeries['ema100'] = mkLineSeries('#b388ff', 1, 'right', 'EMA100');
+                tvIndicatorSeries['ema100'].setData(todayOnly(calcEMA(closes, 100).map((v,i) => v!==null ? {time:times[i], value:v} : null)));
+            }
+            if (activeInds.has('ema200')) {
+                if (!tvIndicatorSeries['ema200']) tvIndicatorSeries['ema200'] = mkLineSeries('#00c853', 1, 'right', 'EMA200');
+                tvIndicatorSeries['ema200'].setData(todayOnly(calcEMA(closes, 200).map((v,i) => v!==null ? {time:times[i], value:v} : null)));
+            }
+            if (activeInds.has('wma20')) {
+                if (!tvIndicatorSeries['wma20']) tvIndicatorSeries['wma20'] = mkLineSeries('#ffd166', 1, 'right', 'WMA20');
+                tvIndicatorSeries['wma20'].setData(todayOnly(calcWMA(closes, 20).map((v,i) => v!==null ? {time:times[i], value:v} : null)));
+            }
+            if (activeInds.has('wma50')) {
+                if (!tvIndicatorSeries['wma50']) tvIndicatorSeries['wma50'] = mkLineSeries('#8ecae6', 1, 'right', 'WMA50');
+                tvIndicatorSeries['wma50'].setData(todayOnly(calcWMA(closes, 50).map((v,i) => v!==null ? {time:times[i], value:v} : null)));
             }
             if (activeInds.has('vwap')) {
                 // VWAP resets daily — always compute from today's candles only
@@ -8544,12 +8728,17 @@ def index():
                 container.appendChild(legend);
             }
             const items = {
-                sma20:'SMA20',sma50:'SMA50',sma200:'SMA200',
-                ema9:'EMA9',ema21:'EMA21',vwap:'VWAP',bb:'BB(20,2)',rsi:'RSI14',macd:'MACD',atr:'ATR Bands'
+                sma9:'SMA9',sma20:'SMA20',sma50:'SMA50',sma100:'SMA100',sma200:'SMA200',
+                ema9:'EMA9',ema21:'EMA21',ema50:'EMA50',ema100:'EMA100',ema200:'EMA200',
+                wma20:'WMA20',wma50:'WMA50',
+                vwap:'VWAP',bb:'BB(20,2)',
+                rsi:'RSI14',macd:'MACD',atr:'ATR Bands'
             };
             const colors = {
-                sma20:'#f0c040',sma50:'#40a0f0',sma200:'#e040fb',
-                ema9:'#ff9900',ema21:'#00e5ff',vwap:'#ffffff',bb:'rgba(100,180,255,0.8)',
+                sma9:'#ffe082',sma20:'#f0c040',sma50:'#40a0f0',sma100:'#7fd1ff',sma200:'#e040fb',
+                ema9:'#ff9900',ema21:'#00e5ff',ema50:'#ff7096',ema100:'#b388ff',ema200:'#00c853',
+                wma20:'#ffd166',wma50:'#8ecae6',
+                vwap:'#ffffff',bb:'rgba(100,180,255,0.8)',
                 rsi:'#e91e63',macd:'#2196f3',atr:'rgba(255,152,0,0.8)'
             };
             legend.innerHTML = Object.keys(tvIndicatorSeries).map(k => `
@@ -8565,10 +8754,26 @@ def index():
             return LightweightCharts.createChart(element, Object.assign({}, buildLightweightThemeOptions(), {
                 autoSize: true,
                 height: height,
-                rightPriceScale: { borderColor: getThemeValue('--border-color', '#333333'), scaleMargins: { top: 0.1, bottom: 0.1 } },
+                rightPriceScale: { borderColor: getThemeValue('--border-color', '#333333'), scaleMargins: { top: 0.1, bottom: 0.1 }, minimumWidth: 72 },
+                localization: {
+                    timeFormatter: (time) => {
+                        const d = new Date(time * 1000);
+                        return d.toLocaleTimeString('en-US', {
+                            hour: '2-digit', minute: '2-digit',
+                            hour12: false, timeZone: 'America/New_York'
+                        });
+                    }
+                },
                 timeScale: {
-                    borderColor: getThemeValue('--border-color', '#333333'), timeVisible: false, secondsVisible: false,
-                    fixLeftEdge: true, fixRightEdge: false,
+                    borderColor: getThemeValue('--border-color', '#333333'), timeVisible: true, secondsVisible: false,
+                    fixLeftEdge: false, fixRightEdge: false,
+                    tickMarkFormatter: (time) => {
+                        const d = new Date(time * 1000);
+                        return d.toLocaleTimeString('en-US', {
+                            hour: '2-digit', minute: '2-digit',
+                            hour12: false, timeZone: 'America/New_York'
+                        });
+                    }
                 },
                 handleScale: { mouseWheel: true, pinch: true, axisPressedMouseMove: true },
                 handleScroll: { mouseWheel: true, pressedMouseMove: true, horzTouchDrag: true, vertTouchDrag: false },
@@ -8903,29 +9108,115 @@ def index():
                 return b;
             }
 
-            // Indicator toggles
             const indicatorDefs = [
+                { key:'sma9',   label:'SMA9',   title:'Simple Moving Average (9)' },
                 { key:'sma20',  label:'SMA20',  title:'Simple Moving Average (20)' },
                 { key:'sma50',  label:'SMA50',  title:'Simple Moving Average (50)' },
+                { key:'sma100', label:'SMA100', title:'Simple Moving Average (100)' },
                 { key:'sma200', label:'SMA200', title:'Simple Moving Average (200)' },
                 { key:'ema9',   label:'EMA9',   title:'Exponential Moving Average (9)' },
                 { key:'ema21',  label:'EMA21',  title:'Exponential Moving Average (21)' },
+                { key:'ema50',  label:'EMA50',  title:'Exponential Moving Average (50)' },
+                { key:'ema100', label:'EMA100', title:'Exponential Moving Average (100)' },
+                { key:'ema200', label:'EMA200', title:'Exponential Moving Average (200)' },
+                { key:'wma20',  label:'WMA20',  title:'Weighted Moving Average (20)' },
+                { key:'wma50',  label:'WMA50',  title:'Weighted Moving Average (50)' },
                 { key:'vwap',   label:'VWAP',   title:'Volume Weighted Average Price' },
                 { key:'bb',     label:'BB',     title:'Bollinger Bands (20, 2)' },
                 { key:'rsi',    label:'RSI',    title:'Relative Strength Index (14) — sub-pane' },
                 { key:'macd',   label:'MACD',   title:'MACD (12, 26, 9) — sub-pane' },
                 { key:'atr',    label:'ATR',    title:'Average True Range (14) — sub-pane' },
             ];
-            indicatorDefs.forEach(def => {
-                const b = btn(def.label, def.title, () => {
-                    if (tvActiveInds.has(def.key)) tvActiveInds.delete(def.key);
-                    else                           tvActiveInds.add(def.key);
-                    b.classList.toggle('active', tvActiveInds.has(def.key));
-                    applyIndicators(tvIndicatorCandles, tvActiveInds);
+            const indicatorPicker = document.createElement('details');
+            indicatorPicker.className = 'tv-indicator-picker';
+            const indicatorSummary = document.createElement('summary');
+            indicatorSummary.className = 'tv-tb-btn tv-indicator-summary';
+            indicatorSummary.title = 'Search and toggle indicators';
+            const indicatorLabel = document.createElement('span');
+            indicatorLabel.textContent = 'Indicators';
+            const indicatorBadge = document.createElement('span');
+            indicatorBadge.className = 'tv-indicator-badge';
+            indicatorSummary.appendChild(indicatorLabel);
+            indicatorSummary.appendChild(indicatorBadge);
+            indicatorPicker.appendChild(indicatorSummary);
+
+            const indicatorMenu = document.createElement('div');
+            indicatorMenu.className = 'tv-indicator-menu';
+            const indicatorSearch = document.createElement('input');
+            indicatorSearch.type = 'search';
+            indicatorSearch.className = 'tv-indicator-search';
+            indicatorSearch.placeholder = 'Search indicators';
+            indicatorSearch.autocomplete = 'off';
+            const indicatorOptions = document.createElement('div');
+            indicatorOptions.className = 'tv-indicator-options';
+
+            function syncIndicatorSummary() {
+                const count = tvActiveInds.size;
+                indicatorBadge.textContent = String(count);
+                indicatorBadge.style.display = count ? 'inline-flex' : 'none';
+            }
+
+            function renderIndicatorOptions() {
+                const query = (indicatorSearch.value || '').trim().toLowerCase();
+                indicatorOptions.innerHTML = '';
+                const matches = indicatorDefs.filter(def =>
+                    def.label.toLowerCase().includes(query) || def.title.toLowerCase().includes(query)
+                );
+
+                if (!matches.length) {
+                    const empty = document.createElement('div');
+                    empty.className = 'tv-indicator-option-empty';
+                    empty.textContent = 'No matching indicators';
+                    indicatorOptions.appendChild(empty);
+                    return;
+                }
+
+                matches.forEach(def => {
+                    const option = document.createElement('button');
+                    option.type = 'button';
+                    option.className = 'tv-indicator-option';
+                    if (tvActiveInds.has(def.key)) option.classList.add('active');
+
+                    const name = document.createElement('span');
+                    name.className = 'tv-indicator-option-name';
+                    name.textContent = def.label;
+                    const desc = document.createElement('span');
+                    desc.className = 'tv-indicator-option-desc';
+                    desc.textContent = def.title;
+
+                    option.appendChild(name);
+                    option.appendChild(desc);
+                    option.addEventListener('click', () => {
+                        if (tvActiveInds.has(def.key)) tvActiveInds.delete(def.key);
+                        else                           tvActiveInds.add(def.key);
+                        syncIndicatorSummary();
+                        renderIndicatorOptions();
+                        applyIndicators(tvIndicatorCandles, tvActiveInds);
+                    });
+
+                    indicatorOptions.appendChild(option);
                 });
-                if (tvActiveInds.has(def.key)) b.classList.add('active');
-                toolbar.appendChild(b);
+            }
+
+            indicatorSearch.addEventListener('input', renderIndicatorOptions);
+            indicatorPicker.addEventListener('toggle', () => {
+                if (indicatorPicker.open) {
+                    setTimeout(() => {
+                        indicatorSearch.focus();
+                        indicatorSearch.select();
+                    }, 0);
+                } else {
+                    indicatorSearch.value = '';
+                    renderIndicatorOptions();
+                }
             });
+
+            indicatorMenu.appendChild(indicatorSearch);
+            indicatorMenu.appendChild(indicatorOptions);
+            indicatorPicker.appendChild(indicatorMenu);
+            syncIndicatorSummary();
+            renderIndicatorOptions();
+            toolbar.appendChild(indicatorPicker);
 
             // --- Separator ---
             const sep2 = document.createElement('div'); sep2.className = 'tv-toolbar-sep'; toolbar.appendChild(sep2);
@@ -9283,8 +9574,15 @@ def index():
                 if (x == null || y == null || Number.isNaN(x) || Number.isNaN(y)) continue;
                 const size = point.size || 8;
                 const radius = size / 2;
+                const overlapCount = Math.max(1, point.overlap_count || 1);
+                const overlapSlot = Math.max(0, Math.min(overlapCount - 1, point.overlap_slot || 0));
+                const offsetStep = Math.max(4, Math.min(10, radius * 0.9));
+                const offsetX = overlapCount > 1
+                    ? (overlapSlot - ((overlapCount - 1) / 2)) * offsetStep
+                    : 0;
+                const drawX = x + offsetX;
                 const hoverRadius = Math.max(8, radius + 5);
-                if (x < -hoverRadius || x > width + hoverRadius || y < -hoverRadius || y > height + hoverRadius) {
+                if (drawX < -hoverRadius || drawX > width + hoverRadius || y < -hoverRadius || y > height + hoverRadius) {
                     continue;
                 }
 
@@ -9292,22 +9590,22 @@ def index():
                 context.globalAlpha = 0.95;
                 context.fillStyle = point.color || 'rgba(255,255,255,0.6)';
                 context.beginPath();
-                context.arc(x, y, radius, 0, Math.PI * 2);
+                context.arc(drawX, y, radius, 0, Math.PI * 2);
                 context.fill();
                 context.globalAlpha = 1;
                 context.strokeStyle = 'rgba(0,0,0,0.25)';
                 context.lineWidth = 1;
                 context.beginPath();
-                context.arc(x, y, radius + 1, 0, Math.PI * 2);
+                context.arc(drawX, y, radius + 1, 0, Math.PI * 2);
                 context.stroke();
                 context.strokeStyle = point.border_color || point.color || '#ffffff';
                 context.lineWidth = point.border_width || 1;
                 context.beginPath();
-                context.arc(x, y, Math.max(0.5, radius - ((point.border_width || 1) / 2)), 0, Math.PI * 2);
+                context.arc(drawX, y, Math.max(0.5, radius - ((point.border_width || 1) / 2)), 0, Math.PI * 2);
                 context.stroke();
                 context.restore();
 
-                const renderedPoint = { ...point, x, y };
+                const renderedPoint = { ...point, x: drawX, y };
                 tvHistoricalRenderedPoints.push(renderedPoint);
                 indexTVHistoricalHoverPoint(renderedPoint);
                 visibleCount += 1;
@@ -9352,6 +9650,7 @@ def index():
                     rightPriceScale: {
                         borderColor:  getThemeValue('--border-color', '#333333'),
                         scaleMargins: { top: 0.04, bottom: 0.15 },
+                        minimumWidth: 72,
                     },
                     localization: {
                         timeFormatter: (time) => {
