@@ -180,6 +180,39 @@ def normalize_level_type(level_type):
     return level_type
 
 
+def resolve_level_value_column(level_type):
+    normalized_type = normalize_level_type(level_type)
+    if normalized_type == 'AbsGEX':
+        return 'GEX'
+    if normalized_type == 'Volume':
+        return 'volume'
+    return normalized_type
+
+
+def combine_level_values(level_type, call_value, put_value):
+    normalized_type = normalize_level_type(level_type)
+    if normalized_type == 'GEX':
+        return call_value - put_value
+    if normalized_type == 'AbsGEX':
+        return abs(call_value) + abs(put_value)
+    if normalized_type == 'Volume':
+        return call_value - put_value
+    return call_value + put_value
+
+
+HEATMAP_TITLE_DISPLAY_NAMES = {
+    'GEX': 'Gamma Exposure',
+    'AbsGEX': 'Absolute Gamma Exposure',
+    'DEX': 'Delta Exposure',
+    'VEX': 'Vanna Exposure',
+    'Charm': 'Charm Exposure',
+    'Volume': 'Volume Exposure',
+    'Speed': 'Speed Exposure',
+    'Vomma': 'Vomma Exposure',
+    'Color': 'Color Exposure',
+}
+
+
 def build_expiry_selection_key(expiry_dates):
     if not expiry_dates:
         return ''
@@ -877,6 +910,16 @@ def format_large_number(num):
         return f"{num/1e3:.2f}K"
     else:
         return f"{num:,.0f}"
+
+
+def build_hover_template(title, rows):
+    hover_rows = [f"<b>{title}</b>"]
+    hover_rows.extend(f"{label}: {value}" for label, value in rows)
+    return '<br>'.join(hover_rows) + '<extra></extra>'
+
+
+def build_time_hover_template(title, rows, time_expr='%{x|%H:%M}'):
+    return build_hover_template(title, rows + [('Time', time_expr)])
 
 def get_strike_interval(strikes):
     """Determine the most common strike interval from a list of strikes"""
@@ -1762,6 +1805,334 @@ def ensure_bar_text_visibility(fig, horizontal=False):
     else:
         fig.update_yaxes(range=[lower_bound, upper_bound])
 
+
+def create_exposure_heatmap(calls, puts, S, strike_range=0.02, show_calls=True, show_puts=True,
+                            show_net=True, call_color='#00FF00', put_color='#FF0000',
+                            selected_expiries=None, heatmap_type='GEX',
+                            heatmap_coloring_mode='Global'):
+    normalized_type = normalize_level_type(heatmap_type)
+    value_column = resolve_level_value_column(normalized_type)
+    display_name = INTERVAL_LEVEL_DISPLAY_NAMES.get(normalized_type, normalized_type)
+    title_display_name = HEATMAP_TITLE_DISPLAY_NAMES.get(normalized_type, display_name)
+    text_color = '#CCCCCC'
+    grid_color = '#333333'
+    background_color = '#1E1E1E'
+
+    base_title = f'{title_display_name} Heatmap'
+    empty_title = build_chart_title_text(base_title, selected_expiries=selected_expiries)
+
+    if (
+        value_column not in calls.columns or
+        value_column not in puts.columns or
+        'expiration' not in calls.columns or
+        'expiration' not in puts.columns
+    ):
+        fig = go.Figure()
+        fig.update_layout(
+            title=build_left_aligned_title(empty_title, text_color=text_color),
+            plot_bgcolor=background_color,
+            paper_bgcolor=background_color,
+            font=dict(color=text_color),
+            annotations=[dict(
+                text='No exposure data available',
+                x=0.5,
+                y=0.5,
+                xref='paper',
+                yref='paper',
+                showarrow=False,
+                font=dict(color=text_color, size=14),
+            )],
+        )
+        return fig.to_json()
+
+    min_strike = S * (1 - strike_range)
+    max_strike = S * (1 + strike_range)
+
+    calls_df = calls[['expiration', 'strike', value_column]].copy()
+    puts_df = puts[['expiration', 'strike', value_column]].copy()
+
+    calls_df = calls_df[(calls_df['strike'] >= min_strike) & (calls_df['strike'] <= max_strike)]
+    puts_df = puts_df[(puts_df['strike'] >= min_strike) & (puts_df['strike'] <= max_strike)]
+
+    all_strikes = list(calls_df['strike']) + list(puts_df['strike'])
+    strike_interval = get_strike_interval(all_strikes) if all_strikes else 1.0
+
+    def aggregate_heatmap_frame(df):
+        if df.empty:
+            return pd.DataFrame(columns=['expiration_label', 'strike', value_column])
+
+        working = df.copy()
+        working['strike'] = working['strike'].apply(lambda value: round_to_strike(value, strike_interval))
+        working['expiration_label'] = working['expiration'].astype(str)
+        return working.groupby(['expiration_label', 'strike'], as_index=False)[value_column].sum()
+
+    calls_grouped = aggregate_heatmap_frame(calls_df)
+    puts_grouped = aggregate_heatmap_frame(puts_df)
+
+    call_lookup = {
+        (row['expiration_label'], row['strike']): row[value_column]
+        for _, row in calls_grouped.iterrows()
+    }
+    put_lookup = {
+        (row['expiration_label'], row['strike']): row[value_column]
+        for _, row in puts_grouped.iterrows()
+    }
+
+    available_expiries = sorted(
+        set(calls_grouped['expiration_label'].tolist()) | set(puts_grouped['expiration_label'].tolist())
+    )
+    if selected_expiries:
+        requested_expiries = [str(expiry) for expiry in selected_expiries]
+        expiry_labels = [expiry for expiry in requested_expiries if expiry in available_expiries]
+        expiry_labels.extend(expiry for expiry in available_expiries if expiry not in expiry_labels)
+    else:
+        expiry_labels = available_expiries
+
+    strikes = sorted(set(calls_grouped['strike'].tolist()) | set(puts_grouped['strike'].tolist()))
+
+    if not expiry_labels or not strikes:
+        fig = go.Figure()
+        fig.update_layout(
+            title=build_left_aligned_title(empty_title, text_color=text_color),
+            plot_bgcolor=background_color,
+            paper_bgcolor=background_color,
+            font=dict(color=text_color),
+            annotations=[dict(
+                text='No exposure data in selected strike range',
+                x=0.5,
+                y=0.5,
+                xref='paper',
+                yref='paper',
+                showarrow=False,
+                font=dict(color=text_color, size=14),
+            )],
+        )
+        return fig.to_json()
+
+    if show_net or (show_calls and show_puts):
+        mode_label = 'Net'
+    elif show_calls:
+        mode_label = 'Call'
+    elif show_puts:
+        mode_label = 'Put'
+    else:
+        mode_label = 'Net'
+
+    actual_values = []
+    text_values = []
+    for strike in strikes:
+        value_row = []
+        text_row = []
+        for expiry in expiry_labels:
+            call_value = call_lookup.get((expiry, strike), 0.0)
+            put_value = put_lookup.get((expiry, strike), 0.0)
+
+            if mode_label == 'Call':
+                exposure_value = call_value
+            elif mode_label == 'Put':
+                exposure_value = -put_value
+            else:
+                exposure_value = combine_level_values(normalized_type, call_value, put_value)
+
+            value_row.append(exposure_value)
+            text_row.append(format_large_number(exposure_value))
+        actual_values.append(value_row)
+        text_values.append(text_row)
+
+    if heatmap_coloring_mode == 'Per Expiration':
+        column_maxima = []
+        for expiry_index in range(len(expiry_labels)):
+            column_values = [row[expiry_index] for row in actual_values]
+            column_max = max((abs(value) for value in column_values), default=0.0)
+            column_maxima.append(column_max if column_max > 0 else 1.0)
+        color_values = []
+        for row in actual_values:
+            color_values.append([
+                row[idx] / column_maxima[idx] if column_maxima[idx] else 0.0
+                for idx in range(len(row))
+            ])
+        colorbar_max = 1.0
+    else:
+        color_values = actual_values
+        max_abs_exposure = max((abs(value) for row in actual_values for value in row), default=0.0)
+        colorbar_max = max_abs_exposure if max_abs_exposure > 0 else 1.0
+
+    total_call_exposure = calls[value_column].sum() if not calls.empty else 0
+    total_put_exposure = puts[value_column].sum() if not puts.empty else 0
+    if mode_label == 'Call':
+        total_net_exposure = total_call_exposure
+    elif mode_label == 'Put':
+        total_net_exposure = -total_put_exposure
+    else:
+        total_net_exposure = combine_level_values(normalized_type, total_call_exposure, total_put_exposure)
+
+    chart_title = build_chart_title_text(
+        f'{title_display_name} Heatmap',
+        selected_expiries=selected_expiries,
+    )
+
+    heatmap_hover_template = build_hover_template(
+        mode_label,
+        [
+            ('Expiration', '%{x}'),
+            ('Price', '$%{y:.2f}'),
+            (title_display_name, '%{customdata}'),
+        ],
+    )
+
+    heatmap_kwargs = dict(
+        x=expiry_labels,
+        y=strikes,
+        z=color_values,
+        customdata=actual_values,
+        colorscale=[
+            [0.0, put_color],
+            [0.5, '#2A2A2A'],
+            [1.0, call_color],
+        ],
+        zmin=-colorbar_max,
+        zmax=colorbar_max,
+        zmid=0,
+        hoverongaps=False,
+        showscale=False,
+        xgap=2,
+        ygap=2,
+        hovertemplate=heatmap_hover_template,
+    )
+
+    label_font_size = 11  # JS will recalculate this on every render/resize
+
+    fig = go.Figure(data=[go.Heatmap(**heatmap_kwargs)])
+
+    cell_annotations = []
+    for strike_index, strike in enumerate(strikes):
+        for expiry_index, expiry_label in enumerate(expiry_labels):
+            cell_annotations.append(dict(
+                x=expiry_label,
+                y=strike,
+                xref='x',
+                yref='y',
+                text=text_values[strike_index][expiry_index],
+                showarrow=False,
+                xanchor='center',
+                yanchor='middle',
+                align='center',
+                font=dict(color='rgba(255, 255, 255, 0.82)', size=label_font_size, family='Arial, sans-serif'),
+            ))
+
+    # Draw a border around the cell with the highest absolute exposure in each expiration column
+    highlight_shapes = []
+    half_interval = strike_interval / 2
+    for expiry_index in range(len(expiry_labels)):
+        col_abs = [(abs(actual_values[si][expiry_index]), si) for si in range(len(strikes))]
+        if not col_abs:
+            continue
+        _, max_si = max(col_abs)
+        max_strike_val = strikes[max_si]
+        highlight_shapes.append(dict(
+            type='rect',
+            xref='x',
+            yref='y',
+            x0=expiry_index - 0.5,
+            x1=expiry_index + 0.5,
+            y0=max_strike_val - half_interval,
+            y1=max_strike_val + half_interval,
+            line=dict(color='#AA00FF', width=2),
+            fillcolor='rgba(0,0,0,0)',
+            layer='above',
+        ))
+
+    add_current_price_reference(fig, S, horizontal=True, text_color=text_color)
+
+    y_tick_format = '.2f' if strike_interval < 1 else ('.1f' if strike_interval < 5 else '.0f')
+    parsed_expiries = []
+    for expiry_label in expiry_labels:
+        try:
+            parsed_expiries.append(datetime.strptime(expiry_label, '%Y-%m-%d'))
+        except Exception:
+            parsed_expiries.append(None)
+
+    multiple_expiry_years = len({dt.year for dt in parsed_expiries if dt is not None}) > 1
+    compact_expiry_labels = []
+    for expiry_label, parsed_expiry in zip(expiry_labels, parsed_expiries):
+        if parsed_expiry is None:
+            compact_expiry_labels.append(expiry_label)
+        elif multiple_expiry_years:
+            compact_expiry_labels.append(parsed_expiry.strftime('%m/%d/%y'))
+        else:
+            compact_expiry_labels.append(parsed_expiry.strftime('%m/%d'))
+
+    if len(set(compact_expiry_labels)) != len(compact_expiry_labels):
+        compact_expiry_labels = [
+            parsed_expiry.strftime('%m/%d/%y') if parsed_expiry is not None else expiry_label
+            for expiry_label, parsed_expiry in zip(expiry_labels, parsed_expiries)
+        ]
+
+    max_visible_expiry_ticks = 8
+    if len(expiry_labels) > max_visible_expiry_ticks:
+        visible_tick_step = max(1, math.ceil(len(expiry_labels) / max_visible_expiry_ticks))
+        compact_expiry_ticktext = [
+            label if idx % visible_tick_step == 0 else ''
+            for idx, label in enumerate(compact_expiry_labels)
+        ]
+    else:
+        compact_expiry_ticktext = compact_expiry_labels
+
+    expiry_tick_font_size = 10 if len(expiry_labels) <= 8 else 9
+    fig.update_layout(
+        shapes=list(fig.layout.shapes) + highlight_shapes,
+        title=build_left_aligned_title(chart_title, text_color=text_color),
+        annotations=list(fig.layout.annotations) + cell_annotations + [
+            build_bar_chart_totals_annotation(
+                total_call_exposure,
+                total_put_exposure,
+                total_net_exposure,
+                call_color,
+                put_color,
+            )
+        ],
+        xaxis=dict(
+            title='Expiration',
+            title_font=dict(color=text_color),
+            tickfont=dict(color=text_color, size=expiry_tick_font_size),
+            gridcolor=grid_color,
+            linecolor=grid_color,
+            showgrid=False,
+            zeroline=False,
+            type='category',
+            tickmode='array',
+            tickvals=expiry_labels,
+            ticktext=compact_expiry_ticktext,
+            categoryorder='array',
+            categoryarray=expiry_labels,
+            tickangle=0,
+        ),
+        yaxis=dict(
+            title='Price',
+            title_font=dict(color=text_color),
+            tickfont=dict(color=text_color),
+            gridcolor=grid_color,
+            linecolor=grid_color,
+            showgrid=False,
+            zeroline=False,
+            tickformat=y_tick_format,
+            range=[min_strike, max_strike],
+            autorange=False,
+        ),
+        plot_bgcolor=background_color,
+        paper_bgcolor=background_color,
+        font=dict(color=text_color),
+        margin=dict(l=48, r=92, t=56, b=40),
+        hoverlabel=dict(
+            bgcolor=background_color,
+            font_size=12,
+            font_family='Arial',
+        ),
+        height=560,
+    )
+
+    return fig.to_json()
+
 def create_exposure_chart(calls, puts, exposure_type, title, S, strike_range=0.02, show_calls=True, show_puts=True, show_net=True, coloring_mode='Solid', call_color='#00FF00', put_color='#FF0000', selected_expiries=None, horizontal=False, show_abs_gex_area=False, abs_gex_opacity=0.2, highlight_max_level=False, max_level_color='#800080', max_level_mode='Absolute'):
     # Ensure the exposure_type column exists
     if exposure_type not in calls.columns or exposure_type not in puts.columns:
@@ -1808,6 +2179,7 @@ def create_exposure_chart(calls, puts, exposure_type, title, S, strike_range=0.0
     
     # Create the main title and net exposure as separate annotations
     fig = go.Figure()
+    hover_metric_label = title.replace(' by Strike', '') if title.endswith(' by Strike') else title
     
     # Add Absolute GEX Area Chart if enabled
     if exposure_type == 'GEX' and show_abs_gex_area:
@@ -1881,7 +2253,7 @@ def create_exposure_chart(calls, puts, exposure_type, title, S, strike_range=0.0
                 text=[format_large_number(val) for val in calls_df[exposure_type]],
                 textposition='auto',
                 orientation='h',
-                hovertemplate='Strike: %{y}<br>Value: %{text}<extra></extra>',
+                hovertemplate=build_hover_template('Call', [('Strike', '$%{y:.2f}'), (hover_metric_label, '%{text}')]),
                 marker_line_width=0
             ))
         else:
@@ -1892,7 +2264,7 @@ def create_exposure_chart(calls, puts, exposure_type, title, S, strike_range=0.0
                 marker_color=call_colors,
                 text=[format_large_number(val) for val in calls_df[exposure_type]],
                 textposition='auto',
-                hovertemplate='Strike: %{x}<br>Value: %{text}<extra></extra>',
+                hovertemplate=build_hover_template('Call', [('Strike', '$%{x:.2f}'), (hover_metric_label, '%{text}')]),
                 marker_line_width=0
             ))
     
@@ -1909,7 +2281,7 @@ def create_exposure_chart(calls, puts, exposure_type, title, S, strike_range=0.0
                 text=[format_large_number(val) for val in puts_df[exposure_type]],
                 textposition='auto',
                 orientation='h',
-                hovertemplate='Strike: %{y}<br>Value: %{text}<extra></extra>',
+                hovertemplate=build_hover_template('Put', [('Strike', '$%{y:.2f}'), (hover_metric_label, '%{text}')]),
                 marker_line_width=0
             ))
         else:
@@ -1920,7 +2292,7 @@ def create_exposure_chart(calls, puts, exposure_type, title, S, strike_range=0.0
                 marker_color=put_colors,
                 text=[format_large_number(val) for val in puts_df[exposure_type]],
                 textposition='auto',
-                hovertemplate='Strike: %{x}<br>Value: %{text}<extra></extra>',
+                hovertemplate=build_hover_template('Put', [('Strike', '$%{x:.2f}'), (hover_metric_label, '%{text}')]),
                 marker_line_width=0
             ))
     
@@ -1959,7 +2331,7 @@ def create_exposure_chart(calls, puts, exposure_type, title, S, strike_range=0.0
                 text=[format_large_number(val) for val in net_exposure],
                 textposition='auto',
                 orientation='h',
-                hovertemplate='Strike: %{y}<br>Net Value: %{text}<extra></extra>',
+                hovertemplate=build_hover_template('Net', [('Strike', '$%{y:.2f}'), (hover_metric_label, '%{text}')]),
                 marker_line_width=0
             ))
         else:
@@ -1970,7 +2342,7 @@ def create_exposure_chart(calls, puts, exposure_type, title, S, strike_range=0.0
                 marker_color=net_colors,
                 text=[format_large_number(val) for val in net_exposure],
                 textposition='auto',
-                hovertemplate='Strike: %{x}<br>Net Value: %{text}<extra></extra>',
+                hovertemplate=build_hover_template('Net', [('Strike', '$%{x:.2f}'), (hover_metric_label, '%{text}')]),
                 marker_line_width=0
             ))
     
@@ -2228,7 +2600,7 @@ def create_options_volume_chart(calls, puts, S, strike_range=0.02, call_color='#
                 text=calls['volume'].tolist(),
                 textposition='auto',
                 orientation='h',
-                hovertemplate='Strike: %{y}<br>Volume: %{x}<extra></extra>',
+                hovertemplate=build_hover_template('Call', [('Strike', '$%{y:.2f}'), ('Volume', '%{x:,.0f}')]),
                 marker_line_width=0
             ))
         else:
@@ -2239,7 +2611,7 @@ def create_options_volume_chart(calls, puts, S, strike_range=0.02, call_color='#
                 marker_color=call_colors,
                 text=calls['volume'].tolist(),
                 textposition='auto',
-                hovertemplate='Strike: %{x}<br>Volume: %{y}<extra></extra>',
+                hovertemplate=build_hover_template('Call', [('Strike', '$%{x:.2f}'), ('Volume', '%{y:,.0f}')]),
                 marker_line_width=0
             ))
     
@@ -2257,7 +2629,7 @@ def create_options_volume_chart(calls, puts, S, strike_range=0.02, call_color='#
                 text=puts['volume'].tolist(),
                 textposition='auto',
                 orientation='h',
-                hovertemplate='Strike: %{y}<br>Volume: %{text}<extra></extra>',  # Show positive value in hover
+                hovertemplate=build_hover_template('Put', [('Strike', '$%{y:.2f}'), ('Volume', '%{text}')]),
                 marker_line_width=0
             ))
         else:
@@ -2268,7 +2640,7 @@ def create_options_volume_chart(calls, puts, S, strike_range=0.02, call_color='#
                 marker_color=put_colors,
                 text=puts['volume'].tolist(),
                 textposition='auto',
-                hovertemplate='Strike: %{x}<br>Volume: %{text}<extra></extra>',  # Show positive value in hover
+                hovertemplate=build_hover_template('Put', [('Strike', '$%{x:.2f}'), ('Volume', '%{text}')]),
                 marker_line_width=0
             ))
     
@@ -2302,7 +2674,7 @@ def create_options_volume_chart(calls, puts, S, strike_range=0.02, call_color='#
                 text=[f"{vol:,.0f}" for vol in net_volume],
                 textposition='auto',
                 orientation='h',
-                hovertemplate='Strike: %{y}<br>Net Volume: %{x}<extra></extra>',
+                hovertemplate=build_hover_template('Net', [('Strike', '$%{y:.2f}'), ('Volume', '%{text}')]),
                 marker_line_width=0
             ))
         else:
@@ -2313,7 +2685,7 @@ def create_options_volume_chart(calls, puts, S, strike_range=0.02, call_color='#
                 marker_color=net_colors,
                 text=[f"{vol:,.0f}" for vol in net_volume],
                 textposition='auto',
-                hovertemplate='Strike: %{x}<br>Net Volume: %{y}<extra></extra>',
+                hovertemplate=build_hover_template('Net', [('Strike', '$%{x:.2f}'), ('Volume', '%{text}')]),
                 marker_line_width=0
             ))
     
@@ -3799,7 +4171,7 @@ def create_historical_bubble_levels_chart(ticker, strike_range, call_color='#00F
     
     # Create colors and sizes for the adjusted strikes
     hover_sides = []
-    formatted_exposures = []
+    raw_exposures = []
     original_strikes = []
     for i, exposure in enumerate(exposures):
         dt = timestamps[i]
@@ -3821,7 +4193,7 @@ def create_historical_bubble_levels_chart(ticker, strike_range, call_color='#00F
         # Calculate bubble size (scaled to the max exposure for this time slice)
         size = max(4, min(25, abs(exposure) * 20 / max_exposure))
         bubble_sizes.append(size)
-        formatted_exposures.append(format_large_number(exposure))
+        raw_exposures.append(exposure)
         original_strikes.append(strikes[i])
 
     # If highlight is enabled, mark the max bubble for each timestamp (historical highlighting)
@@ -3857,8 +4229,8 @@ def create_historical_bubble_levels_chart(ticker, strike_range, call_color='#00F
     if absolute and exposure_type == 'gamma':
         exposure_name = 'Gamma (Abs)'
 
-    # Build customdata: [side, original_strike, formatted_exposure]
-    bubble_customdata = list(zip(hover_sides, original_strikes, formatted_exposures))
+    # Build customdata: [side, original_strike, raw_exposure]
+    bubble_customdata = list(zip(hover_sides, original_strikes, raw_exposures))
 
     fig.add_trace(go.Scatter(
         x=timestamps,
@@ -3872,7 +4244,7 @@ def create_historical_bubble_levels_chart(ticker, strike_range, call_color='#00F
             line=dict(width=0)
         ),
         customdata=bubble_customdata,
-        hovertemplate='<b>%{customdata[0]}</b><br>Strike: $%{customdata[1]:.2f}<br>' + exposure_name + ': %{customdata[2]}<br>Time: %{x|%H:%M}<extra></extra>',
+        hovertemplate=build_time_hover_template('%{customdata[0]}', [('Strike', '$%{customdata[1]:.2f}'), (exposure_name, '%{customdata[2]}')]),
         yaxis='y1'
     ))
 
@@ -3896,7 +4268,7 @@ def create_historical_bubble_levels_chart(ticker, strike_range, call_color='#00F
         mode='lines',
         name='Price',
         line=dict(color='gold', width=2),
-        hovertemplate='<b>Price</b>: $%{y:.2f}<br>Time: %{x|%H:%M}<extra></extra>',
+        hovertemplate=build_time_hover_template('Price', [('Price', '$%{y:.2f}')]),
         yaxis='y1'
     ))
     
@@ -4015,7 +4387,7 @@ def create_open_interest_chart(calls, puts, S, strike_range=0.02, call_color='#0
                 text=[format_large_number(v) for v in calls['openInterest']],
                 textposition='auto',
                 orientation='h',
-                hovertemplate='Strike: %{y}<br>OI: %{text}<extra></extra>',
+                hovertemplate=build_hover_template('Call', [('Strike', '$%{y:.2f}'), ('Open Interest', '%{text}')]),
                 marker_line_width=0
             ))
         else:
@@ -4026,7 +4398,7 @@ def create_open_interest_chart(calls, puts, S, strike_range=0.02, call_color='#0
                 marker_color=call_colors,
                 text=[format_large_number(v) for v in calls['openInterest']],
                 textposition='auto',
-                hovertemplate='Strike: %{x}<br>OI: %{text}<extra></extra>',
+                hovertemplate=build_hover_template('Call', [('Strike', '$%{x:.2f}'), ('Open Interest', '%{text}')]),
                 marker_line_width=0
             ))
     
@@ -4043,7 +4415,7 @@ def create_open_interest_chart(calls, puts, S, strike_range=0.02, call_color='#0
                 text=[format_large_number(v) for v in puts['openInterest']],
                 textposition='auto',
                 orientation='h',
-                hovertemplate='Strike: %{y}<br>OI: %{text}<extra></extra>',
+                hovertemplate=build_hover_template('Put', [('Strike', '$%{y:.2f}'), ('Open Interest', '%{text}')]),
                 marker_line_width=0
             ))
         else:
@@ -4054,7 +4426,7 @@ def create_open_interest_chart(calls, puts, S, strike_range=0.02, call_color='#0
                 marker_color=put_colors,
                 text=[format_large_number(v) for v in puts['openInterest']],
                 textposition='auto',
-                hovertemplate='Strike: %{x}<br>OI: %{text}<extra></extra>',
+                hovertemplate=build_hover_template('Put', [('Strike', '$%{x:.2f}'), ('Open Interest', '%{text}')]),
                 marker_line_width=0
             ))
     
@@ -4083,7 +4455,7 @@ def create_open_interest_chart(calls, puts, S, strike_range=0.02, call_color='#0
                 text=[format_large_number(val) for val in net_oi],
                 textposition='auto',
                 orientation='h',
-                hovertemplate='Strike: %{y}<br>Net OI: %{text}<extra></extra>',
+                hovertemplate=build_hover_template('Net', [('Strike', '$%{y:.2f}'), ('Open Interest', '%{text}')]),
                 marker_line_width=0
             ))
         else:
@@ -4094,7 +4466,7 @@ def create_open_interest_chart(calls, puts, S, strike_range=0.02, call_color='#0
                 marker_color=net_colors,
                 text=[format_large_number(val) for val in net_oi],
                 textposition='auto',
-                hovertemplate='Strike: %{x}<br>Net OI: %{text}<extra></extra>',
+                hovertemplate=build_hover_template('Net', [('Strike', '$%{x:.2f}'), ('Open Interest', '%{text}')]),
                 marker_line_width=0
             ))
     
@@ -4290,7 +4662,7 @@ def create_premium_chart(calls, puts, S, strike_range=0.02, call_color='#00FF00'
                 text=[f"${price:.2f}" for price in calls['lastPrice']],
                 textposition='auto',
                 orientation='h',
-                hovertemplate='Strike: %{y}<br>Premium: $%{x:.2f}<extra></extra>',
+                hovertemplate=build_hover_template('Call', [('Strike', '$%{y:.2f}'), ('Premium', '$%{x:.2f}')]),
                 marker_line_width=0
             ))
         else:
@@ -4301,7 +4673,7 @@ def create_premium_chart(calls, puts, S, strike_range=0.02, call_color='#00FF00'
                 marker_color=call_colors,
                 text=[f"${price:.2f}" for price in calls['lastPrice']],
                 textposition='auto',
-                hovertemplate='Strike: %{x}<br>Premium: $%{y:.2f}<extra></extra>',
+                hovertemplate=build_hover_template('Call', [('Strike', '$%{x:.2f}'), ('Premium', '$%{y:.2f}')]),
                 marker_line_width=0
             ))
     
@@ -4319,7 +4691,7 @@ def create_premium_chart(calls, puts, S, strike_range=0.02, call_color='#00FF00'
                 text=[f"${price:.2f}" for price in puts['lastPrice']],
                 textposition='auto',
                 orientation='h',
-                hovertemplate='Strike: %{y}<br>Premium: $%{x:.2f}<extra></extra>',
+                hovertemplate=build_hover_template('Put', [('Strike', '$%{y:.2f}'), ('Premium', '$%{x:.2f}')]),
                 marker_line_width=0
             ))
         else:
@@ -4330,7 +4702,7 @@ def create_premium_chart(calls, puts, S, strike_range=0.02, call_color='#00FF00'
                 marker_color=put_colors,
                 text=[f"${price:.2f}" for price in puts['lastPrice']],
                 textposition='auto',
-                hovertemplate='Strike: %{x}<br>Premium: $%{y:.2f}<extra></extra>',
+                hovertemplate=build_hover_template('Put', [('Strike', '$%{x:.2f}'), ('Premium', '$%{y:.2f}')]),
                 marker_line_width=0
             ))
     
@@ -4364,7 +4736,7 @@ def create_premium_chart(calls, puts, S, strike_range=0.02, call_color='#00FF00'
                 text=[f"${prem:.2f}" for prem in net_premium],
                 textposition='auto',
                 orientation='h',
-                hovertemplate='Strike: %{y}<br>Net Premium: $%{x:.2f}<extra></extra>',
+                hovertemplate=build_hover_template('Net', [('Strike', '$%{y:.2f}'), ('Premium', '$%{x:.2f}')]),
                 marker_line_width=0
             ))
         else:
@@ -4375,7 +4747,7 @@ def create_premium_chart(calls, puts, S, strike_range=0.02, call_color='#00FF00'
                 marker_color=net_colors,
                 text=[f"${prem:.2f}" for prem in net_premium],
                 textposition='auto',
-                hovertemplate='Strike: %{x}<br>Net Premium: $%{y:.2f}<extra></extra>',
+                hovertemplate=build_hover_template('Net', [('Strike', '$%{x:.2f}'), ('Premium', '$%{y:.2f}')]),
                 marker_line_width=0
             ))
     
@@ -4592,7 +4964,7 @@ def create_centroid_chart(ticker, call_color='#00FF00', put_color='#FF0000', sel
         mode='lines',
         name='Call Centroid',
         line=dict(color=call_color, width=2),
-        hovertemplate='Time: %{x}<br>Call Centroid: $%{y:.2f}<br>Call Volume: %{customdata}<extra></extra>',
+        hovertemplate=build_time_hover_template('Call', [('Centroid', '$%{y:.2f}'), ('Volume', '%{customdata:,.0f}')]),
         customdata=call_volumes,
         connectgaps=False
     ))
@@ -4604,7 +4976,7 @@ def create_centroid_chart(ticker, call_color='#00FF00', put_color='#FF0000', sel
         mode='lines',
         name='Put Centroid',
         line=dict(color=put_color, width=2),
-        hovertemplate='Time: %{x}<br>Put Centroid: $%{y:.2f}<br>Put Volume: %{customdata}<extra></extra>',
+        hovertemplate=build_time_hover_template('Put', [('Centroid', '$%{y:.2f}'), ('Volume', '%{customdata:,.0f}')]),
         customdata=put_volumes,
         connectgaps=False
     ))
@@ -4616,7 +4988,7 @@ def create_centroid_chart(ticker, call_color='#00FF00', put_color='#FF0000', sel
         mode='lines',
         name='Price',
         line=dict(color='gold', width=2),
-        hovertemplate='Time: %{x}<br>Price: $%{y:.2f}<extra></extra>'
+        hovertemplate=build_time_hover_template('Price', [('Price', '$%{y:.2f}')])
     ))
     
     # Add expiry info to title if multiple expiries are selected
@@ -5125,7 +5497,8 @@ def index():
             pointer-events: auto;
             cursor: pointer;
         }
-        .tv-historical-tooltip {
+        .tv-historical-tooltip,
+        .chart-hover-tooltip {
             position: absolute;
             z-index: 55;
             display: none;
@@ -5148,14 +5521,16 @@ def index():
             overflow: hidden;
             white-space: normal;
         }
-        .tv-historical-tooltip .tt-head {
+        .tv-historical-tooltip .tt-head,
+        .chart-hover-tooltip .tt-head {
             display: flex;
             align-items: center;
             justify-content: space-between;
             gap: 8px;
             margin-bottom: 6px;
         }
-        .tv-historical-tooltip .tt-badge {
+        .tv-historical-tooltip .tt-badge,
+        .chart-hover-tooltip .tt-badge {
             padding: 2px 6px;
             border-radius: 999px;
             background: rgba(255, 255, 255, 0.08);
@@ -5164,29 +5539,34 @@ def index():
             letter-spacing: 0.02em;
             text-transform: uppercase;
         }
-        .tv-historical-tooltip .tt-time {
+        .tv-historical-tooltip .tt-time,
+        .chart-hover-tooltip .tt-time {
             color: #8f9baa;
             font-size: 9px;
             margin-bottom: 0;
         }
-        .tv-historical-tooltip .tt-list {
+        .tv-historical-tooltip .tt-list,
+        .chart-hover-tooltip .tt-list {
             display: grid;
             gap: 4px;
         }
-        .tv-historical-tooltip .tt-row {
+        .tv-historical-tooltip .tt-row,
+        .chart-hover-tooltip .tt-row {
             display: flex;
             align-items: center;
             gap: 6px;
             min-width: 0;
         }
-        .tv-historical-tooltip .tt-dot {
+        .tv-historical-tooltip .tt-dot,
+        .chart-hover-tooltip .tt-dot {
             width: 7px;
             height: 7px;
             border-radius: 999px;
             box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.12);
             flex: 0 0 auto;
         }
-        .tv-historical-tooltip .tt-main {
+        .tv-historical-tooltip .tt-main,
+        .chart-hover-tooltip .tt-main {
             display: flex;
             justify-content: space-between;
             align-items: baseline;
@@ -5194,7 +5574,8 @@ def index():
             min-width: 0;
             width: 100%;
         }
-        .tv-historical-tooltip .tt-name {
+        .tv-historical-tooltip .tt-name,
+        .chart-hover-tooltip .tt-name {
             color: #f4f7fb;
             font-weight: 600;
             min-width: 0;
@@ -5202,18 +5583,24 @@ def index():
             text-overflow: ellipsis;
             white-space: nowrap;
         }
-        .tv-historical-tooltip .tt-value {
+        .tv-historical-tooltip .tt-value,
+        .chart-hover-tooltip .tt-value {
             color: #9fb0c4;
             font-variant-numeric: tabular-nums;
             white-space: nowrap;
             flex: 0 0 auto;
         }
-        .tv-historical-tooltip .tt-more {
+        .tv-historical-tooltip .tt-more,
+        .chart-hover-tooltip .tt-more {
             color: #8190a3;
             margin-top: 4px;
             padding-top: 4px;
             border-top: 1px solid rgba(255, 255, 255, 0.06);
             font-size: 9px;
+        }
+        .chart-container .hoverlayer {
+            opacity: 0 !important;
+            pointer-events: none !important;
         }
         .tv-chart-title {
             display: inline-block;
@@ -5869,6 +6256,7 @@ def index():
         .expiry-options,
         .levels-options,
         .tv-historical-tooltip,
+        .chart-hover-tooltip,
         #error-notification {
             transition: background-color 0.2s ease, color 0.2s ease, border-color 0.2s ease, box-shadow 0.2s ease;
         }
@@ -5989,23 +6377,29 @@ def index():
         .tv-sub-pane {
             background: var(--chart-bg);
         }
-        .tv-historical-tooltip {
+        .tv-historical-tooltip,
+        .chart-hover-tooltip {
             background: var(--tooltip-bg);
             border-color: var(--tooltip-border);
             color: var(--text-primary);
             box-shadow: var(--overlay-shadow);
         }
-        .tv-historical-tooltip .tt-badge {
+        .tv-historical-tooltip .tt-badge,
+        .chart-hover-tooltip .tt-badge {
             background: color-mix(in srgb, var(--text-primary) 10%, transparent);
             color: var(--text-secondary);
         }
         .tv-historical-tooltip .tt-time,
+        .chart-hover-tooltip .tt-time,
         .tv-historical-tooltip .tt-value,
+        .chart-hover-tooltip .tt-value,
         .tv-historical-tooltip .tt-more,
+        .chart-hover-tooltip .tt-more,
         .tv-ohlc-tooltip .tt-time {
             color: var(--text-muted);
         }
         .tv-historical-tooltip .tt-name,
+        .chart-hover-tooltip .tt-name,
         .tv-ohlc-tooltip {
             color: var(--text-primary);
         }
@@ -6481,6 +6875,27 @@ def index():
                         </div>
                     </div>
                     <div class="control-group">
+                        <label for="heatmap_type">Heatmap Type:</label>
+                        <select id="heatmap_type" title="Choose the metric shown in the exposure heatmap">
+                            <option value="GEX" selected>GEX</option>
+                            <option value="AbsGEX">Abs GEX</option>
+                            <option value="DEX">DEX</option>
+                            <option value="VEX">Vanna</option>
+                            <option value="Charm">Charm</option>
+                            <option value="Volume">Volume</option>
+                            <option value="Speed">Speed</option>
+                            <option value="Vomma">Vomma</option>
+                            <option value="Color">Color</option>
+                        </select>
+                    </div>
+                    <div class="control-group">
+                        <label for="heatmap_coloring_mode">Heatmap Colors:</label>
+                        <select id="heatmap_coloring_mode" title="Global uses one scale across all expirations. Per Expiration rescales each expiration column independently.">
+                            <option value="Global" selected>Global</option>
+                            <option value="Per Expiration">Per Expiration</option>
+                        </select>
+                    </div>
+                    <div class="control-group">
                         <label for="levels_count">Top #:</label>
                         <input type="number" id="levels_count" min="1" max="10" value="3" style="width: 50px;">
                     </div>
@@ -6547,6 +6962,10 @@ def index():
             <div class="chart-checkbox">
                 <input type="checkbox" id="gamma" checked>
                 <label for="gamma">Gamma Exposure</label>
+            </div>
+            <div class="chart-checkbox">
+                <input type="checkbox" id="heatmap">
+                <label for="heatmap">Exposure Heatmap</label>
             </div>
             <div class="chart-checkbox">
                 <input type="checkbox" id="delta" checked>
@@ -6625,6 +7044,7 @@ def index():
         let lastData = {}; // Store last received data
         let lastPriceData = null; // Price chart data stored separately (fetched via /update_price)
         let updateInProgress = false;
+        let pendingHeatmapOnlyUpdate = false;
         let isStreaming = true;
         let savedScrollPosition = 0; // Track scroll position
         let chartContainerCache = {}; // Cache for chart containers to prevent recreation
@@ -8076,11 +8496,23 @@ def index():
 <script src="https://cdn.plot.ly/plotly-latest.min.js"><\\/script>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
-    :root { --app-bg:#1E1E1E; --panel-bg:#1a1a1a; --panel-bg-alt:#2D2D2D; --chart-bg:#1E1E1E; --border-color:#333; --text-primary:#eef2f7; --text-secondary:#ccc; --text-muted:#888; --accent-color:#800080; --grid-color:#2A2A2A; }
+        :root { --app-bg:#1E1E1E; --panel-bg:#1a1a1a; --panel-bg-alt:#2D2D2D; --chart-bg:#1E1E1E; --border-color:#333; --text-primary:#eef2f7; --text-secondary:#ccc; --text-muted:#888; --accent-color:#800080; --grid-color:#2A2A2A; --tooltip-bg:linear-gradient(180deg, rgba(30, 36, 46, 0.97), rgba(14, 18, 24, 0.99)); --tooltip-border:rgba(255,255,255,0.08); }
     body { background: var(--app-bg); color: var(--text-secondary); overflow: hidden; position: relative; }
     #popout-logo { position: fixed; top: 6px; left: 10px; z-index: 100; font-family: Arial, sans-serif; font-size: 11px; font-weight: bold; color: var(--accent-color); opacity: 0.7; pointer-events: none; letter-spacing: 0.5px; }
   #popout-plot { width: 100vw; height: 100vh; }
     #popout-html { width: 100vw; height: 100vh; overflow: auto; background: var(--chart-bg); color: var(--text-primary); font-family: Arial, sans-serif; }
+        #popout-plot .hoverlayer { opacity: 0 !important; pointer-events: none !important; }
+        .chart-hover-tooltip { position:absolute; z-index:55; display:none; width:auto !important; height:auto !important; min-width:0; max-width:min(240px,calc(100% - 16px)); padding:8px; border:1px solid var(--tooltip-border); border-radius:10px; background:var(--tooltip-bg); color:var(--text-primary); font-size:10px; line-height:1.25; pointer-events:none; box-shadow:0 14px 36px rgba(0,0,0,0.38); backdrop-filter:blur(10px); overflow:hidden; white-space:normal; }
+        .chart-hover-tooltip .tt-head { display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:6px; }
+        .chart-hover-tooltip .tt-badge { padding:2px 6px; border-radius:999px; background:rgba(255,255,255,0.08); color:var(--text-secondary); font-size:9px; letter-spacing:0.02em; text-transform:uppercase; }
+        .chart-hover-tooltip .tt-time, .chart-hover-tooltip .tt-value, .chart-hover-tooltip .tt-more { color:var(--text-muted); }
+        .chart-hover-tooltip .tt-list { display:grid; gap:4px; }
+        .chart-hover-tooltip .tt-row { display:flex; align-items:center; gap:6px; min-width:0; }
+        .chart-hover-tooltip .tt-dot { width:7px; height:7px; border-radius:999px; box-shadow:0 0 0 1px rgba(255,255,255,0.12); flex:0 0 auto; }
+        .chart-hover-tooltip .tt-main { display:flex; justify-content:space-between; align-items:baseline; gap:8px; min-width:0; width:100%; }
+        .chart-hover-tooltip .tt-name { color:var(--text-primary); font-weight:600; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+        .chart-hover-tooltip .tt-value { font-variant-numeric:tabular-nums; white-space:nowrap; flex:0 0 auto; }
+        .chart-hover-tooltip .tt-more { margin-top:4px; padding-top:4px; border-top:1px solid rgba(255,255,255,0.06); font-size:9px; }
 </style></head><body>
 <div id="popout-logo">EzDuz1t Options</div>
 <div id="popout-plot"></div>
@@ -8158,6 +8590,194 @@ def index():
             } catch (e) {}
         }
     }
+    function escapeTooltipHtml(value) {
+        return String(value == null ? '' : value).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+    }
+    function stripTooltipHtml(value) {
+        return String(value == null ? '' : value).replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+    }
+    function formatTooltipNumber(value, maxFractionDigits) {
+        const numericValue = Number(value);
+        if (!Number.isFinite(numericValue)) return String(value == null ? '' : value);
+        const fractionDigits = Number.isInteger(numericValue) ? 0 : (maxFractionDigits == null ? 2 : maxFractionDigits);
+        return numericValue.toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: fractionDigits });
+    }
+    function formatTooltipMoney(value) {
+        const numericValue = Number(value);
+        if (!Number.isFinite(numericValue)) return String(value == null ? '' : value);
+        return '$' + numericValue.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    }
+    function formatTooltipDateTime(value) {
+        if (value == null || value === '') return '';
+        if (typeof value === 'string' && /^\d{2}:\d{2}(:\d{2})?(\s*[A-Z]{2,4})?$/.test(value.trim())) return value;
+        const parsedDate = value instanceof Date ? value : new Date(value);
+        if (!Number.isFinite(parsedDate.getTime())) return String(value);
+        const sameDay = parsedDate.toDateString() === new Date().toDateString();
+        return parsedDate.toLocaleString('en-US', sameDay ? { hour: '2-digit', minute: '2-digit' } : { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+    }
+    function parseTooltipColor(colorValue) {
+        if (typeof colorValue !== 'string') return null;
+        const color = colorValue.trim();
+        if (color.startsWith('#')) {
+            const hex = color.slice(1);
+            if (hex.length === 3) return { r: parseInt(hex[0] + hex[0], 16), g: parseInt(hex[1] + hex[1], 16), b: parseInt(hex[2] + hex[2], 16) };
+            if (hex.length === 6) return { r: parseInt(hex.slice(0, 2), 16), g: parseInt(hex.slice(2, 4), 16), b: parseInt(hex.slice(4, 6), 16) };
+        }
+        const rgbMatch = color.match(/rgba?\(([^)]+)\)/i);
+        if (!rgbMatch) return null;
+        const parts = rgbMatch[1].split(',').map(part => Number.parseFloat(part.trim()));
+        if (parts.length < 3 || parts.some(part => !Number.isFinite(part))) return null;
+        return { r: parts[0], g: parts[1], b: parts[2] };
+    }
+    function formatTooltipRgb(color) {
+        const clamp = value => Math.max(0, Math.min(255, Math.round(value)));
+        return 'rgb(' + clamp(color.r) + ', ' + clamp(color.g) + ', ' + clamp(color.b) + ')';
+    }
+    function interpolateTooltipColor(leftColor, rightColor, ratio) {
+        const clampedRatio = Math.max(0, Math.min(1, ratio));
+        return formatTooltipRgb({
+            r: leftColor.r + ((rightColor.r - leftColor.r) * clampedRatio),
+            g: leftColor.g + ((rightColor.g - leftColor.g) * clampedRatio),
+            b: leftColor.b + ((rightColor.b - leftColor.b) * clampedRatio),
+        });
+    }
+    function resolveHeatmapPointColor(point) {
+        const colorscale = point && point.fullData ? point.fullData.colorscale : null;
+        if (!Array.isArray(colorscale) || !colorscale.length) return null;
+        const zValue = Number(point && point.z);
+        const zMin = Number(point && point.fullData ? point.fullData.zmin : null);
+        const zMax = Number(point && point.fullData ? point.fullData.zmax : null);
+        if (!Number.isFinite(zValue) || !Number.isFinite(zMin) || !Number.isFinite(zMax) || zMax === zMin) return null;
+        const normalizedValue = Math.max(0, Math.min(1, (zValue - zMin) / (zMax - zMin)));
+        const normalizedScale = colorscale
+            .map(stop => ({ offset: Array.isArray(stop) ? Number(stop[0]) : Number(stop && stop.offset), color: parseTooltipColor(Array.isArray(stop) ? stop[1] : (stop && stop.color)) }))
+            .filter(stop => Number.isFinite(stop.offset) && stop.color)
+            .sort((left, right) => left.offset - right.offset);
+        if (!normalizedScale.length) return null;
+        if (normalizedValue <= normalizedScale[0].offset) return formatTooltipRgb(normalizedScale[0].color);
+        for (let index = 1; index < normalizedScale.length; index += 1) {
+            const leftStop = normalizedScale[index - 1];
+            const rightStop = normalizedScale[index];
+            if (normalizedValue <= rightStop.offset) {
+                const span = rightStop.offset - leftStop.offset || 1;
+                return interpolateTooltipColor(leftStop.color, rightStop.color, (normalizedValue - leftStop.offset) / span);
+            }
+        }
+        return formatTooltipRgb(normalizedScale[normalizedScale.length - 1].color);
+    }
+    function resolvePlotlyPointColor(point) {
+        if (point && point.fullData && point.fullData.type === 'heatmap') {
+            const heatmapColor = resolveHeatmapPointColor(point);
+            if (heatmapColor) return heatmapColor;
+        }
+        const marker = point && point.fullData && point.fullData.marker;
+        if (marker && marker.color != null) {
+            const markerColor = Array.isArray(marker.color) ? marker.color[point.pointNumber] : marker.color;
+            if (typeof markerColor === 'string') return markerColor;
+        }
+        if (marker && marker.colors != null) {
+            const markerColors = Array.isArray(marker.colors) ? marker.colors[point.pointNumber] : marker.colors;
+            if (typeof markerColors === 'string') return markerColors;
+        }
+        const lineColor = point && point.fullData && point.fullData.line ? point.fullData.line.color : null;
+        if (typeof lineColor === 'string') return lineColor;
+        return getThemeVar('--accent-color', '#800080');
+    }
+    function buildPlotlyTooltipContext(points, plotDiv) {
+        const firstPoint = points[0] || {};
+        if (firstPoint.fullData && firstPoint.fullData.type === 'pie') return escapeTooltipHtml(stripTooltipHtml(plotDiv && plotDiv._fullLayout && plotDiv._fullLayout.title ? plotDiv._fullLayout.title.text : 'Breakdown') || 'Breakdown');
+        if (firstPoint.fullData && firstPoint.fullData.type === 'heatmap') return 'Exp ' + escapeTooltipHtml(firstPoint.x) + ' • Strike ' + escapeTooltipHtml(formatTooltipMoney(firstPoint.y));
+        if (firstPoint.fullData && firstPoint.fullData.orientation === 'h') return 'Strike ' + escapeTooltipHtml(formatTooltipMoney(firstPoint.y));
+        if (firstPoint.customdata && Array.isArray(firstPoint.customdata) && firstPoint.customdata.length >= 3) return escapeTooltipHtml(formatTooltipDateTime(firstPoint.x));
+        if (firstPoint.x != null) {
+            if (typeof firstPoint.x === 'number') return 'Strike ' + escapeTooltipHtml(formatTooltipMoney(firstPoint.x));
+            return escapeTooltipHtml(formatTooltipDateTime(firstPoint.x));
+        }
+        return escapeTooltipHtml(stripTooltipHtml(plotDiv && plotDiv._fullLayout && plotDiv._fullLayout.title ? plotDiv._fullLayout.title.text : 'Details') || 'Details');
+    }
+    function buildPlotlyTooltipRow(point, plotDiv) {
+        const traceName = stripTooltipHtml(point && point.fullData ? point.fullData.name : (point && point.data ? point.data.name : ''));
+        const isBubblePoint = point && point.customdata && Array.isArray(point.customdata) && point.customdata.length >= 3;
+        const isPiePoint = point && point.fullData && point.fullData.type === 'pie';
+        const isHeatmapPoint = point && point.fullData && point.fullData.type === 'heatmap';
+        const isCentroidPoint = /centroid/i.test(traceName);
+        const chartTitle = stripTooltipHtml(plotDiv && plotDiv._fullLayout && plotDiv._fullLayout.title ? plotDiv._fullLayout.title.text : '');
+        let name = traceName && !/^trace\s+\d+$/i.test(traceName) ? traceName : 'Value';
+        let value = '';
+        if (isPiePoint) {
+            name = point.label || name;
+            const percentValue = typeof point.percent === 'number' ? '  ' + formatTooltipNumber(point.percent * 100) + '%' : '';
+            value = formatTooltipNumber(point.value, 0) + percentValue;
+        } else if (isBubblePoint && traceName !== 'Price') {
+            name = (point.customdata[0] + ' ' + name).trim();
+            value = formatTooltipMoney(point.customdata[1]) + '  ' + formatTooltipNumber(point.customdata[2]);
+        } else if (isHeatmapPoint) {
+            name = name === 'Value' ? 'Exposure' : name;
+            value = point.customdata != null ? formatTooltipNumber(point.customdata) : formatTooltipNumber(point.z);
+        } else if (isCentroidPoint) {
+            const centroidValue = formatTooltipMoney(point.y);
+            const volumeValue = point.customdata != null ? 'Vol ' + formatTooltipNumber(point.customdata, 0) : '';
+            value = volumeValue ? centroidValue + '  ' + volumeValue : centroidValue;
+        } else if (/price/i.test(name)) {
+            value = formatTooltipMoney(point.y != null ? point.y : point.x);
+        } else {
+            let rawValue = point && point.fullData && point.fullData.orientation === 'h' ? point.x : point.y;
+            if (traceName === 'Put' && typeof rawValue === 'number') rawValue = Math.abs(rawValue);
+            if (typeof rawValue === 'number') {
+                value = /premium/i.test(chartTitle) ? formatTooltipMoney(rawValue) : formatTooltipNumber(rawValue);
+            } else if (point && point.text != null && String(point.text).trim() !== '') {
+                value = String(point.text);
+            } else {
+                value = String(rawValue == null ? '' : rawValue);
+            }
+        }
+        return '<div class="tt-row"><span class="tt-dot" style="background:' + escapeTooltipHtml(resolvePlotlyPointColor(point)) + '"></span><div class="tt-main"><span class="tt-name">' + escapeTooltipHtml(name) + '</span><span class="tt-value">' + escapeTooltipHtml(value) + '</span></div></div>';
+    }
+    function ensurePlotlyTooltip() {
+        const plotDiv = document.getElementById('popout-plot');
+        if (!plotDiv) return null;
+        let tooltip = plotDiv.querySelector('.chart-hover-tooltip');
+        if (!tooltip) {
+            tooltip = document.createElement('div');
+            tooltip.className = 'chart-hover-tooltip';
+            plotDiv.appendChild(tooltip);
+        }
+        return tooltip;
+    }
+    function hidePlotlyTooltip() {
+        const plotDiv = document.getElementById('popout-plot');
+        const tooltip = plotDiv ? plotDiv.querySelector('.chart-hover-tooltip') : null;
+        if (tooltip) tooltip.style.display = 'none';
+    }
+    function positionPlotlyTooltip(tooltip, event) {
+        const plotDiv = document.getElementById('popout-plot');
+        if (!plotDiv || !tooltip || !event) return;
+        const bounds = plotDiv.getBoundingClientRect();
+        const left = Math.min(Math.max(8, event.clientX - bounds.left + 12), Math.max(8, bounds.width - tooltip.offsetWidth - 8));
+        const top = Math.min(Math.max(8, event.clientY - bounds.top + 12), Math.max(8, bounds.height - tooltip.offsetHeight - 8));
+        tooltip.style.left = left + 'px';
+        tooltip.style.top = top + 'px';
+    }
+    function attachPlotlyCustomTooltip() {
+        const plotDiv = document.getElementById('popout-plot');
+        if (!plotDiv || plotDiv.__customTooltipBound || typeof plotDiv.on !== 'function') return;
+        plotDiv.__customTooltipBound = true;
+        plotDiv.on('plotly_hover', function(eventData) {
+            const tooltip = ensurePlotlyTooltip();
+            const hoverPoints = Array.isArray(eventData && eventData.points) ? eventData.points : [];
+            if (!tooltip || !hoverPoints.length) {
+                hidePlotlyTooltip();
+                return;
+            }
+            const topPoints = hoverPoints.slice(0, 5);
+            tooltip.innerHTML = '<div class="tt-head"><div class="tt-time">' + buildPlotlyTooltipContext(hoverPoints, plotDiv) + '</div></div><div class="tt-list">' + topPoints.map(function(point) { return buildPlotlyTooltipRow(point, plotDiv); }).join('') + '</div>' + (hoverPoints.length > topPoints.length ? '<div class="tt-more">+' + (hoverPoints.length - topPoints.length) + ' more</div>' : '');
+            tooltip.style.display = 'block';
+            positionPlotlyTooltip(tooltip, eventData && eventData.event);
+        });
+        plotDiv.on('plotly_unhover', hidePlotlyTooltip);
+        plotDiv.on('plotly_relayout', hidePlotlyTooltip);
+        plotDiv.addEventListener('mouseleave', hidePlotlyTooltip);
+    }
     window.updatePopoutChart = function(chartDataJSON, isHtml, themePayload) {
         if (themePayload) {
             applyPopoutTheme(themePayload);
@@ -8189,11 +8809,39 @@ def index():
         Plotly.newPlot('popout-plot', chartData.data, chartData.layout, config);
         plotInited = true;
       }
+            setTimeout(attachPlotlyCustomTooltip, 0);
+      updatePopoutHeatmapTextSize();
     } catch(e) { console.error('Popout chart error:', e); }
   };
+  function updatePopoutHeatmapTextSize() {
+    const div = document.getElementById('popout-plot');
+    if (!div || !div._fullLayout) return;
+    const fl = div._fullLayout;
+    if (!fl.annotations || fl.annotations.length === 0) return;
+    const cellAnnotIdxs = [];
+    fl.annotations.forEach((a, i) => {
+      if (a.xref === 'x' && a.yref === 'y' && !a.showarrow) cellAnnotIdxs.push(i);
+    });
+    if (cellAnnotIdxs.length === 0) return;
+    const trace = div._fullData && div._fullData[0];
+    const ncols = (trace && trace.x) ? trace.x.length : 1;
+    const nrows = (trace && trace.y) ? trace.y.length : 1;
+    const plotW = (fl.width  || div.offsetWidth)  - (fl.margin.l + fl.margin.r);
+    const plotH = (fl.height || div.offsetHeight) - (fl.margin.t + fl.margin.b);
+    const cellW = plotW / Math.max(1, ncols);
+    const cellH = plotH / Math.max(1, nrows);
+    const newSize = Math.max(6, Math.min(20, Math.floor(Math.min(cellW, cellH) * 0.38)));
+    if (fl.annotations[cellAnnotIdxs[0]].font && fl.annotations[cellAnnotIdxs[0]].font.size === newSize) return;
+    const relayoutUpdate = {};
+    cellAnnotIdxs.forEach(i => { relayoutUpdate['annotations[' + i + '].font.size'] = newSize; });
+    try { Plotly.relayout(div, relayoutUpdate); } catch(e) {}
+  }
   window.addEventListener('resize', function() {
     const el = document.getElementById('popout-plot');
-    if (el && el.querySelector('.js-plotly-plot')) { try { Plotly.Plots.resize(el); } catch(e) {} }
+    if (el && el.querySelector('.js-plotly-plot')) {
+      try { Plotly.Plots.resize(el); } catch(e) {}
+      setTimeout(updatePopoutHeatmapTextSize, 80);
+    }
   });
 <\\/script></body></html>`);
             }
@@ -8351,8 +8999,468 @@ def index():
         });
         document.getElementById('coloring_mode').addEventListener('change', updateData);
         document.getElementById('exposure_metric').addEventListener('change', updateData);
+        document.getElementById('heatmap_type').addEventListener('change', updateHeatmapOnly);
+        document.getElementById('heatmap_coloring_mode').addEventListener('change', updateHeatmapOnly);
         document.getElementById('levels_count').addEventListener('input', updateData);
         document.getElementById('abs_gex_opacity').addEventListener('input', updateData);
+
+        function getSelectedExpiryValues() {
+            return Array.from(document.querySelectorAll('.expiry-option input[type="checkbox"]:checked')).map(checkbox => checkbox.value);
+        }
+
+        function escapeTooltipHtml(value) {
+            return String(value == null ? '' : value)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#39;');
+        }
+
+        function stripTooltipHtml(value) {
+            return String(value == null ? '' : value).replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+        }
+
+        function formatTooltipNumber(value, maxFractionDigits = 2) {
+            const numericValue = Number(value);
+            if (!Number.isFinite(numericValue)) return String(value == null ? '' : value);
+            const fractionDigits = Number.isInteger(numericValue) ? 0 : maxFractionDigits;
+            return numericValue.toLocaleString('en-US', {
+                minimumFractionDigits: 0,
+                maximumFractionDigits: fractionDigits,
+            });
+        }
+
+        function formatTooltipMoney(value) {
+            const numericValue = Number(value);
+            if (!Number.isFinite(numericValue)) return String(value == null ? '' : value);
+            return `$${numericValue.toLocaleString('en-US', {
+                minimumFractionDigits: 2,
+                maximumFractionDigits: 2,
+            })}`;
+        }
+
+        function formatTooltipDateTime(value) {
+            if (value == null || value === '') return '';
+            if (typeof value === 'string' && /^\d{2}:\d{2}(:\d{2})?(\s*[A-Z]{2,4})?$/.test(value.trim())) {
+                return value;
+            }
+            const parsedDate = value instanceof Date ? value : new Date(value);
+            if (!Number.isFinite(parsedDate.getTime())) return String(value);
+            const sameDay = parsedDate.toDateString() === new Date().toDateString();
+            return parsedDate.toLocaleString('en-US', sameDay ? {
+                hour: '2-digit',
+                minute: '2-digit',
+            } : {
+                month: 'short',
+                day: 'numeric',
+                hour: '2-digit',
+                minute: '2-digit',
+            });
+        }
+
+        function parseTooltipColor(colorValue) {
+            if (typeof colorValue !== 'string') return null;
+            const color = colorValue.trim();
+            if (color.startsWith('#')) {
+                const hex = color.slice(1);
+                if (hex.length === 3) {
+                    return {
+                        r: parseInt(hex[0] + hex[0], 16),
+                        g: parseInt(hex[1] + hex[1], 16),
+                        b: parseInt(hex[2] + hex[2], 16),
+                    };
+                }
+                if (hex.length === 6) {
+                    return {
+                        r: parseInt(hex.slice(0, 2), 16),
+                        g: parseInt(hex.slice(2, 4), 16),
+                        b: parseInt(hex.slice(4, 6), 16),
+                    };
+                }
+            }
+            const rgbMatch = color.match(/rgba?\(([^)]+)\)/i);
+            if (!rgbMatch) return null;
+            const parts = rgbMatch[1].split(',').map(part => Number.parseFloat(part.trim()));
+            if (parts.length < 3 || parts.some(part => !Number.isFinite(part))) return null;
+            return { r: parts[0], g: parts[1], b: parts[2] };
+        }
+
+        function formatTooltipRgb(color) {
+            const clamp = value => Math.max(0, Math.min(255, Math.round(value)));
+            return `rgb(${clamp(color.r)}, ${clamp(color.g)}, ${clamp(color.b)})`;
+        }
+
+        function interpolateTooltipColor(leftColor, rightColor, ratio) {
+            const clampedRatio = Math.max(0, Math.min(1, ratio));
+            return formatTooltipRgb({
+                r: leftColor.r + ((rightColor.r - leftColor.r) * clampedRatio),
+                g: leftColor.g + ((rightColor.g - leftColor.g) * clampedRatio),
+                b: leftColor.b + ((rightColor.b - leftColor.b) * clampedRatio),
+            });
+        }
+
+        function resolveHeatmapPointColor(point) {
+            const colorscale = point?.fullData?.colorscale;
+            if (!Array.isArray(colorscale) || !colorscale.length) return null;
+
+            const zValue = Number(point?.z);
+            const zMin = Number(point?.fullData?.zmin);
+            const zMax = Number(point?.fullData?.zmax);
+            if (!Number.isFinite(zValue) || !Number.isFinite(zMin) || !Number.isFinite(zMax) || zMax === zMin) {
+                return null;
+            }
+
+            const normalizedValue = Math.max(0, Math.min(1, (zValue - zMin) / (zMax - zMin)));
+            const normalizedScale = colorscale
+                .map(stop => ({
+                    offset: Array.isArray(stop) ? Number(stop[0]) : Number(stop?.offset),
+                    color: parseTooltipColor(Array.isArray(stop) ? stop[1] : stop?.color),
+                }))
+                .filter(stop => Number.isFinite(stop.offset) && stop.color)
+                .sort((left, right) => left.offset - right.offset);
+
+            if (!normalizedScale.length) return null;
+            if (normalizedValue <= normalizedScale[0].offset) {
+                return formatTooltipRgb(normalizedScale[0].color);
+            }
+            for (let index = 1; index < normalizedScale.length; index += 1) {
+                const leftStop = normalizedScale[index - 1];
+                const rightStop = normalizedScale[index];
+                if (normalizedValue <= rightStop.offset) {
+                    const span = rightStop.offset - leftStop.offset || 1;
+                    return interpolateTooltipColor(leftStop.color, rightStop.color, (normalizedValue - leftStop.offset) / span);
+                }
+            }
+            return formatTooltipRgb(normalizedScale[normalizedScale.length - 1].color);
+        }
+
+        function resolvePlotlyPointColor(point) {
+            if (point?.fullData?.type === 'heatmap') {
+                const heatmapColor = resolveHeatmapPointColor(point);
+                if (heatmapColor) return heatmapColor;
+            }
+            const marker = point?.fullData?.marker;
+            if (marker && marker.color != null) {
+                const markerColor = Array.isArray(marker.color) ? marker.color[point.pointNumber] : marker.color;
+                if (typeof markerColor === 'string') return markerColor;
+            }
+            if (marker && marker.colors != null) {
+                const markerColors = Array.isArray(marker.colors) ? marker.colors[point.pointNumber] : marker.colors;
+                if (typeof markerColors === 'string') return markerColors;
+            }
+            const lineColor = point?.fullData?.line?.color;
+            if (typeof lineColor === 'string') return lineColor;
+            return getThemeValue('--accent-color', '#5ab0ff');
+        }
+
+        function buildPlotlyTooltipContext(points, plotDiv) {
+            const firstPoint = points[0] || {};
+            if (firstPoint?.fullData?.type === 'pie') {
+                const titleText = stripTooltipHtml(plotDiv?._fullLayout?.title?.text || 'Breakdown');
+                return escapeTooltipHtml(titleText || 'Breakdown');
+            }
+            if (firstPoint?.fullData?.type === 'heatmap') {
+                return `Exp ${escapeTooltipHtml(firstPoint.x)} • Strike ${escapeTooltipHtml(formatTooltipMoney(firstPoint.y))}`;
+            }
+            if (firstPoint?.fullData?.orientation === 'h') {
+                return `Strike ${escapeTooltipHtml(formatTooltipMoney(firstPoint.y))}`;
+            }
+            if (firstPoint?.customdata && Array.isArray(firstPoint.customdata) && firstPoint.customdata.length >= 3) {
+                return escapeTooltipHtml(formatTooltipDateTime(firstPoint.x));
+            }
+            if (firstPoint?.x != null) {
+                if (typeof firstPoint.x === 'number') {
+                    return `Strike ${escapeTooltipHtml(formatTooltipMoney(firstPoint.x))}`;
+                }
+                return escapeTooltipHtml(formatTooltipDateTime(firstPoint.x));
+            }
+            const titleText = stripTooltipHtml(plotDiv?._fullLayout?.title?.text || 'Details');
+            return escapeTooltipHtml(titleText || 'Details');
+        }
+
+        function buildPlotlyTooltipRow(point, plotDiv) {
+            const traceName = stripTooltipHtml(point?.fullData?.name || point?.data?.name || '');
+            const isBubblePoint = point?.customdata && Array.isArray(point.customdata) && point.customdata.length >= 3;
+            const isPiePoint = point?.fullData?.type === 'pie';
+            const isHeatmapPoint = point?.fullData?.type === 'heatmap';
+            const isCentroidPoint = /centroid/i.test(traceName);
+            const chartTitle = stripTooltipHtml(plotDiv?._fullLayout?.title?.text || '');
+            let name = traceName && !/^trace\s+\d+$/i.test(traceName) ? traceName : 'Value';
+            let value = '';
+
+            if (isPiePoint) {
+                name = point.label || name;
+                const percentValue = typeof point.percent === 'number'
+                    ? `  ${formatTooltipNumber(point.percent * 100)}%`
+                    : '';
+                value = `${formatTooltipNumber(point.value, 0)}${percentValue}`;
+            } else if (isBubblePoint && traceName !== 'Price') {
+                name = `${point.customdata[0]} ${name}`.trim();
+                value = `${formatTooltipMoney(point.customdata[1])}  ${formatTooltipNumber(point.customdata[2])}`;
+            } else if (isHeatmapPoint) {
+                name = name === 'Value' ? 'Exposure' : name;
+                value = point.customdata != null ? formatTooltipNumber(point.customdata) : formatTooltipNumber(point.z);
+            } else if (isCentroidPoint) {
+                const centroidValue = formatTooltipMoney(point.y);
+                const volumeValue = point.customdata != null ? `Vol ${formatTooltipNumber(point.customdata, 0)}` : '';
+                value = volumeValue ? `${centroidValue}  ${volumeValue}` : centroidValue;
+            } else if (/price/i.test(name)) {
+                value = formatTooltipMoney(point.y != null ? point.y : point.x);
+            } else {
+                let rawValue = point?.fullData?.orientation === 'h' ? point.x : point.y;
+                if (traceName === 'Put' && typeof rawValue === 'number') {
+                    rawValue = Math.abs(rawValue);
+                }
+                if (typeof rawValue === 'number') {
+                    value = /premium/i.test(chartTitle) ? formatTooltipMoney(rawValue) : formatTooltipNumber(rawValue);
+                } else if (point?.text != null && String(point.text).trim() !== '') {
+                    value = String(point.text);
+                } else {
+                    value = String(rawValue == null ? '' : rawValue);
+                }
+            }
+
+            return '<div class="tt-row">'
+                + `<span class="tt-dot" style="background:${escapeTooltipHtml(resolvePlotlyPointColor(point))}"></span>`
+                + '<div class="tt-main">'
+                + `<span class="tt-name">${escapeTooltipHtml(name)}</span>`
+                + `<span class="tt-value">${escapeTooltipHtml(value)}</span>`
+                + '</div>'
+                + '</div>';
+        }
+
+        function ensurePlotlyTooltip(plotDiv) {
+            if (!plotDiv) return null;
+            let tooltip = plotDiv.querySelector('.chart-hover-tooltip');
+            if (!tooltip) {
+                tooltip = document.createElement('div');
+                tooltip.className = 'chart-hover-tooltip';
+                plotDiv.appendChild(tooltip);
+            }
+            return tooltip;
+        }
+
+        function hidePlotlyTooltip(plotDiv) {
+            const tooltip = plotDiv?.querySelector('.chart-hover-tooltip');
+            if (tooltip) {
+                tooltip.style.display = 'none';
+            }
+        }
+
+        function positionPlotlyTooltip(plotDiv, tooltip, event) {
+            if (!plotDiv || !tooltip || !event) return;
+            const bounds = plotDiv.getBoundingClientRect();
+            const left = Math.min(
+                Math.max(8, event.clientX - bounds.left + 12),
+                Math.max(8, bounds.width - tooltip.offsetWidth - 8)
+            );
+            const top = Math.min(
+                Math.max(8, event.clientY - bounds.top + 12),
+                Math.max(8, bounds.height - tooltip.offsetHeight - 8)
+            );
+            tooltip.style.left = `${left}px`;
+            tooltip.style.top = `${top}px`;
+        }
+
+        function attachPlotlyCustomTooltip(plotDiv) {
+            if (!plotDiv || plotDiv.__customTooltipBound || typeof plotDiv.on !== 'function') {
+                return;
+            }
+
+            plotDiv.__customTooltipBound = true;
+            plotDiv.on('plotly_hover', eventData => {
+                const tooltip = ensurePlotlyTooltip(plotDiv);
+                const hoverPoints = Array.isArray(eventData?.points) ? eventData.points : [];
+                if (!tooltip || !hoverPoints.length) {
+                    hidePlotlyTooltip(plotDiv);
+                    return;
+                }
+
+                const topPoints = hoverPoints.slice(0, 5);
+                tooltip.innerHTML = '<div class="tt-head"><div class="tt-time">'
+                    + buildPlotlyTooltipContext(hoverPoints, plotDiv) + '</div></div><div class="tt-list">'
+                    + topPoints.map(point => buildPlotlyTooltipRow(point, plotDiv)).join('') + '</div>'
+                    + (hoverPoints.length > topPoints.length
+                        ? `<div class="tt-more">+${hoverPoints.length - topPoints.length} more</div>`
+                        : '');
+
+                tooltip.style.display = 'block';
+                positionPlotlyTooltip(plotDiv, tooltip, eventData?.event);
+            });
+
+            plotDiv.on('plotly_unhover', () => hidePlotlyTooltip(plotDiv));
+            plotDiv.on('plotly_relayout', () => hidePlotlyTooltip(plotDiv));
+            plotDiv.addEventListener('mouseleave', () => hidePlotlyTooltip(plotDiv));
+        }
+
+        function renderPlotlyChart(key, rawChartData) {
+            const containerId = `${key}-chart`;
+            const container = document.getElementById(containerId);
+            if (!container || !rawChartData) {
+                return false;
+            }
+
+            const chartData = typeof rawChartData === 'string' ? JSON.parse(rawChartData) : rawChartData;
+            const baseMargins = chartData.layout.margin || {l: 44, r: 28, t: 44, b: 28};
+
+            chartData.layout.autosize = true;
+            chartData.layout.width = null;
+            chartData.layout.height = null;
+            chartData.layout.margin = getChartMargins(containerId, baseMargins);
+
+            if (chartData.layout.xaxis) {
+                chartData.layout.xaxis.autorange = true;
+            }
+            if (chartData.layout.yaxis) {
+                chartData.layout.yaxis.autorange = true;
+            }
+            applyThemeToPlotlyLayout(chartData.layout);
+
+            const config = {
+                responsive: true,
+                displayModeBar: true,
+                modeBarButtonsToRemove: ['lasso2d', 'select2d'],
+                displaylogo: false,
+                scrollZoom: true
+            };
+
+            let plotPromise;
+            if (charts[key]) {
+                plotPromise = Plotly.react(containerId, chartData.data, chartData.layout, config);
+            } else {
+                plotPromise = Plotly.newPlot(containerId, chartData.data, chartData.layout, config);
+                charts[key] = plotPromise;
+            }
+
+            Promise.resolve(plotPromise).then(() => attachPlotlyCustomTooltip(container));
+
+            if (key === 'heatmap') {
+                updateHeatmapTextSize(containerId);
+                attachHeatmapResizeObserver(containerId);
+            }
+
+            addFullscreenButton(container);
+            addPopoutButton(container);
+            return true;
+        }
+
+        let _heatmapResizeObserver = null;
+
+        function attachHeatmapResizeObserver(containerId) {
+            if (_heatmapResizeObserver) {
+                _heatmapResizeObserver.disconnect();
+            }
+            const el = document.getElementById(containerId);
+            if (!el || typeof ResizeObserver === 'undefined') return;
+            let _heatmapResizeTimer = null;
+            _heatmapResizeObserver = new ResizeObserver(() => {
+                clearTimeout(_heatmapResizeTimer);
+                _heatmapResizeTimer = setTimeout(() => updateHeatmapTextSize(containerId), 120);
+            });
+            _heatmapResizeObserver.observe(el);
+        }
+
+        function updateHeatmapTextSize(containerId) {
+            const div = document.getElementById(containerId);
+            if (!div || !div._fullLayout) return;
+            const fl = div._fullLayout;
+            if (!fl.annotations || fl.annotations.length === 0) return;
+            // Count heatmap cell annotations (xref='x', yref='y', no arrow)
+            const cellAnnotIdxs = [];
+            fl.annotations.forEach((a, i) => {
+                if (a.xref === 'x' && a.yref === 'y' && !a.showarrow) cellAnnotIdxs.push(i);
+            });
+            if (cellAnnotIdxs.length === 0) return;
+            // Determine grid dims from heatmap trace
+            const trace = div._fullData && div._fullData[0];
+            const ncols = (trace && trace.x) ? trace.x.length : 1;
+            const nrows = (trace && trace.y) ? trace.y.length : 1;
+            const plotW = (fl.width  || div.offsetWidth)  - (fl.margin.l + fl.margin.r);
+            const plotH = (fl.height || div.offsetHeight) - (fl.margin.t + fl.margin.b);
+            const cellW = plotW / Math.max(1, ncols);
+            const cellH = plotH / Math.max(1, nrows);
+            const newSize = Math.max(6, Math.min(20, Math.floor(Math.min(cellW, cellH) * 0.38)));
+            if (fl.annotations[cellAnnotIdxs[0]].font && fl.annotations[cellAnnotIdxs[0]].font.size === newSize) return;
+            const relayoutUpdate = {};
+            cellAnnotIdxs.forEach(i => { relayoutUpdate[`annotations[${i}].font.size`] = newSize; });
+            try { Plotly.relayout(div, relayoutUpdate); } catch(e) {}
+        }
+
+        function updateHeatmapOnly() {
+            let fallbackToFullUpdate = false;
+
+            if (!document.getElementById('heatmap').checked) {
+                return;
+            }
+
+            if (updateInProgress) {
+                pendingHeatmapOnlyUpdate = true;
+                return;
+            }
+
+            const expiry = getSelectedExpiryValues();
+            if (expiry.length === 0) {
+                return;
+            }
+
+            updateInProgress = true;
+            pendingHeatmapOnlyUpdate = false;
+
+            fetch('/update_heatmap', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    ticker: document.getElementById('ticker').value,
+                    expiry,
+                    show_calls: document.getElementById('show_calls').checked,
+                    show_puts: document.getElementById('show_puts').checked,
+                    show_net: document.getElementById('show_net').checked,
+                    strike_range: parseFloat(document.getElementById('strike_range').value) / 100,
+                    call_color: callColor,
+                    put_color: putColor,
+                    heatmap_type: document.getElementById('heatmap_type').value,
+                    heatmap_coloring_mode: document.getElementById('heatmap_coloring_mode').value,
+                })
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.error || !data.heatmap) {
+                    console.warn('Heatmap-only update fell back to full update:', data.error || 'missing heatmap payload');
+                    fallbackToFullUpdate = true;
+                    return;
+                }
+
+                lastData = {
+                    ...lastData,
+                    heatmap: data.heatmap,
+                    selected_expiries: data.selected_expiries || lastData.selected_expiries,
+                };
+
+                if (!renderPlotlyChart('heatmap', data.heatmap)) {
+                    updateCharts(lastData);
+                } else {
+                    pushAllPopouts();
+                }
+            })
+            .catch(error => {
+                console.error('Heatmap-only update failed:', error);
+                fallbackToFullUpdate = true;
+            })
+            .finally(() => {
+                updateInProgress = false;
+                if (fallbackToFullUpdate) {
+                    updateData();
+                    return;
+                }
+                if (pendingHeatmapOnlyUpdate) {
+                    pendingHeatmapOnlyUpdate = false;
+                    updateHeatmapOnly();
+                }
+            });
+        }
 
         // Levels dropdown handlers
         function updateLevelsDisplay() {
@@ -8408,8 +9516,7 @@ def index():
             }
             tvLastTicker = ticker;
 
-            const selectedCheckboxes = document.querySelectorAll('.expiry-option input[type="checkbox"]:checked');
-            const expiry = Array.from(selectedCheckboxes).map(checkbox => checkbox.value);
+            const expiry = getSelectedExpiryValues();
             
             // Ensure at least one expiry is selected
             if (expiry.length === 0) {
@@ -8429,6 +9536,8 @@ def index():
             const absGexOpacity = parseInt(document.getElementById('abs_gex_opacity').value) / 100;
             const useRange = document.getElementById('use_range').checked;
             const exposureMetric = document.getElementById('exposure_metric').value;
+            const heatmapType = document.getElementById('heatmap_type').value;
+            const heatmapColoringMode = document.getElementById('heatmap_coloring_mode').value;
             const deltaAdjusted = document.getElementById('delta_adjusted_exposures').checked;
             const calculateInNotional = document.getElementById('calculate_in_notional').checked;
             const strikeRange = parseFloat(document.getElementById('strike_range').value) / 100;
@@ -8439,6 +9548,7 @@ def index():
             const visibleCharts = {
                 show_price: document.getElementById('price').checked,
                 show_gamma: document.getElementById('gamma').checked,
+                show_heatmap: document.getElementById('heatmap').checked,
                 show_delta: document.getElementById('delta').checked,
                 show_vanna: document.getElementById('vanna').checked,
                 show_charm: document.getElementById('charm').checked,
@@ -8495,6 +9605,8 @@ def index():
                     abs_gex_opacity: absGexOpacity,
                     use_range: useRange,
                     exposure_metric: exposureMetric,
+                    heatmap_type: heatmapType,
+                    heatmap_coloring_mode: heatmapColoringMode,
                     delta_adjusted: deltaAdjusted,
                     calculate_in_notional: calculateInNotional,
                     strike_range: strikeRange,
@@ -8541,6 +9653,10 @@ def index():
             })
             .finally(() => {
                 updateInProgress = false;
+                if (pendingHeatmapOnlyUpdate) {
+                    pendingHeatmapOnlyUpdate = false;
+                    updateHeatmapOnly();
+                }
             });
         }
 
@@ -9985,6 +11101,7 @@ def index():
             const selectedCharts = {
                 price: document.getElementById('price').checked,
                 gamma: document.getElementById('gamma').checked,
+                heatmap: document.getElementById('heatmap').checked,
                 delta: document.getElementById('delta').checked,
                 vanna: document.getElementById('vanna').checked,
                 charm: document.getElementById('charm').checked,
@@ -10140,37 +11257,7 @@ def index():
                                 container.innerHTML = data[key];
                             }
                         } else {
-                            const chartData = JSON.parse(data[key]);
-                            const baseMargins = chartData.layout.margin || {l: 44, r: 28, t: 44, b: 28};
-                            
-                            // Configure chart sizing to fill container
-                            chartData.layout.autosize = true;
-                            chartData.layout.width = null;
-                            chartData.layout.height = null;
-                            chartData.layout.margin = getChartMargins(`${key}-chart`, baseMargins);
-                            
-                            // Ensure axes auto-scale with new data
-                            if (chartData.layout.xaxis) {
-                                chartData.layout.xaxis.autorange = true;
-                            }
-                            if (chartData.layout.yaxis) {
-                                chartData.layout.yaxis.autorange = true;
-                            }
-                            applyThemeToPlotlyLayout(chartData.layout);
-                            
-                            const config = {
-                                responsive: true,
-                                displayModeBar: true,
-                                modeBarButtonsToRemove: ['lasso2d', 'select2d'],
-                                displaylogo: false,
-                                scrollZoom: true
-                            };
-                            
-                            if (charts[key]) {
-                                Plotly.react(`${key}-chart`, chartData.data, chartData.layout, config);
-                            } else {
-                                charts[key] = Plotly.newPlot(`${key}-chart`, chartData.data, chartData.layout, config);
-                            }
+                            renderPlotlyChart(key, data[key]);
                         }
                     } catch (error) {
                         console.error(`Error rendering ${key} chart:`, error);
@@ -10551,6 +11638,8 @@ def index():
                 timeframe: document.getElementById('timeframe').value,
                 strike_range: document.getElementById('strike_range').value,
                 exposure_metric: document.getElementById('exposure_metric').value,
+                heatmap_type: document.getElementById('heatmap_type').value,
+                heatmap_coloring_mode: document.getElementById('heatmap_coloring_mode').value,
                 delta_adjusted_exposures: document.getElementById('delta_adjusted_exposures').checked,
                 calculate_in_notional: document.getElementById('calculate_in_notional').checked,
                 show_calls: document.getElementById('show_calls').checked,
@@ -10574,6 +11663,7 @@ def index():
                 charts: {
                     price: document.getElementById('price').checked,
                     gamma: document.getElementById('gamma').checked,
+                    heatmap: document.getElementById('heatmap').checked,
                     delta: document.getElementById('delta').checked,
                     vanna: document.getElementById('vanna').checked,
                     charm: document.getElementById('charm').checked,
@@ -10599,6 +11689,8 @@ def index():
                 document.getElementById('strike_range_value').textContent = settings.strike_range + '%';
             }
             if (settings.exposure_metric) document.getElementById('exposure_metric').value = settings.exposure_metric;
+            if (settings.heatmap_type) document.getElementById('heatmap_type').value = settings.heatmap_type;
+            if (settings.heatmap_coloring_mode) document.getElementById('heatmap_coloring_mode').value = settings.heatmap_coloring_mode;
             if (settings.delta_adjusted_exposures !== undefined) document.getElementById('delta_adjusted_exposures').checked = settings.delta_adjusted_exposures;
             if (settings.calculate_in_notional !== undefined) document.getElementById('calculate_in_notional').checked = settings.calculate_in_notional;
             if (settings.show_calls !== undefined) document.getElementById('show_calls').checked = settings.show_calls;
@@ -10964,6 +12056,8 @@ def update():
         call_color = data.get('call_color', '#00ff00')
         put_color = data.get('put_color', '#ff0000')
         exposure_levels_types = data.get('levels_types', [])
+        heatmap_type = normalize_level_type(data.get('heatmap_type', 'GEX'))
+        heatmap_coloring_mode = data.get('heatmap_coloring_mode', 'Global')
         exposure_levels_count = int(data.get('levels_count', 3))
         use_heikin_ashi = data.get('use_heikin_ashi', False)
         horizontal = data.get('horizontal_bars', False)
@@ -10981,6 +12075,22 @@ def update():
 
         if data.get('show_gamma', True):
             response['gamma'] = create_exposure_chart(calls, puts, "GEX", "Gamma Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, coloring_mode, call_color, put_color, expiry_dates, horizontal, show_abs_gex_area=show_abs_gex, abs_gex_opacity=abs_gex_opacity, highlight_max_level=highlight_max_level, max_level_color=max_level_color, max_level_mode=max_level_mode)
+
+        if data.get('show_heatmap', False):
+            response['heatmap'] = create_exposure_heatmap(
+                calls,
+                puts,
+                S,
+                strike_range,
+                show_calls,
+                show_puts,
+                show_net,
+                call_color,
+                put_color,
+                expiry_dates,
+                heatmap_type=heatmap_type,
+                heatmap_coloring_mode=heatmap_coloring_mode,
+            )
         
         if data.get('show_delta', True):
             response['delta'] = create_exposure_chart(calls, puts, "DEX", "Delta Exposure by Strike", S, strike_range, show_calls, show_puts, show_net, coloring_mode, call_color, put_color, expiry_dates, horizontal, highlight_max_level=highlight_max_level, max_level_color=max_level_color, max_level_mode=max_level_mode)
@@ -11128,6 +12238,54 @@ def update():
         
         return jsonify(response)
         
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/update_heatmap', methods=['POST'])
+def update_heatmap():
+    data = request.get_json()
+    ticker = format_ticker(data.get('ticker'))
+    expiry = data.get('expiry')
+
+    if not ticker or not expiry:
+        return jsonify({'error': 'Missing ticker or expiry'}), 400
+
+    if isinstance(expiry, list):
+        expiry_dates = expiry
+    else:
+        expiry_dates = [expiry]
+
+    try:
+        expiry_key = build_expiry_selection_key(expiry_dates)
+        cached = _options_cache.get((ticker, expiry_key), {})
+        calls = cached.get('calls')
+        puts = cached.get('puts')
+        S = cached.get('S')
+
+        if calls is None or puts is None or S is None:
+            return jsonify({'error': 'Heatmap cache not ready'}), 409
+
+        heatmap = create_exposure_heatmap(
+            calls,
+            puts,
+            S,
+            float(data.get('strike_range', 0.1)),
+            data.get('show_calls', True),
+            data.get('show_puts', True),
+            data.get('show_net', True),
+            data.get('call_color', '#00ff00'),
+            data.get('put_color', '#ff0000'),
+            expiry_dates,
+            heatmap_type=normalize_level_type(data.get('heatmap_type', 'GEX')),
+            heatmap_coloring_mode=data.get('heatmap_coloring_mode', 'Global'),
+        )
+
+        return jsonify({
+            'heatmap': heatmap,
+            'selected_expiries': expiry_dates,
+        })
     except Exception as e:
         import traceback
         traceback.print_exc()
