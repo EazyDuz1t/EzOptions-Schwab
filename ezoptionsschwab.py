@@ -1993,6 +1993,7 @@ def create_exposure_heatmap(calls, puts, S, strike_range=0.02, show_calls=True, 
         zmin=-colorbar_max,
         zmax=colorbar_max,
         zmid=0,
+        name='Exposure',
         hoverongaps=False,
         showscale=False,
         xgap=2,
@@ -5505,7 +5506,7 @@ def index():
             width: auto !important;
             height: auto !important;
             min-width: 0;
-            max-width: min(240px, calc(100% - 16px));
+            max-width: min(300px, calc(100% - 16px));
             padding: 8px;
             border: 1px solid rgba(255, 255, 255, 0.08);
             border-radius: 10px;
@@ -5578,9 +5579,7 @@ def index():
         .chart-hover-tooltip .tt-name {
             color: #f4f7fb;
             font-weight: 600;
-            min-width: 0;
-            overflow: hidden;
-            text-overflow: ellipsis;
+            flex-shrink: 0;
             white-space: nowrap;
         }
         .tv-historical-tooltip .tt-value,
@@ -5588,7 +5587,11 @@ def index():
             color: #9fb0c4;
             font-variant-numeric: tabular-nums;
             white-space: nowrap;
-            flex: 0 0 auto;
+            flex: 0 1 auto;
+            min-width: 0;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            text-align: right;
         }
         .tv-historical-tooltip .tt-more,
         .chart-hover-tooltip .tt-more {
@@ -8497,21 +8500,22 @@ def index():
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
         :root { --app-bg:#1E1E1E; --panel-bg:#1a1a1a; --panel-bg-alt:#2D2D2D; --chart-bg:#1E1E1E; --border-color:#333; --text-primary:#eef2f7; --text-secondary:#ccc; --text-muted:#888; --accent-color:#800080; --grid-color:#2A2A2A; --tooltip-bg:linear-gradient(180deg, rgba(30, 36, 46, 0.97), rgba(14, 18, 24, 0.99)); --tooltip-border:rgba(255,255,255,0.08); }
-    body { background: var(--app-bg); color: var(--text-secondary); overflow: hidden; position: relative; }
+    body { background: var(--app-bg); color: var(--text-secondary); overflow: hidden; position: relative; font-family: Arial, sans-serif; }
     #popout-logo { position: fixed; top: 6px; left: 10px; z-index: 100; font-family: Arial, sans-serif; font-size: 11px; font-weight: bold; color: var(--accent-color); opacity: 0.7; pointer-events: none; letter-spacing: 0.5px; }
   #popout-plot { width: 100vw; height: 100vh; }
     #popout-html { width: 100vw; height: 100vh; overflow: auto; background: var(--chart-bg); color: var(--text-primary); font-family: Arial, sans-serif; }
-        #popout-plot .hoverlayer { opacity: 0 !important; pointer-events: none !important; }
-        .chart-hover-tooltip { position:absolute; z-index:55; display:none; width:auto !important; height:auto !important; min-width:0; max-width:min(240px,calc(100% - 16px)); padding:8px; border:1px solid var(--tooltip-border); border-radius:10px; background:var(--tooltip-bg); color:var(--text-primary); font-size:10px; line-height:1.25; pointer-events:none; box-shadow:0 14px 36px rgba(0,0,0,0.38); backdrop-filter:blur(10px); overflow:hidden; white-space:normal; }
+        #popout-plot .hoverlayer { opacity: 0 !important; visibility: hidden !important; pointer-events: none !important; }
+        #popout-plot .hoverlayer *, #popout-plot g.hovertext, #popout-plot g.hovertext * { opacity: 0 !important; visibility: hidden !important; pointer-events: none !important; }
+        .chart-hover-tooltip { position:absolute; z-index:55; display:none; width:auto !important; height:auto !important; min-width:0; max-width:min(300px,calc(100% - 16px)); padding:8px; border:1px solid var(--tooltip-border); border-radius:10px; background:var(--tooltip-bg); color:var(--text-primary); font-size:10px; line-height:1.25; font-family:Arial, sans-serif; pointer-events:none; box-shadow:0 14px 36px rgba(0,0,0,0.38); backdrop-filter:blur(10px); overflow:hidden; white-space:normal; }
         .chart-hover-tooltip .tt-head { display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:6px; }
         .chart-hover-tooltip .tt-badge { padding:2px 6px; border-radius:999px; background:rgba(255,255,255,0.08); color:var(--text-secondary); font-size:9px; letter-spacing:0.02em; text-transform:uppercase; }
-        .chart-hover-tooltip .tt-time, .chart-hover-tooltip .tt-value, .chart-hover-tooltip .tt-more { color:var(--text-muted); }
+        .chart-hover-tooltip .tt-time, .chart-hover-tooltip .tt-more { color:var(--text-muted); }
         .chart-hover-tooltip .tt-list { display:grid; gap:4px; }
         .chart-hover-tooltip .tt-row { display:flex; align-items:center; gap:6px; min-width:0; }
         .chart-hover-tooltip .tt-dot { width:7px; height:7px; border-radius:999px; box-shadow:0 0 0 1px rgba(255,255,255,0.12); flex:0 0 auto; }
         .chart-hover-tooltip .tt-main { display:flex; justify-content:space-between; align-items:baseline; gap:8px; min-width:0; width:100%; }
-        .chart-hover-tooltip .tt-name { color:var(--text-primary); font-weight:600; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-        .chart-hover-tooltip .tt-value { font-variant-numeric:tabular-nums; white-space:nowrap; flex:0 0 auto; }
+        .chart-hover-tooltip .tt-name { color:var(--text-primary); font-weight:600; flex-shrink:0; white-space:nowrap; }
+        .chart-hover-tooltip .tt-value { color:var(--text-muted); font-variant-numeric:tabular-nums; white-space:nowrap; flex:0 1 auto; min-width:0; overflow:hidden; text-overflow:ellipsis; text-align:right; }
         .chart-hover-tooltip .tt-more { margin-top:4px; padding-top:4px; border-top:1px solid rgba(255,255,255,0.06); font-size:9px; }
 </style></head><body>
 <div id="popout-logo">EzDuz1t Options</div>
@@ -8541,11 +8545,13 @@ def index():
             layout.legend.bgcolor = panelBgAlt;
             layout.legend.font = Object.assign({}, layout.legend.font || {}, { color: textSecondary });
         }
-        if (layout.hoverlabel) {
-            layout.hoverlabel.bgcolor = panelBgAlt;
-            layout.hoverlabel.bordercolor = borderColor;
-            layout.hoverlabel.font = Object.assign({}, layout.hoverlabel.font || {}, { color: textSecondary });
-        }
+        // Always force hoverlabel to transparent — custom JS cards replace all native hover display
+        layout.hoverlabel = Object.assign({}, layout.hoverlabel || {}, {
+            bgcolor: 'rgba(0,0,0,0)',
+            bordercolor: 'rgba(0,0,0,0)',
+            font: Object.assign({}, (layout.hoverlabel || {}).font || {}, { color: 'rgba(0,0,0,0)', size: 1 }),
+            namelength: 0,
+        });
         ['xaxis', 'yaxis', 'xaxis2', 'yaxis2'].forEach(axisKey => {
             const axis = layout[axisKey];
             if (!axis) return;
@@ -8594,7 +8600,7 @@ def index():
         return String(value == null ? '' : value).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
     }
     function stripTooltipHtml(value) {
-        return String(value == null ? '' : value).replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+        return String(value == null ? '' : value).replace(/<[^>]*>/g, ' ').replace(/\\\\s+/g, ' ').trim();
     }
     function formatTooltipNumber(value, maxFractionDigits) {
         const numericValue = Number(value);
@@ -8609,7 +8615,7 @@ def index():
     }
     function formatTooltipDateTime(value) {
         if (value == null || value === '') return '';
-        if (typeof value === 'string' && /^\d{2}:\d{2}(:\d{2})?(\s*[A-Z]{2,4})?$/.test(value.trim())) return value;
+        if (typeof value === 'string' && /^\\\\d{2}:\\\\d{2}(:\\\\d{2})?(\\\\s*[A-Z]{2,4})?$/.test(value.trim())) return value;
         const parsedDate = value instanceof Date ? value : new Date(value);
         if (!Number.isFinite(parsedDate.getTime())) return String(value);
         const sameDay = parsedDate.toDateString() === new Date().toDateString();
@@ -8623,7 +8629,7 @@ def index():
             if (hex.length === 3) return { r: parseInt(hex[0] + hex[0], 16), g: parseInt(hex[1] + hex[1], 16), b: parseInt(hex[2] + hex[2], 16) };
             if (hex.length === 6) return { r: parseInt(hex.slice(0, 2), 16), g: parseInt(hex.slice(2, 4), 16), b: parseInt(hex.slice(4, 6), 16) };
         }
-        const rgbMatch = color.match(/rgba?\(([^)]+)\)/i);
+        const rgbMatch = color.match(/rgba?\\\\(([^)]+)\\\\)/i);
         if (!rgbMatch) return null;
         const parts = rgbMatch[1].split(',').map(part => Number.parseFloat(part.trim()));
         if (parts.length < 3 || parts.some(part => !Number.isFinite(part))) return null;
@@ -8702,7 +8708,7 @@ def index():
         const isHeatmapPoint = point && point.fullData && point.fullData.type === 'heatmap';
         const isCentroidPoint = /centroid/i.test(traceName);
         const chartTitle = stripTooltipHtml(plotDiv && plotDiv._fullLayout && plotDiv._fullLayout.title ? plotDiv._fullLayout.title.text : '');
-        let name = traceName && !/^trace\s+\d+$/i.test(traceName) ? traceName : 'Value';
+        let name = traceName && !/^trace\\\\s+\\\\d+$/i.test(traceName) ? traceName : 'Value';
         let value = '';
         if (isPiePoint) {
             name = point.label || name;
@@ -8731,7 +8737,7 @@ def index():
                 value = String(rawValue == null ? '' : rawValue);
             }
         }
-        return '<div class="tt-row"><span class="tt-dot" style="background:' + escapeTooltipHtml(resolvePlotlyPointColor(point)) + '"></span><div class="tt-main"><span class="tt-name">' + escapeTooltipHtml(name) + '</span><span class="tt-value">' + escapeTooltipHtml(value) + '</span></div></div>';
+        return '<div class="tt-row"><span class="tt-dot" style="background:' + escapeTooltipHtml(resolvePlotlyPointColor(point)) + '"></span><div class="tt-main"><span class="tt-name">' + escapeTooltipHtml(name) + ':</span><span class="tt-value">' + escapeTooltipHtml(value) + '</span></div></div>';
     }
     function ensurePlotlyTooltip() {
         const plotDiv = document.getElementById('popout-plot');
@@ -8749,6 +8755,15 @@ def index():
         const tooltip = plotDiv ? plotDiv.querySelector('.chart-hover-tooltip') : null;
         if (tooltip) tooltip.style.display = 'none';
     }
+    function hideNativePlotlyHover() {
+        const plotDiv = document.getElementById('popout-plot');
+        if (!plotDiv) return;
+        plotDiv.querySelectorAll('.hoverlayer').forEach(function(layer) {
+            layer.style.opacity = '0';
+            layer.style.pointerEvents = 'none';
+            layer.style.display = 'none';
+        });
+    }
     function positionPlotlyTooltip(tooltip, event) {
         const plotDiv = document.getElementById('popout-plot');
         if (!plotDiv || !tooltip || !event) return;
@@ -8765,6 +8780,7 @@ def index():
         plotDiv.on('plotly_hover', function(eventData) {
             const tooltip = ensurePlotlyTooltip();
             const hoverPoints = Array.isArray(eventData && eventData.points) ? eventData.points : [];
+            hideNativePlotlyHover();
             if (!tooltip || !hoverPoints.length) {
                 hidePlotlyTooltip();
                 return;
@@ -8774,8 +8790,8 @@ def index():
             tooltip.style.display = 'block';
             positionPlotlyTooltip(tooltip, eventData && eventData.event);
         });
-        plotDiv.on('plotly_unhover', hidePlotlyTooltip);
-        plotDiv.on('plotly_relayout', hidePlotlyTooltip);
+        // plotDiv.on('plotly_unhover', hidePlotlyTooltip);
+        plotDiv.on('plotly_relayout', function() { hideNativePlotlyHover(); });
         plotDiv.addEventListener('mouseleave', hidePlotlyTooltip);
     }
     window.updatePopoutChart = function(chartDataJSON, isHtml, themePayload) {
@@ -8803,13 +8819,14 @@ def index():
     chartData.layout.margin = chartData.layout.margin || { l: 60, r: 60, t: 60, b: 40 };
             applyPlotlyThemeToLayout(chartData.layout);
       const config = { responsive: true, displayModeBar: true, modeBarButtonsToRemove: ['lasso2d','select2d'], displaylogo: false, scrollZoom: true };
+            let plotPromise;
       if (plotInited) {
-        Plotly.react('popout-plot', chartData.data, chartData.layout, config);
+                plotPromise = Plotly.react('popout-plot', chartData.data, chartData.layout, config);
       } else {
-        Plotly.newPlot('popout-plot', chartData.data, chartData.layout, config);
+                plotPromise = Plotly.newPlot('popout-plot', chartData.data, chartData.layout, config);
         plotInited = true;
       }
-            setTimeout(attachPlotlyCustomTooltip, 0);
+            Promise.resolve(plotPromise).then(function() { attachPlotlyCustomTooltip(); hideNativePlotlyHover(); });
       updatePopoutHeatmapTextSize();
     } catch(e) { console.error('Popout chart error:', e); }
   };
@@ -9289,8 +9306,8 @@ def index():
                 positionPlotlyTooltip(plotDiv, tooltip, eventData?.event);
             });
 
-            plotDiv.on('plotly_unhover', () => hidePlotlyTooltip(plotDiv));
-            plotDiv.on('plotly_relayout', () => hidePlotlyTooltip(plotDiv));
+            // plotDiv.on('plotly_unhover', () => hidePlotlyTooltip(plotDiv));
+            // plotDiv.on('plotly_relayout', () => hidePlotlyTooltip(plotDiv));
             plotDiv.addEventListener('mouseleave', () => hidePlotlyTooltip(plotDiv));
         }
 
