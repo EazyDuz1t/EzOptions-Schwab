@@ -63,6 +63,7 @@ def init_db():
                     net_vomma REAL,
                     net_color REAL,
                     abs_gex_total REAL,
+                    expiry_key TEXT NOT NULL DEFAULT '',
                     date TEXT NOT NULL
                 )
             ''')
@@ -92,6 +93,10 @@ def init_db():
                 cursor.execute('ALTER TABLE interval_data ADD COLUMN net_color REAL')
             except sqlite3.OperationalError:
                 pass
+            try:
+                cursor.execute("ALTER TABLE interval_data ADD COLUMN expiry_key TEXT NOT NULL DEFAULT ''")
+            except sqlite3.OperationalError:
+                pass
 
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS interval_session_data (
@@ -102,9 +107,14 @@ def init_db():
                     expected_move REAL,
                     expected_move_upper REAL,
                     expected_move_lower REAL,
+                    expiry_key TEXT NOT NULL DEFAULT '',
                     date TEXT NOT NULL
                 )
             ''')
+            try:
+                cursor.execute("ALTER TABLE interval_session_data ADD COLUMN expiry_key TEXT NOT NULL DEFAULT ''")
+            except sqlite3.OperationalError:
+                pass
             
             # Add centroid data table
             cursor.execute('''
@@ -117,9 +127,14 @@ def init_db():
                     put_centroid REAL NOT NULL,
                     call_volume INTEGER NOT NULL,
                     put_volume INTEGER NOT NULL,
+                    expiry_key TEXT NOT NULL DEFAULT '',
                     date TEXT NOT NULL
                 )
             ''')
+            try:
+                cursor.execute("ALTER TABLE centroid_data ADD COLUMN expiry_key TEXT NOT NULL DEFAULT ''")
+            except sqlite3.OperationalError:
+                pass
             conn.commit()
 
 def is_market_hours():
@@ -165,6 +180,18 @@ def normalize_level_type(level_type):
     return level_type
 
 
+def build_expiry_selection_key(expiry_dates):
+    if not expiry_dates:
+        return ''
+
+    if isinstance(expiry_dates, str):
+        normalized_dates = [expiry_dates]
+    else:
+        normalized_dates = [str(expiry_date) for expiry_date in expiry_dates if expiry_date]
+
+    return '|'.join(sorted(set(normalized_dates)))
+
+
 def calculate_expected_move_snapshot(calls, puts, spot_price):
     """Return the current ATM straddle-based expected move snapshot."""
     if calls is None or puts is None or calls.empty or puts.empty or not spot_price:
@@ -204,7 +231,7 @@ def calculate_expected_move_snapshot(calls, puts, spot_price):
     }
 
 # Function to store centroid data
-def store_centroid_data(ticker, price, calls, puts):
+def store_centroid_data(ticker, price, calls, puts, expiry_key=''):
     """Store call and put centroid data for 5-minute intervals during market hours only"""
     # Get current time in Eastern Time
     est = pytz.timezone('US/Eastern')
@@ -234,8 +261,8 @@ def store_centroid_data(ticker, price, calls, puts):
         with closing(conn.cursor()) as cursor:
             cursor.execute('''
                 DELETE FROM centroid_data 
-                WHERE ticker = ? AND timestamp = ? AND date = ?
-            ''', (ticker, interval_timestamp, current_date))
+                WHERE ticker = ? AND timestamp = ? AND expiry_key = ? AND date = ?
+            ''', (ticker, interval_timestamp, expiry_key, current_date))
             conn.commit()
     
     # Calculate centroids (volume-weighted average strike prices)
@@ -267,13 +294,26 @@ def store_centroid_data(ticker, price, calls, puts):
         with closing(sqlite3.connect('options_data.db')) as conn:
             with closing(conn.cursor()) as cursor:
                 cursor.execute('''
-                    INSERT INTO centroid_data (ticker, timestamp, price, call_centroid, put_centroid, call_volume, put_volume, date)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ''', (ticker, interval_timestamp, price, call_centroid, put_centroid, call_volume, put_volume, current_date))
+                    INSERT INTO centroid_data (
+                        ticker, timestamp, price, call_centroid, put_centroid,
+                        call_volume, put_volume, expiry_key, date
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    ticker,
+                    interval_timestamp,
+                    price,
+                    call_centroid,
+                    put_centroid,
+                    call_volume,
+                    put_volume,
+                    expiry_key,
+                    current_date,
+                ))
                 conn.commit()
 
 # Function to get centroid data
-def get_centroid_data(ticker, date=None):
+def get_centroid_data(ticker, date=None, expiry_key=None):
     """Get centroid data for current trading session only (market hours)"""
     if date is None:
         # Get current date in Eastern Time
@@ -283,12 +323,20 @@ def get_centroid_data(ticker, date=None):
     
     with closing(sqlite3.connect('options_data.db')) as conn:
         with closing(conn.cursor()) as cursor:
-            cursor.execute('''
-                SELECT timestamp, price, call_centroid, put_centroid, call_volume, put_volume
-                FROM centroid_data
-                WHERE ticker = ? AND date = ?
-                ORDER BY timestamp
-            ''', (ticker, date))
+            if expiry_key is None:
+                cursor.execute('''
+                    SELECT timestamp, price, call_centroid, put_centroid, call_volume, put_volume
+                    FROM centroid_data
+                    WHERE ticker = ? AND date = ?
+                    ORDER BY timestamp
+                ''', (ticker, date))
+            else:
+                cursor.execute('''
+                    SELECT timestamp, price, call_centroid, put_centroid, call_volume, put_volume
+                    FROM centroid_data
+                    WHERE ticker = ? AND date = ? AND expiry_key = ?
+                    ORDER BY timestamp
+                ''', (ticker, date, expiry_key))
             
             # Filter data to only include market hours (9:30 AM - 4:00 PM ET)
             all_data = cursor.fetchall()
@@ -309,7 +357,7 @@ def get_centroid_data(ticker, date=None):
             return filtered_data
 
 # Function to store interval data
-def store_interval_data(ticker, price, strike_range, calls, puts):
+def store_interval_data(ticker, price, strike_range, calls, puts, expiry_key=''):
     if not is_market_hours():
         return
     est = pytz.timezone('US/Eastern')
@@ -329,12 +377,12 @@ def store_interval_data(ticker, price, strike_range, calls, puts):
         with closing(conn.cursor()) as cursor:
             cursor.execute('''
                 DELETE FROM interval_data 
-                WHERE ticker = ? AND timestamp = ? AND date = ?
-            ''', (ticker, interval_timestamp, current_date))
+                WHERE ticker = ? AND timestamp = ? AND expiry_key = ? AND date = ?
+            ''', (ticker, interval_timestamp, expiry_key, current_date))
             cursor.execute('''
                 DELETE FROM interval_session_data
-                WHERE ticker = ? AND timestamp = ? AND date = ?
-            ''', (ticker, interval_timestamp, current_date))
+                WHERE ticker = ? AND timestamp = ? AND expiry_key = ? AND date = ?
+            ''', (ticker, interval_timestamp, expiry_key, current_date))
             conn.commit()
     
     # Calculate strike range boundaries
@@ -421,9 +469,10 @@ def store_interval_data(ticker, price, strike_range, calls, puts):
                 cursor.execute('''
                     INSERT INTO interval_data (
                         ticker, timestamp, price, strike, net_gamma, net_delta, net_vanna,
-                        net_charm, net_volume, net_speed, net_vomma, net_color, abs_gex_total, date
+                        net_charm, net_volume, net_speed, net_vomma, net_color, abs_gex_total,
+                        expiry_key, date
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (
                     ticker,
                     interval_timestamp,
@@ -438,15 +487,17 @@ def store_interval_data(ticker, price, strike_range, calls, puts):
                     exposure['vomma'],
                     exposure['color'],
                     abs_gex_total,
+                    expiry_key,
                     current_date,
                 ))
 
             if expected_move_snapshot:
                 cursor.execute('''
                     INSERT INTO interval_session_data (
-                        ticker, timestamp, price, expected_move, expected_move_upper, expected_move_lower, date
+                        ticker, timestamp, price, expected_move, expected_move_upper,
+                        expected_move_lower, expiry_key, date
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (
                     ticker,
                     interval_timestamp,
@@ -454,24 +505,34 @@ def store_interval_data(ticker, price, strike_range, calls, puts):
                     expected_move_snapshot['move'],
                     expected_move_snapshot['upper'],
                     expected_move_snapshot['lower'],
+                    expiry_key,
                     current_date,
                 ))
             conn.commit()
 
 # Function to get interval data
-def get_interval_data(ticker, date=None):
+def get_interval_data(ticker, date=None, expiry_key=None):
     if date is None:
         date = datetime.now(pytz.timezone('US/Eastern')).strftime('%Y-%m-%d')
     
     with closing(sqlite3.connect('options_data.db')) as conn:
         with closing(conn.cursor()) as cursor:
-            cursor.execute('''
-                  SELECT timestamp, price, strike, net_gamma, net_delta, net_vanna, net_charm,
-                      abs_gex_total, net_volume, net_speed, net_vomma, net_color
-                FROM interval_data
-                WHERE ticker = ? AND date = ?
-                ORDER BY timestamp, strike
-            ''', (ticker, date))
+            if expiry_key is None:
+                cursor.execute('''
+                      SELECT timestamp, price, strike, net_gamma, net_delta, net_vanna, net_charm,
+                          abs_gex_total, net_volume, net_speed, net_vomma, net_color
+                    FROM interval_data
+                    WHERE ticker = ? AND date = ?
+                    ORDER BY timestamp, strike
+                ''', (ticker, date))
+            else:
+                cursor.execute('''
+                      SELECT timestamp, price, strike, net_gamma, net_delta, net_vanna, net_charm,
+                          abs_gex_total, net_volume, net_speed, net_vomma, net_color
+                    FROM interval_data
+                    WHERE ticker = ? AND date = ? AND expiry_key = ?
+                    ORDER BY timestamp, strike
+                ''', (ticker, date, expiry_key))
             all_data = cursor.fetchall()
 
     est = pytz.timezone('US/Eastern')
@@ -485,18 +546,26 @@ def get_interval_data(ticker, date=None):
     return filtered
 
 
-def get_interval_session_data(ticker, date=None):
+def get_interval_session_data(ticker, date=None, expiry_key=None):
     if date is None:
         date = datetime.now(pytz.timezone('US/Eastern')).strftime('%Y-%m-%d')
 
     with closing(sqlite3.connect('options_data.db')) as conn:
         with closing(conn.cursor()) as cursor:
-            cursor.execute('''
-                SELECT timestamp, price, expected_move, expected_move_upper, expected_move_lower
-                FROM interval_session_data
-                WHERE ticker = ? AND date = ?
-                ORDER BY timestamp
-            ''', (ticker, date))
+            if expiry_key is None:
+                cursor.execute('''
+                    SELECT timestamp, price, expected_move, expected_move_upper, expected_move_lower
+                    FROM interval_session_data
+                    WHERE ticker = ? AND date = ?
+                    ORDER BY timestamp
+                ''', (ticker, date))
+            else:
+                cursor.execute('''
+                    SELECT timestamp, price, expected_move, expected_move_upper, expected_move_lower
+                    FROM interval_session_data
+                    WHERE ticker = ? AND date = ? AND expiry_key = ?
+                    ORDER BY timestamp
+                ''', (ticker, date, expiry_key))
             all_data = cursor.fetchall()
 
     est = pytz.timezone('US/Eastern')
@@ -509,11 +578,17 @@ def get_interval_session_data(ticker, date=None):
             filtered.append(row)
     return filtered
 
-def get_last_session_date(ticker, table='interval_data'):
+def get_last_session_date(ticker, table='interval_data', expiry_key=None):
     """Return the most recent date that has data for ticker, or None."""
     with closing(sqlite3.connect('options_data.db')) as conn:
         with closing(conn.cursor()) as cursor:
-            cursor.execute(f'SELECT MAX(date) FROM {table} WHERE ticker = ?', (ticker,))
+            if expiry_key is None:
+                cursor.execute(f'SELECT MAX(date) FROM {table} WHERE ticker = ?', (ticker,))
+            else:
+                cursor.execute(
+                    f'SELECT MAX(date) FROM {table} WHERE ticker = ? AND expiry_key = ?',
+                    (ticker, expiry_key),
+                )
             row = cursor.fetchone()
             return row[0] if row and row[0] else None
 
@@ -593,7 +668,7 @@ current_expiry = None
 
 # Cache for last fetched options data per ticker — used by /update_price
 # so the price chart can refresh independently without re-fetching the full chain.
-_options_cache = {}  # ticker -> {'calls': DataFrame, 'puts': DataFrame, 'S': float}
+_options_cache = {}  # (ticker, expiry_key) -> {'calls': DataFrame, 'puts': DataFrame, 'S': float}
 
 # Initialize Schwab client
 try:
@@ -3008,7 +3083,7 @@ def snap_timestamp_to_chart_time(timestamp, chart_times):
 
 def build_historical_levels_overlay(ticker, display_date, chart_times, latest_price, strike_range,
                                     selected_types, levels_count, call_color, put_color,
-                                    highlight_max_level=False, max_level_color='#800080',
+                                    selected_expiries=None, highlight_max_level=False, max_level_color='#800080',
                                     coloring_mode='Linear Intensity'):
     """Build historical intraday exposure overlays for the TradingView price chart."""
     if not ticker or not chart_times or not selected_types or not latest_price:
@@ -3026,8 +3101,9 @@ def build_historical_levels_overlay(ticker, display_date, chart_times, latest_pr
 
     min_strike = latest_price * (1 - strike_range)
     max_strike = latest_price * (1 + strike_range)
-    interval_rows = get_interval_data(ticker, display_date) if normalized_types else []
-    session_rows = get_interval_session_data(ticker, display_date) if include_expected_move else []
+    expiry_key = build_expiry_selection_key(selected_expiries)
+    interval_rows = get_interval_data(ticker, display_date, expiry_key=expiry_key) if normalized_types else []
+    session_rows = get_interval_session_data(ticker, display_date, expiry_key=expiry_key) if include_expected_move else []
 
     points_by_time = {}
     for row in interval_rows:
@@ -3195,7 +3271,7 @@ def prepare_price_chart_data(price_data, calls=None, puts=None, exposure_levels_
                               exposure_levels_count=3, call_color='#00FF00', put_color='#FF0000',
                               strike_range=0.1, use_heikin_ashi=False,
                               highlight_max_level=False, max_level_color='#800080',
-                              coloring_mode='Linear Intensity', ticker=None):
+                              coloring_mode='Linear Intensity', ticker=None, selected_expiries=None):
     """Return raw OHLCV + overlay data as JSON for TradingView Lightweight Charts rendering."""
     import json as _json
 
@@ -3283,6 +3359,7 @@ def prepare_price_chart_data(price_data, calls=None, puts=None, exposure_levels_
         levels_count=exposure_levels_count,
         call_color=call_color,
         put_color=put_color,
+        selected_expiries=selected_expiries,
         highlight_max_level=highlight_max_level,
         max_level_color=max_level_color,
         coloring_mode=coloring_mode,
@@ -4469,12 +4546,13 @@ def create_centroid_chart(ticker, call_color='#00FF00', put_color='#FF0000', sel
 
     # Get centroid data; fall back to most recent session if today has no data
     showing_last_session = False
-    centroid_data = get_centroid_data(ticker)
+    expiry_key = build_expiry_selection_key(selected_expiries)
+    centroid_data = get_centroid_data(ticker, expiry_key=expiry_key)
 
     if not centroid_data:
-        last_date = get_last_session_date(ticker, 'centroid_data')
+        last_date = get_last_session_date(ticker, 'centroid_data', expiry_key=expiry_key)
         if last_date:
-            centroid_data = get_centroid_data(ticker, last_date)
+            centroid_data = get_centroid_data(ticker, last_date, expiry_key=expiry_key)
             showing_last_session = True
 
     if not centroid_data:
@@ -7910,11 +7988,13 @@ def index():
       function val(id){var el=d.getElementById(id);return el?el.value:null;}
       function chk(id){var el=d.getElementById(id);return el?el.checked:false;}
       var ticker=val('ticker');if(!ticker)return null;
+            var expiry=[];
       var levelsTypes=[];
+            try{expiry=Array.from(d.querySelectorAll('.expiry-option input[type="checkbox"]:checked')).map(function(cb){return cb.value;});}catch(e){}
       try{levelsTypes=Array.from(d.querySelectorAll('.levels-option input:checked')).map(function(cb){return cb.value;});}catch(e){}
             var themePayload=null;
             try{if(op.buildPopoutThemePayload)themePayload=op.buildPopoutThemePayload();}catch(e){}
-            return{ticker:ticker,timeframe:val('timeframe')||'1',call_color:val('call_color')||'#00ff00',put_color:val('put_color')||'#ff0000',levels_types:levelsTypes,levels_count:parseInt(val('levels_count'))||3,use_heikin_ashi:chk('use_heikin_ashi'),strike_range:parseFloat(val('strike_range'))/100||0.1,highlight_max_level:chk('highlight_max_level'),max_level_color:val('max_level_color')||'#800080',coloring_mode:val('coloring_mode')||'Linear Intensity',theme_payload:themePayload};
+                        return{ticker:ticker,expiry:expiry,timeframe:val('timeframe')||'1',call_color:val('call_color')||'#00ff00',put_color:val('put_color')||'#ff0000',levels_types:levelsTypes,levels_count:parseInt(val('levels_count'))||3,use_heikin_ashi:chk('use_heikin_ashi'),strike_range:parseFloat(val('strike_range'))/100||0.1,highlight_max_level:chk('highlight_max_level'),max_level_color:val('max_level_color')||'#800080',coloring_mode:val('coloring_mode')||'Linear Intensity',theme_payload:themePayload};
     }catch(e){return null;}
   }
   function loadInitialData(){
@@ -9855,8 +9935,10 @@ def index():
         let _priceHistoryInFlight = false;
 
         function buildPricePayload() {
+            const expiry = Array.from(document.querySelectorAll('.expiry-option input[type="checkbox"]:checked')).map(cb => cb.value);
             return {
                 ticker: document.getElementById('ticker').value,
+                expiry,
                 timeframe: document.getElementById('timeframe').value,
                 call_color: callColor,
                 put_color: putColor,
@@ -10792,14 +10874,16 @@ def update():
         if S is None:
             return jsonify({'error': 'Could not fetch current price'})
 
+        expiry_key = build_expiry_selection_key(expiry_dates)
+
         # Cache options data so /update_price can use it without re-fetching
-        _options_cache[ticker] = {'calls': calls.copy(), 'puts': puts.copy(), 'S': S}
+        _options_cache[(ticker, expiry_key)] = {'calls': calls.copy(), 'puts': puts.copy(), 'S': S}
         
         # Get strike range
         strike_range = float(data.get('strike_range', 0.1))
         
         # Store interval data
-        store_interval_data(ticker, S, strike_range, calls, puts)
+        store_interval_data(ticker, S, strike_range, calls, puts, expiry_key=expiry_key)
         
         # Check if this is the first access of the day for this ticker and clear centroid data if needed
         est = pytz.timezone('US/Eastern')
@@ -10829,7 +10913,7 @@ def update():
                             conn.commit()
         
         # Store centroid data
-        store_centroid_data(ticker, S, calls, puts)
+        store_centroid_data(ticker, S, calls, puts, expiry_key=expiry_key)
         
         # Clear centroid data at the end of the day
         current_time = datetime.now()
@@ -11057,10 +11141,19 @@ def update_price():
     """
     data = request.get_json()
     ticker = data.get('ticker')
+    expiry = data.get('expiry')
     ticker = format_ticker(ticker)
     if not ticker:
         return jsonify({'error': 'Missing ticker'}), 400
     try:
+        if isinstance(expiry, list):
+            expiry_dates = expiry
+        elif expiry:
+            expiry_dates = [expiry]
+        else:
+            expiry_dates = []
+        expiry_key = build_expiry_selection_key(expiry_dates)
+
         timeframe = int(data.get('timeframe', 1))
         call_color = data.get('call_color', '#00ff00')
         put_color = data.get('put_color', '#ff0000')
@@ -11077,7 +11170,7 @@ def update_price():
         # Use the most recently cached options data for exposure overlays.
         # If no cache exists yet the chart renders without overlays and
         # will gain them after the first /update completes.
-        cached = _options_cache.get(ticker, {})
+        cached = _options_cache.get((ticker, expiry_key), {})
         calls = cached.get('calls')
         puts = cached.get('puts')
 
@@ -11095,6 +11188,7 @@ def update_price():
             max_level_color=max_level_color,
             coloring_mode=coloring_mode,
             ticker=ticker,
+            selected_expiries=expiry_dates,
         )
         # Inject timeframe so the popout candle-close timer knows the selected interval
         try:
