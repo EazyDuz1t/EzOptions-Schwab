@@ -3478,6 +3478,16 @@ def build_historical_levels_overlay(ticker, display_date, chart_times, latest_pr
     interval_rows = get_interval_data(ticker, display_date, expiry_key=expiry_key) if normalized_types else []
     session_rows = get_interval_session_data(ticker, display_date, expiry_key=expiry_key) if include_expected_move else []
 
+    if not interval_rows and normalized_types:
+        last_date = get_last_session_date(ticker, 'interval_data', expiry_key=expiry_key)
+        if last_date:
+            interval_rows = get_interval_data(ticker, last_date, expiry_key=expiry_key)
+
+    if not session_rows and include_expected_move:
+        last_date = get_last_session_date(ticker, 'interval_session_data', expiry_key=expiry_key)
+        if last_date:
+            session_rows = get_interval_session_data(ticker, last_date, expiry_key=expiry_key)
+
     points_by_time = {}
     for row in interval_rows:
         timestamp, _, strike, net_gamma, net_delta, net_vanna, net_charm, abs_gex_total, net_volume, net_speed, net_vomma, net_color = row
@@ -7047,7 +7057,10 @@ def index():
         let lastData = {}; // Store last received data
         let lastPriceData = null; // Price chart data stored separately (fetched via /update_price)
         let updateInProgress = false;
+        let pendingFullUpdate = false;
         let pendingHeatmapOnlyUpdate = false;
+        let expirationsLoading = false;
+        let latestExpirationsRequestId = 0;
         let isStreaming = true;
         let savedScrollPosition = 0; // Track scroll position
         let chartContainerCache = {}; // Cache for chart containers to prevent recreation
@@ -9509,13 +9522,15 @@ def index():
         });
         
         function updateData() {
-            if (updateInProgress) {
+            if (updateInProgress || expirationsLoading) {
+                pendingFullUpdate = true;
                 return; // Skip if an update is already in progress
             }
             
             updateInProgress = true;
             
             const ticker = document.getElementById('ticker').value;
+            const requestTicker = ticker.toUpperCase();
             const tickerChanged = tvLastTicker !== null && ticker.toUpperCase() !== tvLastTicker.toUpperCase();
 
             // Reset chart state when the ticker changes
@@ -9534,6 +9549,7 @@ def index():
             tvLastTicker = ticker;
 
             const expiry = getSelectedExpiryValues();
+            const requestExpiryKey = expiry.slice().sort().join('|');
             
             // Ensure at least one expiry is selected
             if (expiry.length === 0) {
@@ -9595,9 +9611,15 @@ def index():
                 coloring_mode: coloringMode
             };
 
-            // Fetch price history: immediate on ticker/settings change, throttled to 30s otherwise.
+            // Historical bubble overlays depend on /update populating the interval
+            // store and options cache first. If level overlays are enabled, defer the
+            // price-chart fetch until the /update request completes to avoid rendering
+            // a bubble-less chart that only corrects after a full reload.
+            const deferPriceHistoryUntilUpdate = levelsTypes.length > 0;
+
+            // Fetch price history immediately only when no historical overlays are requested.
             // Real-time candle ticks come from SSE (connectPriceStream), not from polling.
-            if (visibleCharts.show_price) {
+            if (visibleCharts.show_price && !deferPriceHistoryUntilUpdate) {
                 fetchPriceHistory(tickerChanged || !tvLastCandles.length);
             }
             
@@ -9638,6 +9660,11 @@ def index():
             })
             .then(response => response.json())
             .then(data => {
+                const activeTicker = (document.getElementById('ticker').value || '').toUpperCase();
+                const activeExpiryKey = getSelectedExpiryValues().slice().sort().join('|');
+                if (activeTicker !== requestTicker || activeExpiryKey !== requestExpiryKey) {
+                    return;
+                }
                 if (data.error) {
                     showError(data.error);
                     // Pause streaming on persistent error
@@ -9670,6 +9697,11 @@ def index():
             })
             .finally(() => {
                 updateInProgress = false;
+                if (pendingFullUpdate) {
+                    pendingFullUpdate = false;
+                    updateData();
+                    return;
+                }
                 if (pendingHeatmapOnlyUpdate) {
                     pendingHeatmapOnlyUpdate = false;
                     updateHeatmapOnly();
@@ -11066,6 +11098,8 @@ def index():
         let _priceHistoryLastMs = 0;
         let _priceHistoryLastKey = '';
         let _priceHistoryInFlight = false;
+        let _priceHistoryPendingRefresh = false;
+        let _priceHistoryDesiredKey = '';
 
         function buildPricePayload() {
             const expiry = Array.from(document.querySelectorAll('.expiry-option input[type="checkbox"]:checked')).map(cb => cb.value);
@@ -11087,14 +11121,19 @@ def index():
 
         function fetchPriceHistory(force) {
             if (!document.getElementById('price').checked) return;
-            if (_priceHistoryInFlight) return;
             const payload = buildPricePayload();
             const key = JSON.stringify(payload);
+            _priceHistoryDesiredKey = key;
+            if (_priceHistoryInFlight) {
+                _priceHistoryPendingRefresh = _priceHistoryPendingRefresh || !!force || key !== _priceHistoryLastKey;
+                return;
+            }
             const now = Date.now();
             // Skip if nothing changed and it's been less than 30 seconds
             if (!force && key === _priceHistoryLastKey && now - _priceHistoryLastMs < 30000) return;
             _priceHistoryLastMs = now;
             _priceHistoryLastKey = key;
+            _priceHistoryPendingRefresh = false;
             _priceHistoryInFlight = true;
             fetch('/update_price', {
                 method: 'POST',
@@ -11103,12 +11142,21 @@ def index():
             })
             .then(r => r.json())
             .then(priceResp => {
+                if (key !== _priceHistoryDesiredKey) {
+                    return;
+                }
                 if (!priceResp.error && priceResp.price) {
                     applyPriceData(priceResp.price);
                 }
             })
             .catch(err => console.error('Error fetching price chart:', err))
-            .finally(() => { _priceHistoryInFlight = false; });
+            .finally(() => {
+                _priceHistoryInFlight = false;
+                if (_priceHistoryPendingRefresh || _priceHistoryDesiredKey !== _priceHistoryLastKey) {
+                    _priceHistoryPendingRefresh = false;
+                    fetchPriceHistory(true);
+                }
+            });
         }
 
         function updateCharts(data) {
@@ -11382,13 +11430,21 @@ def index():
         
         function loadExpirations() {
             const ticker = document.getElementById('ticker').value;
+            const requestId = ++latestExpirationsRequestId;
+            expirationsLoading = true;
+            document.getElementById('expiry-text').textContent = 'Loading expiries...';
             fetch(`/expirations/${ticker}`)
                 .then(response => {
                     if (!response.ok) throw new Error('Failed to fetch expirations');
                     return response.json();
                 })
                 .then(data => {
+                    const activeTicker = document.getElementById('ticker').value;
+                    if (requestId !== latestExpirationsRequestId || activeTicker !== ticker) {
+                        return;
+                    }
                     if (data.error) {
+                        expirationsLoading = false;
                         showError(data.error);
                         return;
                     }
@@ -11442,10 +11498,16 @@ def index():
                         }
                     }
                     
+                    expirationsLoading = false;
                     updateExpiryDisplay();
                     updateData();
                 })
                 .catch(error => {
+                    const activeTicker = document.getElementById('ticker').value;
+                    if (requestId !== latestExpirationsRequestId || activeTicker !== ticker) {
+                        return;
+                    }
+                    expirationsLoading = false;
                     showError('Error loading expirations: ' + error.message);
                 });
         }
