@@ -25,6 +25,19 @@ load_dotenv()
 # Initialize Flask app
 app = Flask(__name__)
 
+FAVICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+    <defs>
+        <linearGradient id="gold-gradient" x1="0%" y1="0%" x2="100%" y2="100%">
+            <stop offset="0%" stop-color="#fff1a8"/>
+            <stop offset="45%" stop-color="#f4c542"/>
+            <stop offset="100%" stop-color="#b77911"/>
+        </linearGradient>
+    </defs>
+    <rect x="2" y="2" width="60" height="60" rx="15" fill="#111111" stroke="#f4c542" stroke-width="2.5"/>
+    <text x="32" y="40" text-anchor="middle" font-family="Arial, sans-serif" font-size="28" font-style="italic" font-weight="700" fill="url(#gold-gradient)">Ez</text>
+</svg>
+"""
+
 MAX_RETAINED_SESSION_DATES = 2
 _retention_lock = threading.Lock()
 
@@ -5114,6 +5127,9 @@ def index():
 <html>
 <head>
     <title>EzOptions - Schwab</title>
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+    <link rel="shortcut icon" href="/favicon.svg" type="image/svg+xml">
+    <link rel="apple-touch-icon" href="/favicon.svg">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
     <meta name="mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-capable" content="yes">
@@ -5466,6 +5482,90 @@ def index():
             height: 100%;
             min-width: 0;
             min-height: 0;
+        }
+
+        #chart-control-staging {
+            display: none;
+        }
+
+        .heatmap-chart-shell {
+            display: flex;
+            flex-direction: column;
+            width: 100%;
+            height: 100%;
+            min-width: 0;
+            min-height: 0;
+            gap: 8px;
+            padding: 8px;
+        }
+
+        .heatmap-chart-toolbar {
+            display: flex;
+            align-items: center;
+            justify-content: flex-start;
+            gap: 8px;
+            flex-wrap: wrap;
+            padding: 0 0 0 82px;
+            flex: 0 0 auto;
+            align-content: flex-start;
+        }
+
+        .heatmap-chart-toolbar-controls {
+            display: flex;
+            align-items: center;
+            justify-content: flex-start;
+            flex-wrap: wrap;
+            gap: 8px;
+            width: 100%;
+            align-content: flex-start;
+        }
+
+        .heatmap-chart-toolbar .control-group {
+            margin: 0;
+            min-width: 182px;
+            padding: 4px 8px;
+            gap: 6px;
+            background: var(--panel-bg-alt);
+            border: 1px solid var(--border-color);
+            border-radius: 10px;
+            box-shadow: none;
+            justify-content: space-between;
+        }
+
+        .heatmap-chart-toolbar .control-group label {
+            color: var(--text-secondary);
+            font-size: 11px;
+            font-weight: 500;
+        }
+
+        .heatmap-chart-toolbar .control-group select {
+            min-width: 104px;
+            margin-left: auto;
+            padding: 4px 8px;
+            border-radius: 8px;
+            border-color: var(--border-color);
+            background: var(--panel-bg);
+            color: var(--text-primary);
+            font-size: 12px;
+        }
+
+        .heatmap-chart-toolbar .control-group select:hover {
+            border-color: var(--accent-color);
+        }
+
+        .heatmap-chart-toolbar .control-group select:focus {
+            outline: none;
+            border-color: var(--accent-color);
+            box-shadow: 0 0 0 2px var(--accent-soft);
+        }
+
+        .heatmap-plot {
+            flex: 1;
+            width: 100%;
+            min-width: 0;
+            min-height: 0;
+            border-radius: 12px;
+            overflow: hidden;
         }
 
         /* TradingView-style price chart overrides */
@@ -6683,6 +6783,26 @@ def index():
                 height: clamp(320px, 44dvh, 420px);
                 border-radius: 14px;
             }
+            body.mobile-layout .heatmap-chart-shell {
+                padding: 8px;
+                gap: 8px;
+            }
+            body.mobile-layout .heatmap-chart-toolbar {
+                padding: 0;
+            }
+            body.mobile-layout .heatmap-chart-toolbar-controls {
+                width: 100%;
+                justify-content: stretch;
+            }
+            body.mobile-layout .heatmap-chart-toolbar .control-group {
+                flex: 1 1 100%;
+                justify-content: space-between;
+                border-radius: 12px;
+            }
+            body.mobile-layout .heatmap-chart-toolbar .control-group select {
+                min-width: 0;
+                flex: 1 1 auto;
+            }
             body.mobile-layout .price-chart-container {
                 border-radius: 14px;
             }
@@ -6867,7 +6987,7 @@ def index():
                             <option value="Ranked Intensity">Ranked Intensity</option>
                         </select>
                     </div>
-                    <div class="control-group">
+                    <div class="control-group" style="display:none;">
                         <label>Price Levels:</label>
                         <div class="levels-dropdown">
                             <div class="levels-display" id="levels-display">
@@ -6887,28 +7007,7 @@ def index():
                             </div>
                         </div>
                     </div>
-                    <div class="control-group">
-                        <label for="heatmap_type">Heatmap Type:</label>
-                        <select id="heatmap_type" title="Choose the metric shown in the exposure heatmap">
-                            <option value="GEX" selected>GEX</option>
-                            <option value="AbsGEX">Abs GEX</option>
-                            <option value="DEX">DEX</option>
-                            <option value="VEX">Vanna</option>
-                            <option value="Charm">Charm</option>
-                            <option value="Volume">Volume</option>
-                            <option value="Speed">Speed</option>
-                            <option value="Vomma">Vomma</option>
-                            <option value="Color">Color</option>
-                        </select>
-                    </div>
-                    <div class="control-group">
-                        <label for="heatmap_coloring_mode">Heatmap Colors:</label>
-                        <select id="heatmap_coloring_mode" title="Global uses one scale across all expirations. Per Expiration rescales each expiration column independently.">
-                            <option value="Global" selected>Global</option>
-                            <option value="Per Expiration">Per Expiration</option>
-                        </select>
-                    </div>
-                    <div class="control-group">
+                    <div class="control-group" style="display:none;">
                         <label for="levels_count">Top #:</label>
                         <input type="number" id="levels_count" min="1" max="10" value="3" style="width: 50px;">
                     </div>
@@ -7030,6 +7129,30 @@ def index():
                 <label for="centroid">Call vs Put Centroid Map</label>
             </div>
         </div>
+
+        <div id="chart-control-staging" aria-hidden="true">
+            <div class="control-group" id="heatmap-type-control">
+                <label for="heatmap_type">Heatmap Type:</label>
+                <select id="heatmap_type" title="Choose the metric shown in the exposure heatmap">
+                    <option value="GEX" selected>GEX</option>
+                    <option value="AbsGEX">Abs GEX</option>
+                    <option value="DEX">DEX</option>
+                    <option value="VEX">Vanna</option>
+                    <option value="Charm">Charm</option>
+                    <option value="Volume">Volume</option>
+                    <option value="Speed">Speed</option>
+                    <option value="Vomma">Vomma</option>
+                    <option value="Color">Color</option>
+                </select>
+            </div>
+            <div class="control-group" id="heatmap-coloring-control">
+                <label for="heatmap_coloring_mode">Heatmap Colors:</label>
+                <select id="heatmap_coloring_mode" title="Global uses one scale across all expirations. Per Expiration rescales each expiration column independently.">
+                    <option value="Global" selected>Global</option>
+                    <option value="Per Expiration">Per Expiration</option>
+                </select>
+            </div>
+        </div>
         
         <div class="chart-grid" id="chart-grid">
             <div class="price-chart-container">
@@ -7042,6 +7165,10 @@ def index():
                 <div class="tv-sub-pane" id="macd-pane" style="display:none">
                     <div class="tv-sub-pane-header">MACD (12,26,9)</div>
                     <div id="macd-chart" style="height:120px"></div>
+                </div>
+                <div class="tv-sub-pane" id="arv-pane" style="display:none">
+                    <div class="tv-sub-pane-header">ARV 20 (Ann. %)</div>
+                    <div id="arv-chart" style="height:110px"></div>
                 </div>
             </div>
         </div>
@@ -7072,9 +7199,10 @@ def index():
         let tvResizeObserver = null;
         // Indicator series references
         let tvIndicatorSeries = {};
-        // Sub-pane charts for RSI and MACD
+        // Sub-pane charts for RSI, MACD, and ARV
         let tvRsiChart = null, tvRsiSeries = null;
         let tvMacdChart = null, tvMacdSeries = {};
+        let tvArvChart = null, tvArvSeries = null;
         // Persist active indicators across data refreshes
         let tvActiveInds = new Set();
         // Auto-range: when true, chart fits all data on every update; when false, zoom/pan is preserved
@@ -7603,6 +7731,9 @@ def index():
             if (tvMacdChart) {
                 try { tvMacdChart.applyOptions(buildLightweightThemeOptions()); } catch (e) {}
             }
+            if (tvArvChart) {
+                try { tvArvChart.applyOptions(buildLightweightThemeOptions()); } catch (e) {}
+            }
             Object.keys(charts).forEach(key => {
                 const div = document.getElementById(`${key}-chart`);
                 if (!div || !div._fullLayout || key === 'large_trades') return;
@@ -7723,7 +7854,7 @@ def index():
 
         function resizeAllCharts() {
             Object.keys(charts).forEach(chartKey => {
-                const chartElement = document.getElementById(`${chartKey}-chart`);
+                const chartElement = getPlotlyChartElement(chartKey);
                 if (chartElement && charts[chartKey] && chartKey !== 'large_trades') {
                     try { Plotly.Plots.resize(chartElement); } catch (e) {}
                 }
@@ -7813,6 +7944,7 @@ def index():
                     // Sub-pane charts also need their price axes reset
                     if (tvRsiChart)  tvRsiChart.priceScale('right').applyOptions({ autoScale: true });
                     if (tvMacdChart) tvMacdChart.priceScale('right').applyOptions({ autoScale: true });
+                    if (tvArvChart)  tvArvChart.priceScale('right').applyOptions({ autoScale: true });
                 } catch(e) {}
             }, 50);
         }
@@ -8040,6 +8172,7 @@ def index():
             if (chartId === 'price-chart') {
                 popup.document.write(`<!DOCTYPE html>
 <html><head><title>Price Chart - EzOptions</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"><\\/script>
 <style>
   * { margin:0; padding:0; box-sizing:border-box; }
@@ -8185,6 +8318,7 @@ def index():
   function calcBB(c,p,m){p=p||20;m=m||2;var s=calcSMA(c,p);return s.map(function(mid,i){if(mid===null)return{upper:null,mid:null,lower:null};var sl=c.slice(Math.max(0,i-p+1),i+1),v=sl.reduce(function(a,b){return a+(b-mid)*(b-mid);},0)/sl.length,sd=Math.sqrt(v);return{upper:mid+m*sd,mid:mid,lower:mid-m*sd};});}
   function calcRSI(c,p){p=p||14;var r=[];for(var i=0;i<c.length;i++){if(i<p){r.push(null);continue;}var g=0,l=0;for(var j=i-p+1;j<=i;j++){var d=c[j]-c[j-1];if(d>0)g+=d;else l-=d;}var ag=g/p,al=l/p;r.push(al===0?100:100-100/(1+ag/al));}return r;}
   function calcATR(candles,p){p=p||14;var r=[];for(var i=0;i<candles.length;i++){var tr;if(i===0){tr=candles[i].high-candles[i].low;}else{tr=Math.max(candles[i].high-candles[i].low,Math.abs(candles[i].high-candles[i-1].close),Math.abs(candles[i].low-candles[i-1].close));}if(i<p-1){r.push(null);continue;}if(r.length===0||r[r.length-1]===null){var sum=0;for(var j=i-p+1;j<=i;j++){var t2;if(j===0){t2=candles[j].high-candles[j].low;}else{t2=Math.max(candles[j].high-candles[j].low,Math.abs(candles[j].high-candles[j-1].close),Math.abs(candles[j].low-candles[j-1].close));}sum+=t2;}r.push(sum/p);}else{r.push((r[r.length-1]*(p-1)+tr)/p);}}return r;}
+    function calcAutoTrendLine(candles,dayStart){dayStart=dayStart||0;var points=(dayStart>0?candles.filter(function(c){return c.time>=dayStart;}):candles).map(function(c){return{time:c.time,close:Number(c.close)};}).filter(function(point){return Number.isFinite(point.close);});if(points.length<2)return[];var sumX=0,sumY=0,sumXY=0,sumXX=0,n=points.length;points.forEach(function(point,index){sumX+=index;sumY+=point.close;sumXY+=index*point.close;sumXX+=index*index;});var denom=(n*sumXX)-(sumX*sumX),slope=denom===0?0:((n*sumXY)-(sumX*sumY))/denom,intercept=(sumY-(slope*sumX))/n;return points.map(function(point,index){return{time:point.time,value:intercept+(slope*index)};});}
   function calcMACD(c,fast,slow,sig){fast=fast||12;slow=slow||26;sig=sig||9;var ef=calcEMA(c,fast),es=calcEMA(c,slow);var ml=ef.map(function(v,i){return(v!==null&&es[i]!==null)?v-es[i]:null;});var sl=[],es2=null,vi=0,k=2/(sig+1);for(var i=0;i<ml.length;i++){if(ml[i]===null){sl.push(null);continue;}if(vi<sig-1){sl.push(null);vi++;continue;}if(es2===null){var piece=ml.filter(function(v){return v!==null;}).slice(0,sig);es2=piece.reduce(function(a,b){return a+b;},0)/sig;}else{es2=ml[i]*k+es2*(1-k);}sl.push(es2);vi++;}return{macd:ml,signal:sl,histogram:ml.map(function(v,i){return(v!==null&&sl[i]!==null)?v-sl[i]:null;})};}
 
     // ── Sub-pane chart factory ─────────────────────────────────────────────────
@@ -8215,6 +8349,7 @@ def index():
         if(activeInds.has('vwap')){if(!tvIndSeries['vwap'])tvIndSeries['vwap']=mkLine('#ffffff',1,'VWAP');var vv=calcVWAP(candles.map(function(c,i){return{high:candles[i].high,low:candles[i].low,close:candles[i].close,volume:c.volume||0};}));tvIndSeries['vwap'].setData(vv.map(function(v,i){return{time:times[i],value:v};}));}
         if(activeInds.has('bb')){var bb=calcBB(closes);if(!tvIndSeries['bb']){tvIndSeries['bb']=[mkLine('rgba(100,180,255,0.8)',1,'BB U'),mkLine('rgba(100,180,255,0.5)',1,'BB M'),mkLine('rgba(100,180,255,0.8)',1,'BB L')];}var bbSeries=tvIndSeries['bb'];bbSeries[0].setData(bb.map(function(v,i){return v.upper!==null?{time:times[i],value:v.upper}:null;}).filter(Boolean));bbSeries[1].setData(bb.map(function(v,i){return v.mid!==null?{time:times[i],value:v.mid}:null;}).filter(Boolean));bbSeries[2].setData(bb.map(function(v,i){return v.lower!==null?{time:times[i],value:v.lower}:null;}).filter(Boolean));}
         if(activeInds.has('atr')){var atrV=calcATR(candles),e20=calcEMA(closes,20),mult=1.5;if(!tvIndSeries['atr']){tvIndSeries['atr']=[mkLine('rgba(255,152,0,0.8)',1,'ATR U'),mkLine('rgba(255,152,0,0.8)',1,'ATR L')];}var atrSeries=tvIndSeries['atr'];atrSeries[0].setData(e20.map(function(v,i){return(v!==null&&atrV[i]!==null)?{time:times[i],value:v+mult*atrV[i]}:null;}).filter(Boolean));atrSeries[1].setData(e20.map(function(v,i){return(v!==null&&atrV[i]!==null)?{time:times[i],value:v-mult*atrV[i]}:null;}).filter(Boolean));}
+                if(activeInds.has('auto_trend')){if(!tvIndSeries['auto_trend'])tvIndSeries['auto_trend']=tvChart.addLineSeries({color:'#ffca28',lineWidth:2,lineStyle:LightweightCharts.LineStyle.LargeDashed,priceScaleId:'right',lastValueVisible:true,priceLineVisible:false,title:'Auto Trend'});tvIndSeries['auto_trend'].setData(calcAutoTrendLine(candles));}
     if(activeInds.has('rsi'))applyRsiPane(candles,times);else destroyRsiPane();
     if(activeInds.has('macd'))applyMacdPane(candles,times);else destroyMacdPane();
     updateLegend();
@@ -8243,8 +8378,8 @@ def index():
   function updateLegend(){
     var cont=document.getElementById('price-chart');if(!cont)return;
     var leg=cont.querySelector('.ind-legend');if(!leg){leg=document.createElement('div');leg.className='ind-legend';cont.appendChild(leg);}
-    var cols={sma9:'#ffe082',sma20:'#f0c040',sma50:'#40a0f0',sma100:'#7fd1ff',sma200:'#e040fb',ema9:'#ff9900',ema21:'#00e5ff',ema50:'#ff7096',ema100:'#b388ff',ema200:'#00c853',wma20:'#ffd166',wma50:'#8ecae6',vwap:'#ffffff',bb:'rgba(100,180,255,0.8)',rsi:'#e91e63',macd:'#2196f3',atr:'rgba(255,152,0,0.8)'};
-    var lbls={sma9:'SMA9',sma20:'SMA20',sma50:'SMA50',sma100:'SMA100',sma200:'SMA200',ema9:'EMA9',ema21:'EMA21',ema50:'EMA50',ema100:'EMA100',ema200:'EMA200',wma20:'WMA20',wma50:'WMA50',vwap:'VWAP',bb:'BB(20,2)',rsi:'RSI14',macd:'MACD',atr:'ATR Bands'};
+    var cols={sma9:'#ffe082',sma20:'#f0c040',sma50:'#40a0f0',sma100:'#7fd1ff',sma200:'#e040fb',ema9:'#ff9900',ema21:'#00e5ff',ema50:'#ff7096',ema100:'#b388ff',ema200:'#00c853',wma20:'#ffd166',wma50:'#8ecae6',vwap:'#ffffff',bb:'rgba(100,180,255,0.8)',auto_trend:'#ffca28',rsi:'#e91e63',macd:'#2196f3',atr:'rgba(255,152,0,0.8)'};
+    var lbls={sma9:'SMA9',sma20:'SMA20',sma50:'SMA50',sma100:'SMA100',sma200:'SMA200',ema9:'EMA9',ema21:'EMA21',ema50:'EMA50',ema100:'EMA100',ema200:'EMA200',wma20:'WMA20',wma50:'WMA50',vwap:'VWAP',bb:'BB(20,2)',auto_trend:'Auto Trend',rsi:'RSI14',macd:'MACD',atr:'ATR Bands'};
     leg.innerHTML=Object.keys(tvIndSeries).map(function(k){return '<div class="ind-item"><div class="ind-swatch" style="background:'+( cols[k]||'#888')+'"></div>'+(lbls[k]||k)+'</div>';}).join('');
   }
 
@@ -8271,7 +8406,7 @@ def index():
     while(tb.children.length>2)tb.removeChild(tb.lastChild);
     function btn(text,title,onClick,extra){var b=document.createElement('button');b.className='tb-btn'+(extra?' '+extra:'');b.textContent=text;b.title=title;b.addEventListener('click',onClick);return b;}
     function sep(){var d=document.createElement('div');d.className='tv-tb-sep';return d;}
-        var inds=[{k:'sma9',l:'SMA9',t:'Simple Moving Average (9)'},{k:'sma20',l:'SMA20',t:'Simple Moving Average (20)'},{k:'sma50',l:'SMA50',t:'Simple Moving Average (50)'},{k:'sma100',l:'SMA100',t:'Simple Moving Average (100)'},{k:'sma200',l:'SMA200',t:'Simple Moving Average (200)'},{k:'ema9',l:'EMA9',t:'Exponential Moving Average (9)'},{k:'ema21',l:'EMA21',t:'Exponential Moving Average (21)'},{k:'ema50',l:'EMA50',t:'Exponential Moving Average (50)'},{k:'ema100',l:'EMA100',t:'Exponential Moving Average (100)'},{k:'ema200',l:'EMA200',t:'Exponential Moving Average (200)'},{k:'wma20',l:'WMA20',t:'Weighted Moving Average (20)'},{k:'wma50',l:'WMA50',t:'Weighted Moving Average (50)'},{k:'vwap',l:'VWAP',t:'Volume Weighted Average Price'},{k:'bb',l:'BB',t:'Bollinger Bands (20, 2)'},{k:'rsi',l:'RSI',t:'Relative Strength Index (14) — sub-pane'},{k:'macd',l:'MACD',t:'MACD (12, 26, 9) — sub-pane'},{k:'atr',l:'ATR',t:'Average True Range (14)'}];
+        var inds=[{k:'sma9',l:'SMA9',t:'Simple Moving Average (9)'},{k:'sma20',l:'SMA20',t:'Simple Moving Average (20)'},{k:'sma50',l:'SMA50',t:'Simple Moving Average (50)'},{k:'sma100',l:'SMA100',t:'Simple Moving Average (100)'},{k:'sma200',l:'SMA200',t:'Simple Moving Average (200)'},{k:'ema9',l:'EMA9',t:'Exponential Moving Average (9)'},{k:'ema21',l:'EMA21',t:'Exponential Moving Average (21)'},{k:'ema50',l:'EMA50',t:'Exponential Moving Average (50)'},{k:'ema100',l:'EMA100',t:'Exponential Moving Average (100)'},{k:'ema200',l:'EMA200',t:'Exponential Moving Average (200)'},{k:'wma20',l:'WMA20',t:'Weighted Moving Average (20)'},{k:'wma50',l:'WMA50',t:'Weighted Moving Average (50)'},{k:'vwap',l:'VWAP',t:'Volume Weighted Average Price'},{k:'bb',l:'BB',t:'Bollinger Bands (20, 2)'},{k:'auto_trend',l:'Auto Trend',t:'Automatic linear-regression trend line for the current session'},{k:'rsi',l:'RSI',t:'Relative Strength Index (14) — sub-pane'},{k:'macd',l:'MACD',t:'MACD (12, 26, 9) — sub-pane'},{k:'atr',l:'ATR',t:'Average True Range (14)'}];
         var indPicker=document.createElement('details');indPicker.className='tv-indicator-picker';
         var indSummary=document.createElement('summary');indSummary.className='tb-btn tv-indicator-summary';indSummary.title='Search and toggle indicators';
         var indLabel=document.createElement('span');indLabel.textContent='Indicators';
@@ -8509,6 +8644,7 @@ def index():
             } else {
                 popup.document.write(`<!DOCTYPE html>
 <html><head><title>${displayName} - EzOptions</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <script src="https://cdn.plot.ly/plotly-latest.min.js"><\\/script>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -9324,10 +9460,73 @@ def index():
             plotDiv.addEventListener('mouseleave', () => hidePlotlyTooltip(plotDiv));
         }
 
+        function mountHeatmapControls(toolbar) {
+            const staging = document.getElementById('chart-control-staging');
+            const target = toolbar || staging;
+            if (!target) {
+                return;
+            }
+
+            ['heatmap-type-control', 'heatmap-coloring-control'].forEach(controlId => {
+                const control = document.getElementById(controlId);
+                if (control && control.parentElement !== target) {
+                    target.appendChild(control);
+                }
+            });
+        }
+
+        function ensureHeatmapChartShell(container) {
+            if (!container) {
+                mountHeatmapControls(null);
+                return null;
+            }
+
+            let shell = container.querySelector('.heatmap-chart-shell');
+            if (!shell) {
+                shell = document.createElement('div');
+                shell.className = 'heatmap-chart-shell';
+
+                const toolbar = document.createElement('div');
+                toolbar.className = 'heatmap-chart-toolbar';
+
+                const toolbarControls = document.createElement('div');
+                toolbarControls.className = 'heatmap-chart-toolbar-controls';
+
+                const plot = document.createElement('div');
+                plot.className = 'heatmap-plot';
+                plot.id = 'heatmap-plot';
+
+                toolbar.appendChild(toolbarControls);
+                shell.appendChild(toolbar);
+                shell.appendChild(plot);
+                container.appendChild(shell);
+            }
+
+            mountHeatmapControls(shell.querySelector('.heatmap-chart-toolbar-controls'));
+            return shell;
+        }
+
+        function getPlotlyChartElement(chartKey) {
+            const container = document.getElementById(`${chartKey}-chart`);
+            if (!container) {
+                return null;
+            }
+            if (chartKey === 'heatmap') {
+                const shell = ensureHeatmapChartShell(container);
+                return shell ? shell.querySelector('.heatmap-plot') : null;
+            }
+            return container;
+        }
+
         function renderPlotlyChart(key, rawChartData) {
             const containerId = `${key}-chart`;
             const container = document.getElementById(containerId);
             if (!container || !rawChartData) {
+                return false;
+            }
+
+            const plotElement = getPlotlyChartElement(key);
+            if (!plotElement) {
                 return false;
             }
 
@@ -9357,13 +9556,13 @@ def index():
 
             let plotPromise;
             if (charts[key]) {
-                plotPromise = Plotly.react(containerId, chartData.data, chartData.layout, config);
+                plotPromise = Plotly.react(plotElement, chartData.data, chartData.layout, config);
             } else {
-                plotPromise = Plotly.newPlot(containerId, chartData.data, chartData.layout, config);
+                plotPromise = Plotly.newPlot(plotElement, chartData.data, chartData.layout, config);
                 charts[key] = plotPromise;
             }
 
-            Promise.resolve(plotPromise).then(() => attachPlotlyCustomTooltip(container));
+            Promise.resolve(plotPromise).then(() => attachPlotlyCustomTooltip(plotElement));
 
             if (key === 'heatmap') {
                 updateHeatmapTextSize(containerId);
@@ -9392,7 +9591,7 @@ def index():
         }
 
         function updateHeatmapTextSize(containerId) {
-            const div = document.getElementById(containerId);
+            const div = getPlotlyChartElement(containerId.replace('-chart', ''));
             if (!div || !div._fullLayout) return;
             const fl = div._fullLayout;
             if (!fl.annotations || fl.annotations.length === 0) return;
@@ -9622,6 +9821,22 @@ def index():
             if (visibleCharts.show_price && !deferPriceHistoryUntilUpdate) {
                 fetchPriceHistory(tickerChanged || !tvLastCandles.length);
             }
+
+            function normalizeFetchError(error) {
+                if (!error) {
+                    return 'Unknown update error.';
+                }
+                if (typeof error === 'string') {
+                    return error;
+                }
+                if (error.name === 'AbortError') {
+                    return 'Request was cancelled.';
+                }
+                if (error.name === 'SyntaxError') {
+                    return 'The server returned an unreadable response.';
+                }
+                return error.message || String(error);
+            }
             
             fetch('/update', {
                 method: 'POST',
@@ -9658,7 +9873,17 @@ def index():
                     ...visibleCharts
                 })
             })
-            .then(response => response.json())
+            .then(async response => {
+                const payload = await response.json().catch(() => {
+                    throw new SyntaxError(`Update request returned non-JSON (HTTP ${response.status})`);
+                });
+
+                if (!response.ok) {
+                    throw new Error(payload?.error || `Update request failed with HTTP ${response.status}`);
+                }
+
+                return payload;
+            })
             .then(data => {
                 const activeTicker = (document.getElementById('ticker').value || '').toUpperCase();
                 const activeExpiryKey = getSelectedExpiryValues().slice().sort().join('|');
@@ -9677,8 +9902,14 @@ def index():
                 // Only update if data has changed
                 if (JSON.stringify(data) !== JSON.stringify(lastData)) {
                     lastData = data;  // Update before rendering so popout windows get fresh data
-                    updateCharts(data);
-                    updatePriceInfo(data.price_info);
+                    try {
+                        updateCharts(data);
+                        updatePriceInfo(data.price_info);
+                    } catch (renderError) {
+                        console.error('Error rendering update payload:', renderError);
+                        showError('Render Error: ' + normalizeFetchError(renderError));
+                        return;
+                    }
                 }
                 // Options cache is now populated — refresh price levels immediately.
                 // This fixes the delay where levels were missing right after a ticker change
@@ -9689,7 +9920,11 @@ def index():
                 }
             })
             .catch(error => {
-                showError('Network Error: Could not connect to the server.');
+                const normalizedMessage = normalizeFetchError(error);
+                const userMessage = /network|failed to fetch/i.test(normalizedMessage)
+                    ? 'Network Error: Could not connect to the server.'
+                    : normalizedMessage;
+                showError(userMessage);
                 if (isStreaming) {
                     toggleStreaming();
                 }
@@ -9836,6 +10071,78 @@ def index():
             return result;
         }
 
+        function calcARV(candles, period=20) {
+            const tradingSecondsPerYear = 252 * 6.5 * 60 * 60;
+            if (!Array.isArray(candles) || candles.length === 0) return [];
+
+            const barIntervals = [];
+            for (let i = 1; i < candles.length; i++) {
+                const deltaSeconds = Number(candles[i].time) - Number(candles[i - 1].time);
+                if (Number.isFinite(deltaSeconds) && deltaSeconds > 0) {
+                    barIntervals.push(deltaSeconds);
+                }
+            }
+
+            const sortedIntervals = barIntervals.slice().sort((a, b) => a - b);
+            const medianInterval = sortedIntervals.length
+                ? (sortedIntervals.length % 2 === 0
+                    ? (sortedIntervals[(sortedIntervals.length / 2) - 1] + sortedIntervals[sortedIntervals.length / 2]) / 2
+                    : sortedIntervals[Math.floor(sortedIntervals.length / 2)])
+                : 60;
+            const annualizationFactor = Math.sqrt(tradingSecondsPerYear / Math.max(medianInterval, 1));
+
+            const logReturns = candles.map((candle, index) => {
+                if (index === 0) return null;
+                const prevClose = Number(candles[index - 1].close);
+                const close = Number(candle.close);
+                if (!(prevClose > 0) || !(close > 0)) return null;
+                return Math.log(close / prevClose);
+            });
+
+            return candles.map((_, index) => {
+                if (index < period) return null;
+                const window = logReturns
+                    .slice(index - period + 1, index + 1)
+                    .filter(value => Number.isFinite(value));
+                if (window.length < period) return null;
+
+                const mean = window.reduce((sum, value) => sum + value, 0) / window.length;
+                const variance = window.reduce((sum, value) => sum + ((value - mean) ** 2), 0) / Math.max(window.length - 1, 1);
+                return Math.sqrt(Math.max(variance, 0)) * annualizationFactor * 100;
+            });
+        }
+
+        function calcAutoTrendLine(candles, dayStart=0) {
+            const dayCandles = dayStart > 0 ? candles.filter(c => c.time >= dayStart) : candles;
+            const points = dayCandles
+                .map(c => ({ time: c.time, close: Number(c.close) }))
+                .filter(point => Number.isFinite(point.close));
+
+            if (points.length < 2) return [];
+
+            let sumX = 0;
+            let sumY = 0;
+            let sumXY = 0;
+            let sumXX = 0;
+
+            points.forEach((point, index) => {
+                sumX += index;
+                sumY += point.close;
+                sumXY += index * point.close;
+                sumXX += index * index;
+            });
+
+            const n = points.length;
+            const denominator = (n * sumXX) - (sumX * sumX);
+            const slope = denominator === 0 ? 0 : ((n * sumXY) - (sumX * sumY)) / denominator;
+            const intercept = (sumY - (slope * sumX)) / n;
+
+            return points.map((point, index) => ({
+                time: point.time,
+                value: intercept + (slope * index),
+            }));
+        }
+
         // ── Apply/remove indicators on existing chart ─────────────────────────
         function applyIndicators(candles, activeInds) {
             if (!tvPriceChart || !tvCandleSeries) return;
@@ -9950,6 +10257,20 @@ def index():
                 atrUpper.setData(todayOnly(ema20.map((v,i) => (v!==null && atrVals[i]!==null) ? {time:times[i], value:v + mult*atrVals[i]} : null)));
                 atrLower.setData(todayOnly(ema20.map((v,i) => (v!==null && atrVals[i]!==null) ? {time:times[i], value:v - mult*atrVals[i]} : null)));
             }
+            if (activeInds.has('auto_trend')) {
+                if (!tvIndicatorSeries['auto_trend']) {
+                    tvIndicatorSeries['auto_trend'] = tvPriceChart.addLineSeries({
+                        color: '#ffca28',
+                        lineWidth: 2,
+                        lineStyle: LightweightCharts.LineStyle.LargeDashed,
+                        priceScaleId: 'right',
+                        lastValueVisible: true,
+                        priceLineVisible: false,
+                        title: 'Auto Trend'
+                    });
+                }
+                tvIndicatorSeries['auto_trend'].setData(calcAutoTrendLine(candles, dayStart));
+            }
 
             // RSI and MACD sub-panes: compute with full history but display today only
             const todayCandles = dayStart > 0 ? candles.filter(c => c.time >= dayStart) : candles;
@@ -9957,6 +10278,8 @@ def index():
             else                       destroyRsiPane();
             if (activeInds.has('macd')) applyMacdPane(candles, todayCandles);
             else                        destroyMacdPane();
+            if (activeInds.has('arv')) applyArvPane(candles, todayCandles);
+            else                       destroyArvPane();
 
             // Update legend overlay
             updateIndicatorLegend();
@@ -9976,14 +10299,14 @@ def index():
                 sma9:'SMA9',sma20:'SMA20',sma50:'SMA50',sma100:'SMA100',sma200:'SMA200',
                 ema9:'EMA9',ema21:'EMA21',ema50:'EMA50',ema100:'EMA100',ema200:'EMA200',
                 wma20:'WMA20',wma50:'WMA50',
-                vwap:'VWAP',bb:'BB(20,2)',
+                vwap:'VWAP',bb:'BB(20,2)',auto_trend:'Auto Trend',
                 rsi:'RSI14',macd:'MACD',atr:'ATR Bands'
             };
             const colors = {
                 sma9:'#ffe082',sma20:'#f0c040',sma50:'#40a0f0',sma100:'#7fd1ff',sma200:'#e040fb',
                 ema9:'#ff9900',ema21:'#00e5ff',ema50:'#ff7096',ema100:'#b388ff',ema200:'#00c853',
                 wma20:'#ffd166',wma50:'#8ecae6',
-                vwap:'#ffffff',bb:'rgba(100,180,255,0.8)',
+                vwap:'#ffffff',bb:'rgba(100,180,255,0.8)',auto_trend:'#ffca28',
                 rsi:'#e91e63',macd:'#2196f3',atr:'rgba(255,152,0,0.8)'
             };
             legend.innerHTML = Object.keys(tvIndicatorSeries).map(k => `
@@ -10031,7 +10354,7 @@ def index():
                 try { chart.timeScale().unsubscribeVisibleLogicalRangeChange(handler); } catch(e){}
             });
             tvSyncHandlers = [];
-            const allCharts = [tvPriceChart, tvRsiChart, tvMacdChart].filter(Boolean);
+            const allCharts = [tvPriceChart, tvRsiChart, tvMacdChart, tvArvChart].filter(Boolean);
             if (allCharts.length < 2) return;
             allCharts.forEach(srcChart => {
                 const others = allCharts.filter(c => c !== srcChart);
@@ -10048,7 +10371,7 @@ def index():
             if (tvPriceChart) {
                 try {
                     const range = tvPriceChart.timeScale().getVisibleLogicalRange();
-                    if (range) [tvRsiChart, tvMacdChart].filter(Boolean).forEach(c => {
+                    if (range) [tvRsiChart, tvMacdChart, tvArvChart].filter(Boolean).forEach(c => {
                         try { c.timeScale().setVisibleLogicalRange(range); } catch(e){}
                     });
                 } catch(e){}
@@ -10126,6 +10449,46 @@ def index():
                 tvSyncHandlers = tvSyncHandlers.filter(h => h.chart !== tvMacdChart);
                 try { tvMacdChart.remove(); } catch(e){}
                 tvMacdChart = null; tvMacdSeries = {};
+            }
+        }
+
+        function applyArvPane(allCandles, todayCandles) {
+            const pane = document.getElementById('arv-pane');
+            if (!pane) return;
+            pane.style.display = 'block';
+
+            const allTimes = allCandles.map(c => c.time);
+            const dayStart = tvCurrentDayStartTime || 0;
+            const arvData = calcARV(allCandles, 20)
+                .map((value, index) => Number.isFinite(value) ? { time: allTimes[index], value } : null)
+                .filter(point => point !== null && point.time >= dayStart);
+
+            if (!tvArvChart) {
+                const chartEl = document.getElementById('arv-chart');
+                if (!chartEl) return;
+                tvArvChart = createSubPaneChart(chartEl, 110);
+                tvArvSeries = tvArvChart.addLineSeries({
+                    color: '#26c6da',
+                    lineWidth: 1.5,
+                    lastValueVisible: true,
+                    priceLineVisible: false,
+                    title: 'ARV20 %',
+                    priceFormat: { type: 'price', precision: 2, minMove: 0.01 }
+                });
+            }
+
+            tvArvSeries.setData(arvData);
+            setupTimeScaleSync();
+        }
+
+        function destroyArvPane() {
+            const pane = document.getElementById('arv-pane');
+            if (pane) pane.style.display = 'none';
+            if (tvArvChart) {
+                tvSyncHandlers = tvSyncHandlers.filter(h => h.chart !== tvArvChart);
+                try { tvArvChart.remove(); } catch(e){}
+                tvArvChart = null;
+                tvArvSeries = null;
             }
         }
 
@@ -10368,8 +10731,10 @@ def index():
                 { key:'wma50',  label:'WMA50',  title:'Weighted Moving Average (50)' },
                 { key:'vwap',   label:'VWAP',   title:'Volume Weighted Average Price' },
                 { key:'bb',     label:'BB',     title:'Bollinger Bands (20, 2)' },
+                { key:'auto_trend', label:'Auto Trend', title:'Automatic linear-regression trend line for the current session' },
                 { key:'rsi',    label:'RSI',    title:'Relative Strength Index (14) — sub-pane' },
                 { key:'macd',   label:'MACD',   title:'MACD (12, 26, 9) — sub-pane' },
+                { key:'arv',    label:'ARV',    title:'Annualized Realized Volatility (20) — sub-pane' },
                 { key:'atr',    label:'ATR',    title:'Average True Range (14) — sub-pane' },
             ];
             const indicatorPicker = document.createElement('details');
@@ -10462,6 +10827,137 @@ def index():
             syncIndicatorSummary();
             renderIndicatorOptions();
             toolbar.appendChild(indicatorPicker);
+
+            const levelDefs = Array.from(document.querySelectorAll('.levels-option input[type="checkbox"]')).map(input => {
+                const label = document.querySelector(`label[for="${input.id}"]`);
+                return {
+                    value: input.value,
+                    label: label ? label.textContent : input.value,
+                    input,
+                };
+            });
+            const hiddenLevelsCount = document.getElementById('levels_count');
+            const levelsPicker = document.createElement('details');
+            levelsPicker.className = 'tv-indicator-picker';
+            const levelsSummary = document.createElement('summary');
+            levelsSummary.className = 'tv-tb-btn tv-indicator-summary';
+            levelsSummary.title = 'Select price levels shown on the TradingView chart';
+            const levelsLabel = document.createElement('span');
+            levelsLabel.textContent = 'Levels';
+            const levelsBadge = document.createElement('span');
+            levelsBadge.className = 'tv-indicator-badge';
+            levelsSummary.appendChild(levelsLabel);
+            levelsSummary.appendChild(levelsBadge);
+            levelsPicker.appendChild(levelsSummary);
+
+            const levelsMenu = document.createElement('div');
+            levelsMenu.className = 'tv-indicator-menu';
+            const levelsSearch = document.createElement('input');
+            levelsSearch.type = 'search';
+            levelsSearch.className = 'tv-indicator-search';
+            levelsSearch.placeholder = 'Search price levels';
+            levelsSearch.autocomplete = 'off';
+            const levelsOptions = document.createElement('div');
+            levelsOptions.className = 'tv-indicator-options';
+            const levelsFooter = document.createElement('div');
+            levelsFooter.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:8px;padding-top:8px;border-top:1px solid var(--border-color);';
+            const levelsCountLabel = document.createElement('label');
+            levelsCountLabel.textContent = 'Top #';
+            levelsCountLabel.style.cssText = 'font-size:11px;color:var(--text-secondary);';
+            const levelsCountInput = document.createElement('input');
+            levelsCountInput.type = 'number';
+            levelsCountInput.min = '1';
+            levelsCountInput.max = '10';
+            levelsCountInput.value = hiddenLevelsCount ? hiddenLevelsCount.value : '3';
+            levelsCountInput.style.cssText = 'width:58px;border:1px solid var(--border-color);border-radius:6px;background:var(--panel-bg-strong);color:var(--text-primary);padding:6px 8px;font-size:12px;';
+            levelsFooter.appendChild(levelsCountLabel);
+            levelsFooter.appendChild(levelsCountInput);
+
+            function getSelectedLevels() {
+                return levelDefs.filter(def => def.input.checked).map(def => def.value);
+            }
+
+            function syncLevelsSummary() {
+                const count = getSelectedLevels().length;
+                levelsBadge.textContent = String(count);
+                levelsBadge.style.display = count ? 'inline-flex' : 'none';
+                levelsSummary.title = count
+                    ? `${count} price level${count === 1 ? '' : 's'} selected · Top ${levelsCountInput.value}`
+                    : 'Select price levels shown on the TradingView chart';
+            }
+
+            function renderLevelsOptions() {
+                const query = (levelsSearch.value || '').trim().toLowerCase();
+                levelsOptions.innerHTML = '';
+                const matches = levelDefs.filter(def =>
+                    def.label.toLowerCase().includes(query) || def.value.toLowerCase().includes(query)
+                );
+
+                if (!matches.length) {
+                    const empty = document.createElement('div');
+                    empty.className = 'tv-indicator-option-empty';
+                    empty.textContent = 'No matching price levels';
+                    levelsOptions.appendChild(empty);
+                    return;
+                }
+
+                matches.forEach(def => {
+                    const option = document.createElement('button');
+                    option.type = 'button';
+                    option.className = 'tv-indicator-option';
+                    if (def.input.checked) option.classList.add('active');
+
+                    const name = document.createElement('span');
+                    name.className = 'tv-indicator-option-name';
+                    name.textContent = def.label;
+                    const desc = document.createElement('span');
+                    desc.className = 'tv-indicator-option-desc';
+                    desc.textContent = `Overlay ${def.value} levels on price`; 
+
+                    option.appendChild(name);
+                    option.appendChild(desc);
+                    option.addEventListener('click', () => {
+                        def.input.checked = !def.input.checked;
+                        def.input.dispatchEvent(new Event('change', { bubbles: true }));
+                        syncLevelsSummary();
+                        renderLevelsOptions();
+                    });
+
+                    levelsOptions.appendChild(option);
+                });
+            }
+
+            levelsSearch.addEventListener('input', renderLevelsOptions);
+            levelsPicker.addEventListener('toggle', () => {
+                if (levelsPicker.open) {
+                    setTimeout(() => {
+                        levelsSearch.focus();
+                        levelsSearch.select();
+                    }, 0);
+                } else {
+                    levelsSearch.value = '';
+                    renderLevelsOptions();
+                }
+            });
+            levelsCountInput.addEventListener('input', () => {
+                let nextValue = parseInt(levelsCountInput.value, 10);
+                if (!Number.isFinite(nextValue)) return;
+                nextValue = Math.max(1, Math.min(10, nextValue));
+                levelsCountInput.value = String(nextValue);
+                if (hiddenLevelsCount && hiddenLevelsCount.value !== String(nextValue)) {
+                    hiddenLevelsCount.value = String(nextValue);
+                    hiddenLevelsCount.dispatchEvent(new Event('input', { bubbles: true }));
+                }
+                syncLevelsSummary();
+            });
+
+            levelsMenu.appendChild(levelsSearch);
+            levelsMenu.appendChild(levelsOptions);
+            levelsMenu.appendChild(levelsFooter);
+            levelsPicker.appendChild(levelsMenu);
+            syncLevelsSummary();
+            renderLevelsOptions();
+            toolbar.appendChild(levelsPicker);
 
             // --- Separator ---
             const sep2 = document.createElement('div'); sep2.className = 'tv-toolbar-sep'; toolbar.appendChild(sep2);
@@ -11049,6 +11545,7 @@ def index():
                         tvApplyAutoscale();
                         if (tvRsiChart)  tvRsiChart.priceScale('right').applyOptions({ autoScale: true });
                         if (tvMacdChart) tvMacdChart.priceScale('right').applyOptions({ autoScale: true });
+                        if (tvArvChart)  tvArvChart.priceScale('right').applyOptions({ autoScale: true });
                         scheduleTVHistoricalOverlayDraw();
                     } catch(e) {}
                 }, 50);
@@ -11077,10 +11574,14 @@ def index():
                 const macdPane = document.createElement('div');
                 macdPane.className = 'tv-sub-pane'; macdPane.id = 'macd-pane'; macdPane.style.display = 'none';
                 macdPane.innerHTML = '<div class="tv-sub-pane-header">MACD (12,26,9)</div><div id="macd-chart" style="height:120px"></div>';
+                const arvPane = document.createElement('div');
+                arvPane.className = 'tv-sub-pane'; arvPane.id = 'arv-pane'; arvPane.style.display = 'none';
+                arvPane.innerHTML = '<div class="tv-sub-pane-header">ARV 20 (Ann. %)</div><div id="arv-chart" style="height:110px"></div>';
                 priceContainer.appendChild(toolbarContainer);
                 priceContainer.appendChild(chartDiv);
                 priceContainer.appendChild(rsiPane);
                 priceContainer.appendChild(macdPane);
+                priceContainer.appendChild(arvPane);
                 document.getElementById('chart-grid').insertBefore(priceContainer, document.getElementById('chart-grid').firstChild);
             }
             priceContainer.style.display = 'block';
@@ -11184,7 +11685,7 @@ def index():
             function resizeRegularCharts() {
                 requestAnimationFrame(() => {
                     Object.keys(charts).forEach(chartKey => {
-                        const chartElement = document.getElementById(`${chartKey}-chart`);
+                        const chartElement = getPlotlyChartElement(chartKey);
                         if (!chartElement || chartKey === 'large_trades') return;
                         try {
                             Plotly.Plots.resize(chartElement);
@@ -11215,10 +11716,15 @@ def index():
                     const macdPane = document.createElement('div');
                     macdPane.className = 'tv-sub-pane'; macdPane.id = 'macd-pane'; macdPane.style.display = 'none';
                     macdPane.innerHTML = '<div class="tv-sub-pane-header">MACD (12,26,9)</div><div id="macd-chart" style="height:120px"></div>';
+                    // ARV sub-pane
+                    const arvPane = document.createElement('div');
+                    arvPane.className = 'tv-sub-pane'; arvPane.id = 'arv-pane'; arvPane.style.display = 'none';
+                    arvPane.innerHTML = '<div class="tv-sub-pane-header">ARV 20 (Ann. %)</div><div id="arv-chart" style="height:110px"></div>';
                     priceContainer.appendChild(toolbarContainer);
                     priceContainer.appendChild(chartDiv);
                     priceContainer.appendChild(rsiPane);
                     priceContainer.appendChild(macdPane);
+                    priceContainer.appendChild(arvPane);
                     document.getElementById('chart-grid').insertBefore(priceContainer, document.getElementById('chart-grid').firstChild);
                 }
                 priceContainer.style.display = 'block';
@@ -11234,6 +11740,7 @@ def index():
                 }
                 destroyRsiPane();
                 destroyMacdPane();
+                destroyArvPane();
                 if (tvPriceChart) {
                     try { tvPriceChart.unsubscribeClick(tvHandleChartClick); } catch(e){}
                     tvPriceChart.remove();
@@ -11273,12 +11780,14 @@ def index():
             // Hide the charts grid if no regular charts are enabled
             if (regularCharts.length === 0) {
                 chartsGrid.style.display = 'none';
+                mountHeatmapControls(null);
                 chartsGrid.innerHTML = '';
             } else {
                 chartsGrid.style.display = 'grid';
                 
                 // Only rebuild if chart selection changed
                 if (needsGridRebuild) {
+                    mountHeatmapControls(null);
                     chartsGrid.innerHTML = '';
                     chartsGrid.className = 'charts-grid';
                     
@@ -11337,6 +11846,9 @@ def index():
                 if (!selectedCharts[key] && !['price'].includes(key)) {
                     const container = document.getElementById(`${key}-chart`);
                     if (container) {
+                        if (key === 'heatmap') {
+                            mountHeatmapControls(null);
+                        }
                         container.remove();
                     }
                     delete charts[key];
@@ -11994,6 +12506,11 @@ def index():
 </body>
 </html>
     ''')
+
+@app.route('/favicon.svg')
+@app.route('/favicon.ico')
+def favicon():
+    return Response(FAVICON_SVG, mimetype='image/svg+xml')
 
 @app.route('/expirations/<ticker>')
 def get_expirations(ticker):
