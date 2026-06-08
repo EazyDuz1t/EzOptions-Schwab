@@ -40,7 +40,6 @@ FAVICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
 
 MAX_RETAINED_SESSION_DATES = 2
 _retention_lock = threading.Lock()
-
 # Global error handlers for Flask
 @app.errorhandler(404)
 def not_found_error(error):
@@ -211,6 +210,25 @@ def combine_level_values(level_type, call_value, put_value):
     if normalized_type == 'Volume':
         return call_value - put_value
     return call_value + put_value
+
+
+def safe_float(value, default=0.0):
+    try:
+        if value is None or pd.isna(value):
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def safe_int(value, default=0):
+    try:
+        if value is None or pd.isna(value):
+            return default
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
 
 
 HEATMAP_TITLE_DISPLAY_NAMES = {
@@ -417,20 +435,6 @@ def store_interval_data(ticker, price, strike_range, calls, puts, expiry_key='')
     # Store interval overlays at 1-minute resolution so they can be aggregated
     # to whatever candle timeframe the chart is using.
     interval_timestamp = (current_time // 60) * 60
-    
-    # Delete existing data for this 1-minute interval to update with most recent data
-    with closing(sqlite3.connect('options_data.db')) as conn:
-        with closing(conn.cursor()) as cursor:
-            cursor.execute('''
-                DELETE FROM interval_data 
-                WHERE ticker = ? AND timestamp = ? AND expiry_key = ? AND date = ?
-            ''', (ticker, interval_timestamp, expiry_key, current_date))
-            cursor.execute('''
-                DELETE FROM interval_session_data
-                WHERE ticker = ? AND timestamp = ? AND expiry_key = ? AND date = ?
-            ''', (ticker, interval_timestamp, expiry_key, current_date))
-            conn.commit()
-    
     # Calculate strike range boundaries
     min_strike = price * (1 - strike_range)
     max_strike = price * (1 + strike_range)
@@ -438,6 +442,20 @@ def store_interval_data(ticker, price, strike_range, calls, puts, expiry_key='')
     # Filter options within strike range
     range_calls = calls[(calls['strike'] >= min_strike) & (calls['strike'] <= max_strike)]
     range_puts = puts[(puts['strike'] >= min_strike) & (puts['strike'] <= max_strike)]
+
+    def _empty_exposure():
+        return {
+            'gamma': 0,
+            'delta': 0,
+            'vanna': 0,
+            'charm': 0,
+            'volume': 0,
+            'speed': 0,
+            'vomma': 0,
+            'color': 0,
+            'call_gamma': 0,
+            'put_gamma': 0,
+        }
     
     # Calculate per-strike exposures used by the historical intraday overlays.
     exposure_by_strike = {}
@@ -450,18 +468,7 @@ def store_interval_data(ticker, price, strike_range, calls, puts, expiry_key='')
         speed = row['Speed']
         vomma = row['Vomma']
         color = row['Color']
-        cur = exposure_by_strike.get(strike, {
-            'gamma': 0,
-            'delta': 0,
-            'vanna': 0,
-            'charm': 0,
-            'volume': 0,
-            'speed': 0,
-            'vomma': 0,
-            'color': 0,
-            'call_gamma': 0,
-            'put_gamma': 0,
-        })
+        cur = exposure_by_strike.get(strike, _empty_exposure())
         cur['gamma'] = cur.get('gamma',0) + gamma
         cur['delta'] = cur.get('delta',0) + delta
         cur['vanna'] = cur.get('vanna',0) + vanna
@@ -482,18 +489,7 @@ def store_interval_data(ticker, price, strike_range, calls, puts, expiry_key='')
         speed = row['Speed']
         vomma = row['Vomma']
         color = row['Color']
-        cur = exposure_by_strike.get(strike, {
-            'gamma': 0,
-            'delta': 0,
-            'vanna': 0,
-            'charm': 0,
-            'volume': 0,
-            'speed': 0,
-            'vomma': 0,
-            'color': 0,
-            'call_gamma': 0,
-            'put_gamma': 0,
-        })
+        cur = exposure_by_strike.get(strike, _empty_exposure())
         cur['gamma'] = cur.get('gamma',0) - gamma
         cur['delta'] = cur.get('delta',0) + delta
         cur['vanna'] = cur.get('vanna',0) + vanna
@@ -510,13 +506,22 @@ def store_interval_data(ticker, price, strike_range, calls, puts, expiry_key='')
     # Store data for each strike
     with closing(sqlite3.connect('options_data.db')) as conn:
         with closing(conn.cursor()) as cursor:
+            cursor.execute('''
+                DELETE FROM interval_data
+                WHERE ticker = ? AND timestamp = ? AND expiry_key = ? AND date = ?
+            ''', (ticker, interval_timestamp, expiry_key, current_date))
+            cursor.execute('''
+                DELETE FROM interval_session_data
+                WHERE ticker = ? AND timestamp = ? AND expiry_key = ? AND date = ?
+            ''', (ticker, interval_timestamp, expiry_key, current_date))
+
             for strike, exposure in exposure_by_strike.items():
                 abs_gex_total = abs(exposure.get('call_gamma',0)) + abs(exposure.get('put_gamma',0))
                 cursor.execute('''
                     INSERT INTO interval_data (
                         ticker, timestamp, price, strike, net_gamma, net_delta, net_vanna,
-                        net_charm, net_volume, net_speed, net_vomma, net_color, abs_gex_total,
-                        expiry_key, date
+                        net_charm, net_volume, net_speed, net_vomma, net_color,
+                        abs_gex_total, expiry_key, date
                     )
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (
@@ -1780,6 +1785,7 @@ def build_bar_chart_totals_annotation(call_total, put_total, net_total, call_col
     )
 
 
+
 def build_left_aligned_title(title_text, text_color='#CCCCCC', size=16, y=0.98):
     return dict(
         text=f"<b>{title_text}</b>",
@@ -2850,6 +2856,8 @@ def create_options_volume_chart(calls, puts, S, strike_range=0.02, call_color='#
 
     return fig.to_json()
 
+
+
 def update_options_chain(ticker, expiration_date=None):
     """Update the options chain by fetching new data from the API"""
     global current_chain, last_update_time, current_ticker, current_expiry
@@ -3467,6 +3475,20 @@ def snap_timestamp_to_chart_time(timestamp, chart_times):
     return next_time
 
 
+def bucket_timestamp_to_chart_interval(timestamp, chart_times):
+    """Map a stored interval timestamp to the chart candle bucket that contains it."""
+    if not chart_times:
+        return None
+
+    idx = bisect_left(chart_times, timestamp)
+    if idx < len(chart_times) and chart_times[idx] == timestamp:
+        return chart_times[idx]
+    if idx <= 0:
+        return None
+    return chart_times[idx - 1]
+
+
+
 def build_historical_levels_overlay(ticker, display_date, chart_times, latest_price, strike_range,
                                     selected_types, levels_count, call_color, put_color,
                                     selected_expiries=None, highlight_max_level=False, max_level_color='#800080',
@@ -3503,7 +3525,20 @@ def build_historical_levels_overlay(ticker, display_date, chart_times, latest_pr
 
     points_by_time = {}
     for row in interval_rows:
-        timestamp, _, strike, net_gamma, net_delta, net_vanna, net_charm, abs_gex_total, net_volume, net_speed, net_vomma, net_color = row
+        (
+            timestamp,
+            _stored_price,
+            strike,
+            net_gamma,
+            net_delta,
+            net_vanna,
+            net_charm,
+            abs_gex_total,
+            net_volume,
+            net_speed,
+            net_vomma,
+            net_color,
+        ) = row
         if strike < min_strike or strike > max_strike:
             continue
 
@@ -3573,6 +3608,8 @@ def build_historical_levels_overlay(ticker, display_date, chart_times, latest_pr
             and abs(point['value']) == highlight_abs_by_bucket_type[bucket_key]
         )
         base_color = call_color if point['value'] >= 0 else put_color
+        formatted_value = format_large_number(point['value'])
+        side_label = 'Call' if point['value'] >= 0 else 'Put'
         historical_points.append({
             'time': point['time'],
             'price': round(point['price'], 4),
@@ -3582,8 +3619,8 @@ def build_historical_levels_overlay(ticker, display_date, chart_times, latest_pr
             'border_width': 2 if is_max else 1,
             'label': INTERVAL_LEVEL_DISPLAY_NAMES.get(level_type, level_type),
             'rank': point['rank'],
-            'side': 'Call' if point['value'] >= 0 else 'Put',
-            'value': format_large_number(point['value']),
+            'side': side_label,
+            'value': formatted_value,
             'kind': 'exposure',
         })
 
@@ -3667,7 +3704,8 @@ def prepare_price_chart_data(price_data, calls=None, puts=None, exposure_levels_
                               exposure_levels_count=3, call_color='#00FF00', put_color='#FF0000',
                               strike_range=0.1, use_heikin_ashi=False,
                               highlight_max_level=False, max_level_color='#800080',
-                              coloring_mode='Linear Intensity', ticker=None, selected_expiries=None):
+                              coloring_mode='Linear Intensity', ticker=None, selected_expiries=None,
+                              show_latest_level_lines=True):
     """Return raw OHLCV + overlay data as JSON for TradingView Lightweight Charts rendering."""
     import json as _json
 
@@ -3745,9 +3783,21 @@ def prepare_price_chart_data(price_data, calls=None, puts=None, exposure_levels_
     last_candle = display_candles[-1] if display_candles else None
     last_candle_up = (last_candle['close'] >= last_candle['open']) if last_candle else True
 
+    display_date_key = display_date.strftime('%Y-%m-%d') if hasattr(display_date, 'strftime') else str(display_date)
+    requested_level_types = [normalize_level_type(level_type) for level_type in exposure_levels_types if level_type]
+    wants_historical_levels = any(level_type in INTERVAL_LEVEL_VALUE_KEYS for level_type in requested_level_types)
+    wants_expected_move_history = 'Expected Move' in requested_level_types
+    expiry_key = build_expiry_selection_key(selected_expiries)
+
+    if ticker and current_price and calls is not None and puts is not None and (wants_historical_levels or wants_expected_move_history):
+        needs_interval_seed = wants_historical_levels and not get_interval_data(ticker, display_date_key, expiry_key=expiry_key)
+        needs_session_seed = wants_expected_move_history and not get_interval_session_data(ticker, display_date_key, expiry_key=expiry_key)
+        if needs_interval_seed or needs_session_seed:
+            store_interval_data(ticker, current_price, strike_range, calls, puts, expiry_key=expiry_key)
+
     historical_exposure_levels, historical_expected_moves = build_historical_levels_overlay(
         ticker=ticker,
-        display_date=display_date.strftime('%Y-%m-%d') if hasattr(display_date, 'strftime') else str(display_date),
+        display_date=display_date_key,
         chart_times=[c['time'] for c in lc_candles],
         latest_price=current_price,
         strike_range=strike_range,
@@ -3760,7 +3810,6 @@ def prepare_price_chart_data(price_data, calls=None, puts=None, exposure_levels_
         max_level_color=max_level_color,
         coloring_mode=coloring_mode,
     )
-
     # Compute exposure levels
     exposure_levels = []
     expected_moves = []
@@ -3875,6 +3924,7 @@ def prepare_price_chart_data(price_data, calls=None, puts=None, exposure_levels_
         'put_color': put_color,
         'use_heikin_ashi': use_heikin_ashi,
         'last_candle_up': last_candle_up,
+        'show_latest_level_lines': bool(show_latest_level_lines),
         'exposure_levels': exposure_levels,
         'expected_moves': expected_moves,
         'historical_exposure_levels': historical_exposure_levels,
@@ -4638,289 +4688,6 @@ def create_open_interest_chart(calls, puts, S, strike_range=0.02, call_color='#0
 
     return fig.to_json()
 
-def create_premium_chart(calls, puts, S, strike_range=0.02, call_color='#00FF00', put_color='#FF0000', coloring_mode='Solid', show_calls=True, show_puts=True, show_net=True, selected_expiries=None, horizontal=False, highlight_max_level=False, max_level_color='#800080', max_level_mode='Absolute'):
-    total_call_premium = calls['lastPrice'].sum() if not calls.empty and 'lastPrice' in calls.columns else 0
-    total_put_premium = puts['lastPrice'].sum() if not puts.empty and 'lastPrice' in puts.columns else 0
-    total_net_premium = total_call_premium - total_put_premium
-
-    # Filter strikes within range
-    min_strike = S * (1 - strike_range)
-    max_strike = S * (1 + strike_range)
-    
-    calls = calls[(calls['strike'] >= min_strike) & (calls['strike'] <= max_strike)].copy()
-    puts = puts[(puts['strike'] >= min_strike) & (puts['strike'] <= max_strike)].copy()
-    
-    # Determine strike interval and aggregate by rounded strikes
-    all_strikes = list(calls['strike']) + list(puts['strike'])
-    if all_strikes:
-        strike_interval = get_strike_interval(all_strikes)
-        calls = aggregate_by_strike(calls, ['lastPrice'], strike_interval)
-        puts = aggregate_by_strike(puts, ['lastPrice'], strike_interval)
-    
-    # Create figure
-    fig = go.Figure()
-    
-    # Calculate max premium for normalization across all data
-    max_premium = 1.0
-    all_abs_vals = []
-    if not calls.empty:
-        all_abs_vals.extend(calls['lastPrice'].abs().tolist())
-    if not puts.empty:
-        all_abs_vals.extend(puts['lastPrice'].abs().tolist())
-    if all_abs_vals:
-        max_premium = max(all_abs_vals)
-    if max_premium == 0:
-        max_premium = 1.0
-    
-    # Add call premium bars
-    if show_calls and not calls.empty:
-        # Apply coloring mode
-        call_colors = get_colors(call_color, calls['lastPrice'], max_premium, coloring_mode)
-            
-        if horizontal:
-            fig.add_trace(go.Bar(
-                y=calls['strike'].tolist(),
-                x=calls['lastPrice'].tolist(),
-                name='Call',
-                marker_color=call_colors,
-                text=[f"${price:.2f}" for price in calls['lastPrice']],
-                textposition='auto',
-                orientation='h',
-                hovertemplate=build_hover_template('Call', [('Strike', '$%{y:.2f}'), ('Premium', '$%{x:.2f}')]),
-                marker_line_width=0
-            ))
-        else:
-            fig.add_trace(go.Bar(
-                x=calls['strike'].tolist(),
-                y=calls['lastPrice'].tolist(),
-                name='Call',
-                marker_color=call_colors,
-                text=[f"${price:.2f}" for price in calls['lastPrice']],
-                textposition='auto',
-                hovertemplate=build_hover_template('Call', [('Strike', '$%{x:.2f}'), ('Premium', '$%{y:.2f}')]),
-                marker_line_width=0
-            ))
-    
-    # Add put premium bars
-    if show_puts and not puts.empty:
-        # Apply coloring mode
-        put_colors = get_colors(put_color, puts['lastPrice'], max_premium, coloring_mode)
-            
-        if horizontal:
-            fig.add_trace(go.Bar(
-                y=puts['strike'].tolist(),
-                x=puts['lastPrice'].tolist(),
-                name='Put',
-                marker_color=put_colors,
-                text=[f"${price:.2f}" for price in puts['lastPrice']],
-                textposition='auto',
-                orientation='h',
-                hovertemplate=build_hover_template('Put', [('Strike', '$%{y:.2f}'), ('Premium', '$%{x:.2f}')]),
-                marker_line_width=0
-            ))
-        else:
-            fig.add_trace(go.Bar(
-                x=puts['strike'].tolist(),
-                y=puts['lastPrice'].tolist(),
-                name='Put',
-                marker_color=put_colors,
-                text=[f"${price:.2f}" for price in puts['lastPrice']],
-                textposition='auto',
-                hovertemplate=build_hover_template('Put', [('Strike', '$%{x:.2f}'), ('Premium', '$%{y:.2f}')]),
-                marker_line_width=0
-            ))
-    
-    # Add net premium bars if enabled
-    if show_net and not (calls.empty and puts.empty):
-        # Create net premium by combining calls and puts
-        all_strikes_list = sorted(set(calls['strike'].tolist() + puts['strike'].tolist()))
-        net_premium = []
-        
-        for strike in all_strikes_list:
-            call_prem = calls[calls['strike'] == strike]['lastPrice'].sum() if not calls.empty else 0
-            put_prem = puts[puts['strike'] == strike]['lastPrice'].sum() if not puts.empty else 0
-            net_prem = call_prem - put_prem
-            
-            net_premium.append(net_prem)
-        
-        # Calculate max for net premium normalization
-        max_net_premium = max(abs(min(net_premium)), abs(max(net_premium))) if net_premium else 1.0
-        if max_net_premium == 0:
-            max_net_premium = 1.0
-        
-        # Apply coloring mode for net values
-        net_colors = get_net_colors(net_premium, max_net_premium, call_color, put_color, coloring_mode)
-        
-        if horizontal:
-            fig.add_trace(go.Bar(
-                y=all_strikes_list,
-                x=net_premium,
-                name='Net',
-                marker_color=net_colors,
-                text=[f"${prem:.2f}" for prem in net_premium],
-                textposition='auto',
-                orientation='h',
-                hovertemplate=build_hover_template('Net', [('Strike', '$%{y:.2f}'), ('Premium', '$%{x:.2f}')]),
-                marker_line_width=0
-            ))
-        else:
-            fig.add_trace(go.Bar(
-                x=all_strikes,
-                y=net_premium,
-                name='Net',
-                marker_color=net_colors,
-                text=[f"${prem:.2f}" for prem in net_premium],
-                textposition='auto',
-                hovertemplate=build_hover_template('Net', [('Strike', '$%{x:.2f}'), ('Premium', '$%{y:.2f}')]),
-                marker_line_width=0
-            ))
-    
-    add_current_price_reference(fig, S, horizontal=horizontal, text_color='white')
-    
-    chart_title = build_bar_chart_title(
-        'Option Premium by Strike',
-        total_call_premium,
-        total_put_premium,
-        total_net_premium,
-        call_color,
-        put_color,
-        selected_expiries=selected_expiries,
-    )
-    
-    xaxis_config = dict(
-        title='',
-        title_font=dict(color='#CCCCCC'),
-        tickfont=dict(color='#CCCCCC'),
-        gridcolor='#333333',
-        linecolor='#333333',
-        showgrid=False,
-        zeroline=True,
-        zerolinecolor='#333333',
-        automargin=True
-    )
-    
-    yaxis_config = dict(
-        title='',
-        title_font=dict(color='#CCCCCC'),
-        tickfont=dict(color='#CCCCCC'),
-        gridcolor='#333333',
-        linecolor='#333333',
-        showgrid=False,
-        zeroline=True,
-        zerolinecolor='#333333'
-    )
-    
-    if horizontal:
-         yaxis_config.update(dict(
-            range=[min_strike, max_strike],
-            autorange=False
-         ))
-    else:
-        xaxis_config.update(dict(
-            range=[min_strike, max_strike],
-            autorange=False,
-            tickangle=45,
-            tickformat='.0f',
-            showticklabels=True,
-            ticks='outside',
-            ticklen=5,
-            tickwidth=1,
-            tickcolor='#CCCCCC'
-        ))
-
-    # Update layout
-    fig.update_layout(
-        title=build_left_aligned_title(chart_title),
-        annotations=list(fig.layout.annotations) + [
-            build_bar_chart_totals_annotation(
-                total_call_premium,
-                total_put_premium,
-                total_net_premium,
-                call_color,
-                put_color,
-            )
-        ],
-        xaxis=xaxis_config,
-        yaxis=yaxis_config,
-        barmode='relative',
-        hovermode='y unified' if horizontal else 'x unified',
-        plot_bgcolor='#1E1E1E',
-        paper_bgcolor='#1E1E1E',
-        font=dict(color='#CCCCCC'),
-        legend=dict(
-            orientation="h",
-            yanchor="bottom",
-            y=1.02,
-            xanchor="right",
-            x=1,
-            font=dict(color='#CCCCCC'),
-            bgcolor='#1E1E1E'
-        ),
-        bargap=0.1,
-        bargroupgap=0.1,
-        margin=dict(l=38, r=56 if horizontal else 42, t=48, b=16),
-        hoverlabel=dict(
-            bgcolor='#1E1E1E',
-            font_size=12,
-            font_family="Arial"
-        ),
-        spikedistance=1000,
-        hoverdistance=100,
-        showlegend=False,
-        height=500
-    )
-
-    ensure_bar_text_visibility(fig, horizontal=horizontal)
-    
-    # Add hover spikes
-    fig.update_xaxes(showspikes=True, spikecolor='#CCCCCC', spikethickness=1)
-    fig.update_yaxes(showspikes=True, spikecolor='#CCCCCC', spikethickness=1)
-    
-    # Logic for Highlighting Max Level
-    if highlight_max_level:
-        try:
-            if max_level_mode == 'Net':
-                net_trace_idx = next((i for i, t in enumerate(fig.data) if t.type == 'bar' and t.name == 'Net'), None)
-                if net_trace_idx is not None:
-                    raw = fig.data[net_trace_idx].x if horizontal else fig.data[net_trace_idx].y
-                    if raw:
-                        vals = list(raw)
-                        total_net = sum(vals)
-                        if total_net >= 0:
-                            max_bar_idx = vals.index(max(vals))
-                        else:
-                            max_bar_idx = vals.index(min(vals))
-                        line_widths = [0] * len(vals)
-                        line_widths[max_bar_idx] = 5
-                        fig.data[net_trace_idx].update(marker=dict(
-                            line=dict(width=line_widths, color=max_level_color)
-                        ))
-            else:
-                max_abs_val = 0
-                max_trace_idx = -1
-                max_bar_idx = -1
-                for i, trace in enumerate(fig.data):
-                    if trace.type == 'bar':
-                        vals = trace.x if horizontal else trace.y
-                        if vals:
-                            abs_vals = [abs(v) for v in vals]
-                            if abs_vals:
-                                local_max = max(abs_vals)
-                                if local_max > max_abs_val:
-                                    max_abs_val = local_max
-                                    max_trace_idx = i
-                                    max_bar_idx = abs_vals.index(local_max)
-                if max_trace_idx != -1:
-                    vals = fig.data[max_trace_idx].x if horizontal else fig.data[max_trace_idx].y
-                    line_widths = [0] * len(vals)
-                    line_widths[max_bar_idx] = 5
-                    fig.data[max_trace_idx].update(marker=dict(
-                        line=dict(width=line_widths, color=max_level_color)
-                    ))
-        except Exception as e:
-            print(f"Error highlighting max level in premium chart: {e}")
-
-    return fig.to_json()
 
 def create_centroid_chart(ticker, call_color='#00FF00', put_color='#FF0000', selected_expiries=None):
     """Create a chart showing call and put centroids over time with price line"""
@@ -5588,7 +5355,7 @@ def index():
         .tv-historical-overlay {
             position: absolute;
             inset: 0;
-            z-index: 4;
+            z-index: 20;
             pointer-events: none;
             overflow: hidden;
         }
@@ -5854,6 +5621,41 @@ def index():
             color: #888;
             text-align: center;
         }
+        .tv-settings-menu {
+            width: min(300px, calc(100vw - 32px));
+            display: grid;
+            gap: 8px;
+        }
+        .tv-settings-row {
+            display: flex;
+            align-items: flex-start;
+            gap: 10px;
+            padding: 8px;
+            border-radius: 8px;
+            color: #fff;
+            cursor: pointer;
+        }
+        .tv-settings-row:hover {
+            background: #252525;
+        }
+        .tv-settings-row input[type="checkbox"] {
+            margin: 2px 0 0;
+        }
+        .tv-settings-copy {
+            display: grid;
+            gap: 2px;
+            min-width: 0;
+        }
+        .tv-settings-name {
+            font-size: 12px;
+            font-weight: 600;
+            color: #f2f2f2;
+        }
+        .tv-settings-desc {
+            font-size: 10px;
+            color: #9ea7b3;
+            line-height: 1.35;
+        }
         /* Indicator legend — inside canvas, pointer-events none so it doesn't block */
         .tv-indicator-legend {
             position: absolute;
@@ -5894,6 +5696,25 @@ def index():
             font-weight: bold;
             pointer-events: none;
         }
+        .tv-sub-pane-header--interactive {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            pointer-events: auto;
+        }
+        .tv-sub-pane-title {
+            pointer-events: none;
+        }
+        .tv-sub-pane-mode {
+            height: 20px;
+            padding: 0 6px;
+            border-radius: 4px;
+            border: 1px solid #444;
+            background: #2a2a2a;
+            color: #ccc;
+            font-size: 10px;
+            font-weight: normal;
+        }
         /* Drawing mode cursor */
         #price-chart.draw-mode > canvas { cursor: crosshair !important; }
         /* OHLC hover tooltip */
@@ -5932,33 +5753,85 @@ def index():
         }
         .price-info {
             display: flex;
-            gap: 15px;
-            align-items: center;
-            font-size: 1.2em;
-            flex-wrap: wrap;
+            align-items: stretch;
+            gap: 0;
             width: 100%;
+            margin: 0 0 14px;
+            padding: 8px;
+            background-color: var(--panel-bg);
+            color: var(--text-secondary);
+            border: 1px solid var(--border-color);
+            border-radius: 14px;
+            box-shadow: var(--button-shadow);
+            overflow-x: auto;
+            scrollbar-width: thin;
+        }
+        .price-info-stats,
+        .price-info-market-group {
+            display: flex;
+            align-items: stretch;
+            gap: 6px;
+            flex: 0 0 auto;
+        }
+        .price-info-market-group {
+            margin-left: auto;
+            padding-left: 10px;
+            border-left: 1px solid var(--border-color);
         }
         .price-info-item {
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
             min-width: 0;
+            padding: 9px 14px;
+            border-radius: 10px;
+            background-color: var(--panel-bg-alt);
+            border: 1px solid var(--border-color);
+            transition: background-color 0.18s ease, border-color 0.18s ease, box-shadow 0.18s ease;
+        }
+        .price-info-item:hover {
+            background-color: var(--panel-hover);
+            border-color: var(--border-color);
         }
         .price-info-item strong {
             display: block;
-            margin-bottom: 4px;
-            font-size: 0.72em;
-            font-weight: 600;
-            letter-spacing: 0.04em;
+            margin-bottom: 5px;
+            font-size: 0.62em;
+            font-weight: 700;
+            letter-spacing: 0.08em;
             text-transform: uppercase;
             color: var(--text-muted);
+            white-space: nowrap;
         }
-        .price-info-item span,
-        .price-info-item div {
+        .price-info-item > span {
             display: block;
+            font-size: 1.02em;
+            font-weight: 600;
+            color: var(--text-primary);
+            font-variant-numeric: tabular-nums;
+            line-height: 1.3;
+            white-space: nowrap;
         }
-        .green {
-            color: #00FF00;
+        .price-info-item span span {
+            font-size: 0.84em;
+            font-weight: 500;
         }
-        .red {
-            color: #FF0000;
+        .price-info-item.price-info-primary > span {
+            font-size: 1.18em;
+            font-weight: 700;
+            letter-spacing: -0.01em;
+            color: var(--text-primary);
+        }
+        .green,
+        .price-info-item.green > span {
+            color: var(--good-color);
+        }
+        .red,
+        .price-info-item.red > span {
+            color: var(--bad-color);
+        }
+        .price-info-item[title] {
+            cursor: help;
         }
         button {
             padding: 8px 16px;
@@ -6186,8 +6059,19 @@ def index():
             }
             .price-info {
                 flex-direction: column;
-                align-items: flex-start;
-                font-size: 1em;
+                align-items: stretch;
+                padding: 8px;
+            }
+            .price-info-stats,
+            .price-info-market-group {
+                flex-wrap: wrap;
+            }
+            .price-info-market-group {
+                margin-left: 0;
+                padding-left: 0;
+                border-left: none;
+                border-top: 1px solid var(--border-color);
+                padding-top: 8px;
             }
             .stream-control button, .settings-control button {
                 min-height: 44px;
@@ -6361,6 +6245,8 @@ def index():
         .price-chart-container,
         .tv-toolbar-container,
         .tv-sub-pane,
+        .price-info,
+        .price-info-item,
         input,
         select,
         button,
@@ -6388,11 +6274,22 @@ def index():
         }
         .control-group label,
         .chart-checkbox label,
-        .price-info,
         .tv-chart-title,
         .tv-legend-item,
         .tv-sub-pane-header {
             color: var(--text-secondary);
+        }
+        .price-info,
+        .price-info-item {
+            background-color: var(--panel-bg);
+            border-color: var(--border-color);
+        }
+        .price-info-item {
+            background-color: var(--panel-bg-alt);
+        }
+        .price-info-item:hover {
+            background-color: var(--panel-hover);
+            border-color: var(--border-color);
         }
         .expiry-display,
         .levels-display,
@@ -6562,6 +6459,8 @@ def index():
         body[data-theme="neon"] .levels-options,
         body[data-theme="neon"] .chart-container,
         body[data-theme="neon"] .price-chart-container,
+        body[data-theme="neon"] .price-info,
+        body[data-theme="neon"] .price-info-item,
         body[data-theme="neon"] .tv-toolbar-container,
         body[data-theme="neon"] .tv-sub-pane {
             border-color: color-mix(in srgb, var(--accent-color) 22%, var(--border-color));
@@ -6761,21 +6660,34 @@ def index():
                 height: 22px;
             }
             body.mobile-layout .price-info {
-                display: grid;
-                grid-auto-flow: column;
-                grid-auto-columns: minmax(180px, 1fr);
-                gap: 8px;
-                overflow-x: auto;
+                display: flex;
+                flex-direction: row;
                 flex-wrap: nowrap;
-                padding: 2px 0 8px;
+                gap: 0;
+                overflow-x: auto;
+                padding: 8px;
                 scroll-snap-type: x proximity;
+                -webkit-overflow-scrolling: touch;
+            }
+            body.mobile-layout .price-info-stats,
+            body.mobile-layout .price-info-market-group {
+                display: flex;
+                flex: 0 0 auto;
+                gap: 8px;
+                flex-wrap: nowrap;
+            }
+            body.mobile-layout .price-info-market-group {
+                margin-left: auto;
+                padding-left: 10px;
+                border-left: 1px solid var(--border-color);
+                border-top: none;
+                padding-top: 0;
             }
             body.mobile-layout .price-info-item {
-                min-height: 78px;
+                min-height: 72px;
+                min-width: 128px;
                 padding: 10px 12px;
-                border-radius: 14px;
-                background: var(--panel-bg-alt);
-                border: 1px solid var(--border-color);
+                border-radius: 12px;
                 box-sizing: border-box;
                 scroll-snap-align: start;
             }
@@ -6842,8 +6754,8 @@ def index():
                 flex-wrap: wrap;
                 align-items: flex-start;
             }
-            body.mobile-layout .price-info {
-                grid-auto-columns: minmax(220px, 88vw);
+            body.mobile-layout .price-info-item {
+                min-width: 148px;
             }
         }
         @media (hover: none), (pointer: coarse) {
@@ -7011,7 +6923,7 @@ def index():
                         <label for="levels_count">Top #:</label>
                         <input type="number" id="levels_count" min="1" max="10" value="3" style="width: 50px;">
                     </div>
-                    <div class="control-group">
+                    <div class="control-group" style="display:none;">
                         <input type="checkbox" id="use_heikin_ashi">
                         <label for="use_heikin_ashi">Heikin-Ashi</label>
                     </div>
@@ -7121,10 +7033,6 @@ def index():
                 <label for="large_trades">Options Chain</label>
             </div>
             <div class="chart-checkbox">
-                <input type="checkbox" id="premium" checked>
-                <label for="premium">Premium by Strike</label>
-            </div>
-            <div class="chart-checkbox">
                 <input type="checkbox" id="centroid" checked>
                 <label for="centroid">Call vs Put Centroid Map</label>
             </div>
@@ -7199,7 +7107,7 @@ def index():
         let tvResizeObserver = null;
         // Indicator series references
         let tvIndicatorSeries = {};
-        // Sub-pane charts for RSI, MACD, and ARV
+        // Sub-pane charts for flow indicators, RSI, MACD, and ARV
         let tvRsiChart = null, tvRsiSeries = null;
         let tvMacdChart = null, tvMacdSeries = {};
         let tvArvChart = null, tvArvSeries = null;
@@ -7224,12 +7132,16 @@ def index():
         // kept so they can be removed without a full chart rebuild
         let tvExposurePriceLines = [];
         let tvExpectedMovePriceLines = [];
+        let tvLatestLevelLabelPriceLines = [];
+        let tvLatestLevelLabelSignature = '';
         let tvHistoricalPoints = [];
         let tvHistoricalExpectedMoveSeries = [];
         let tvHistoricalOverlayPending = false;
         let tvHistoricalOverlayDomEventsBound = false;
         let tvHistoricalRenderedPoints = [];
         let tvHistoricalHoverBuckets = new Map();
+        let tvShowLatestLevelLines = true;
+            let tvPriceAboveBubbles = false;
         const tvHistoricalOverlayMaxVisible = 1200;
         const tvHistoricalHoverBucketSize = 48;
         // Track the active ticker so we can reset chart state on ticker change
@@ -7245,9 +7157,119 @@ def index():
         let candleCloseTimerInterval = null;
         // Live price from the streamer (null until first quote arrives)
         let livePrice = null;
+        let lastPriceInfo = null;
+        let marketContextTimer = null;
         // Debounce timer for Plotly price-line updates (avoid flooding relayout calls)
         let plotlyPriceUpdateTimer = null;
         let currentTheme = 'dark';
+
+        const PRICE_LEVEL_EMPTY_FALLBACK_MS = 500;
+        let lastStablePriceLevelTypes = [];
+        let priceLevelEmptySince = 0;
+        let priceLevelClearRefreshTimer = null;
+
+        function readSelectedPriceLevelTypes(root = document) {
+            try {
+                return Array.from(root.querySelectorAll('.levels-option input[type="checkbox"]:checked')).map(cb => cb.value);
+            } catch(e) {
+                return [];
+            }
+        }
+
+        function rememberStablePriceLevelTypes(levels) {
+            if (!levels.length) return;
+            lastStablePriceLevelTypes = levels.slice();
+            priceLevelEmptySince = 0;
+            if (priceLevelClearRefreshTimer) {
+                clearTimeout(priceLevelClearRefreshTimer);
+                priceLevelClearRefreshTimer = null;
+            }
+        }
+
+        function isPriceLevelEmptyFallbackActive() {
+            return !!(
+                priceLevelEmptySince &&
+                lastStablePriceLevelTypes.length &&
+                Date.now() - priceLevelEmptySince < PRICE_LEVEL_EMPTY_FALLBACK_MS
+            );
+        }
+
+        function getSelectedPriceLevelTypes(options = {}) {
+            const root = options.root || document;
+            const levels = readSelectedPriceLevelTypes(root);
+            if (root === document && levels.length) {
+                rememberStablePriceLevelTypes(levels);
+            }
+            if (root === document && !levels.length && options.allowStableFallback !== false && isPriceLevelEmptyFallbackActive()) {
+                return lastStablePriceLevelTypes.slice();
+            }
+            return levels;
+        }
+        window.getSelectedPriceLevelTypes = getSelectedPriceLevelTypes;
+
+        function notePriceLevelSelectionChanged() {
+            const levels = readSelectedPriceLevelTypes();
+            if (levels.length) {
+                rememberStablePriceLevelTypes(levels);
+            } else if (!priceLevelEmptySince) {
+                priceLevelEmptySince = Date.now();
+            }
+            return levels;
+        }
+
+        function schedulePriceLevelEmptyRefresh() {
+            if (priceLevelClearRefreshTimer) return;
+            const elapsed = priceLevelEmptySince ? Date.now() - priceLevelEmptySince : PRICE_LEVEL_EMPTY_FALLBACK_MS;
+            const delay = Math.max(25, PRICE_LEVEL_EMPTY_FALLBACK_MS - elapsed + 25);
+            priceLevelClearRefreshTimer = setTimeout(() => {
+                priceLevelClearRefreshTimer = null;
+                refreshPriceLevelsOnly();
+            }, delay);
+        }
+
+        function getShowLatestLevelLinesSetting() {
+            const toggle = document.getElementById('show_latest_level_lines');
+            return toggle ? toggle.checked : tvShowLatestLevelLines !== false;
+        }
+        window.getShowLatestLevelLinesSetting = getShowLatestLevelLinesSetting;
+
+            function getPriceAboveBubblesSetting() {
+                const toggle = document.getElementById('price_above_bubbles');
+                return toggle ? toggle.checked : tvPriceAboveBubbles === true;
+            }
+            window.getPriceAboveBubblesSetting = getPriceAboveBubblesSetting;
+
+        function setShowLatestLevelLinesSetting(enabled) {
+            tvShowLatestLevelLines = enabled !== false;
+            const toggle = document.getElementById('show_latest_level_lines');
+            if (toggle && toggle.checked !== tvShowLatestLevelLines) {
+                toggle.checked = tvShowLatestLevelLines;
+            }
+            if (lastPriceData && typeof lastPriceData === 'object') {
+                lastPriceData.show_latest_level_lines = tvShowLatestLevelLines;
+            }
+            if (tvPriceChart) {
+                scheduleTVHistoricalOverlayDraw();
+            }
+        }
+
+            function setPriceAboveBubblesSetting(enabled, syncPopout = true) {
+                tvPriceAboveBubbles = enabled === true;
+                const toggle = document.getElementById('price_above_bubbles');
+                if (toggle && toggle.checked !== tvPriceAboveBubbles) {
+                    toggle.checked = tvPriceAboveBubbles;
+                }
+                if (lastPriceData && typeof lastPriceData === 'object') {
+                    lastPriceData.price_above_bubbles = tvPriceAboveBubbles;
+                }
+                if (tvPriceChart) {
+                    scheduleTVHistoricalOverlayDraw();
+                }
+                if (syncPopout && lastPriceData && typeof pushDataToPopout === 'function') {
+                    pushDataToPopout('price-chart');
+                }
+            }
+
 
         const BASE_THEME = {
             '--app-bg': '#0f131a',
@@ -7783,7 +7805,7 @@ def index():
         const PLOTLY_PRICE_LINE_CHARTS = [
             'gamma-chart', 'delta-chart', 'vanna-chart', 'charm-chart',
             'speed-chart', 'vomma-chart', 'color-chart',
-            'options_volume-chart', 'open_interest-chart', 'premium-chart'
+            'options_volume-chart', 'open_interest-chart'
         ];
 
         /**
@@ -7845,6 +7867,7 @@ def index():
                 if (cpLine) {
                     cpLine.textContent = '$' + priceStr;
                 }
+                refreshMarketContextItems(lastPriceInfo, last);
             }
         }
 
@@ -8205,6 +8228,9 @@ def index():
   #price-chart { flex:1; min-height:0; position:relative; }
     .tv-sub-pane { background:var(--chart-bg); border-top:1px solid var(--border-color); flex-shrink:0; position:relative; }
     .tv-sub-pane-hdr { position:absolute; top:4px; left:8px; z-index:5; font-size:10px; color:var(--text-muted); font-weight:bold; pointer-events:none; }
+    .tv-sub-pane-hdr-interactive { display:flex; align-items:center; gap:8px; pointer-events:auto; }
+    .tv-sub-pane-title { pointer-events:none; }
+    .tv-sub-pane-mode { height:20px; padding:0 6px; border-radius:4px; border:1px solid var(--border-color); background:var(--panel-bg-strong); color:var(--text-secondary); font-size:10px; font-weight:normal; }
     .ind-legend { position:absolute; bottom:8px; left:8px; display:none; flex-wrap:wrap; gap:6px; z-index:15; pointer-events:none; }
     .ind-item { font-size:10px; color:var(--text-secondary); display:flex; align-items:center; gap:4px; }
   .ind-swatch { width:14px; height:3px; border-radius:2px; }
@@ -8214,7 +8240,7 @@ def index():
     .tv-ohlc-tooltip .tt-time { color:var(--text-muted); font-size:10px; margin-bottom:2px; }
   .tv-ohlc-tooltip .tt-up { color:#00FF00; }
   .tv-ohlc-tooltip .tt-dn { color:#FF4444; }
-    .tv-historical-overlay { position:absolute; inset:0; z-index:4; pointer-events:none; overflow:hidden; }
+    .tv-historical-overlay { position:absolute; inset:0; z-index:20; pointer-events:none; overflow:hidden; }
     .tv-historical-canvas { position:absolute; inset:0; width:100%; height:100%; pointer-events:none; }
     .tv-historical-bubble { position:absolute; border-radius:999px; transform:translate(-50%,-50%); box-shadow:0 0 0 1px rgba(0,0,0,0.25); opacity:0.95; pointer-events:auto; cursor:pointer; }
         .tv-historical-tooltip { position:absolute; z-index:55; display:none; width:auto !important; height:auto !important; min-width:0; max-width:min(240px,calc(100% - 16px)); padding:8px; border:1px solid var(--tooltip-border); border-radius:10px; background:var(--tooltip-bg); color:var(--text-primary); font-size:10px; line-height:1.25; pointer-events:none; box-shadow:0 14px 36px rgba(0,0,0,0.38); backdrop-filter:blur(10px); flex:none !important; align-self:flex-start; overflow:hidden; white-space:normal; }
@@ -8241,12 +8267,14 @@ def index():
 </div>
 <script>
   // ── State ──────────────────────────────────────────────────────────────────
-  var tvChart=null, tvCandle=null, tvVol=null;
+    var tvChart=null, tvCandle=null, tvVol=null;
+    var tvRightScaleMinWidth=88;
   var tvRsiChart=null, tvRsiSeries=null;
   var tvMacdChart=null, tvMacdSeries={};
   var tvIndSeries={};
   var activeInds=new Set();
-  var tvPriceLines=[], tvDrawings=[], tvDrawingDefs=[];
+    var tvPriceLines=[], tvLatestLevelLabelLines=[], tvDrawings=[], tvDrawingDefs=[];
+    var tvLatestLevelLabelSignature='';
   var tvAllLevelPrices=[];
     var tvHistoricalPoints=[];
   var tvLastCandles=[];
@@ -8262,9 +8290,14 @@ def index():
     var historicalDomBound=false;
     var tvHistoricalRenderedPoints=[];
     var tvHistoricalHoverBuckets=new Map();
+        var tvShowLatestLevelLines=true;
+            var tvPriceAboveBubbles=false;
         var historicalBubbleDrawPending=false;
         var historicalBubbleMaxVisible=1200;
         var historicalBubbleHoverBucketSize=48;
+            var tvPriceColors={up:'#00FF00',down:'#FF0000'};
+
+        function setPriceAboveBubblesSetting(enabled){tvPriceAboveBubbles=enabled===true;}
 
     function getThemeVar(name,fallback){
         var value=getComputedStyle(document.documentElement).getPropertyValue(name).trim();
@@ -8322,11 +8355,21 @@ def index():
   function calcMACD(c,fast,slow,sig){fast=fast||12;slow=slow||26;sig=sig||9;var ef=calcEMA(c,fast),es=calcEMA(c,slow);var ml=ef.map(function(v,i){return(v!==null&&es[i]!==null)?v-es[i]:null;});var sl=[],es2=null,vi=0,k=2/(sig+1);for(var i=0;i<ml.length;i++){if(ml[i]===null){sl.push(null);continue;}if(vi<sig-1){sl.push(null);vi++;continue;}if(es2===null){var piece=ml.filter(function(v){return v!==null;}).slice(0,sig);es2=piece.reduce(function(a,b){return a+b;},0)/sig;}else{es2=ml[i]*k+es2*(1-k);}sl.push(es2);vi++;}return{macd:ml,signal:sl,histogram:ml.map(function(v,i){return(v!==null&&sl[i]!==null)?v-sl[i]:null;})};}
 
     // ── Sub-pane chart factory ─────────────────────────────────────────────────
-        function mkSubChart(el,h){return LightweightCharts.createChart(el,Object.assign({},buildTVThemeOptions(),{autoSize:true,height:h,rightPriceScale:{borderColor:getThemeVar('--border-color','#333'),scaleMargins:{top:0.1,bottom:0.1},minimumWidth:72},localization:{timeFormatter:function(time){var d=new Date(time*1000);return d.toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit',hour12:false,timeZone:'America/New_York'});}},timeScale:{borderColor:getThemeVar('--border-color','#333'),timeVisible:true,secondsVisible:false,fixLeftEdge:false,fixRightEdge:false,tickMarkFormatter:function(time){var d=new Date(time*1000);return d.toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit',hour12:false,timeZone:'America/New_York'});}},handleScale:{mouseWheel:true,pinch:true,axisPressedMouseMove:true},handleScroll:{mouseWheel:true,pressedMouseMove:true,horzTouchDrag:true,vertTouchDrag:false}}));}
+        function mkSubChart(el,h){return LightweightCharts.createChart(el,Object.assign({},buildTVThemeOptions(),{autoSize:true,height:h,rightPriceScale:{borderColor:getThemeVar('--border-color','#333'),scaleMargins:{top:0.1,bottom:0.1},minimumWidth:tvRightScaleMinWidth},localization:{timeFormatter:function(time){var d=new Date(time*1000);return d.toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit',hour12:false,timeZone:'America/New_York'});}},timeScale:{borderColor:getThemeVar('--border-color','#333'),timeVisible:true,secondsVisible:false,fixLeftEdge:false,fixRightEdge:false,tickMarkFormatter:function(time){var d=new Date(time*1000);return d.toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit',hour12:false,timeZone:'America/New_York'});}},handleScale:{mouseWheel:true,pinch:true,axisPressedMouseMove:true},handleScroll:{mouseWheel:true,pressedMouseMove:true,horzTouchDrag:true,vertTouchDrag:false}}));}
 
   // ── Time-scale sync ────────────────────────────────────────────────────────
-  function setupSync(){tvSyncHandlers.forEach(function(h){try{h.chart.timeScale().unsubscribeVisibleLogicalRangeChange(h.handler);}catch(e){}});tvSyncHandlers=[];var all=[tvChart,tvRsiChart,tvMacdChart].filter(Boolean);if(all.length<2)return;all.forEach(function(src){var others=all.filter(function(c){return c!==src;});var h=function(range){if(tvSyncingTS||!range)return;tvSyncingTS=true;others.forEach(function(c){try{c.timeScale().setVisibleLogicalRange(range);}catch(e){}});tvSyncingTS=false;};try{src.timeScale().subscribeVisibleLogicalRangeChange(h);}catch(e){}tvSyncHandlers.push({chart:src,handler:h});});if(tvChart){try{var r=tvChart.timeScale().getVisibleLogicalRange();if(r)[tvRsiChart,tvMacdChart].filter(Boolean).forEach(function(c){try{c.timeScale().setVisibleLogicalRange(r);}catch(e){}});}catch(e){}}}
+    function setupSync(){tvSyncHandlers.forEach(function(h){try{h.chart.timeScale().unsubscribeVisibleLogicalRangeChange(h.handler);}catch(e){}});tvSyncHandlers=[];var all=[tvChart,tvRsiChart,tvMacdChart].filter(Boolean);if(all.length<2)return;all.forEach(function(src){var others=all.filter(function(c){return c!==src;});var h=function(range){if(tvSyncingTS||!range)return;tvSyncingTS=true;others.forEach(function(c){try{c.timeScale().setVisibleLogicalRange(range);}catch(e){}});tvSyncingTS=false;};try{src.timeScale().subscribeVisibleLogicalRangeChange(h);}catch(e){}tvSyncHandlers.push({chart:src,handler:h});});if(tvChart){try{var r=tvChart.timeScale().getVisibleLogicalRange();if(r)[tvRsiChart,tvMacdChart].filter(Boolean).forEach(function(c){try{c.timeScale().setVisibleLogicalRange(r);}catch(e){}});}catch(e){}}}
 
+    function fmtLargeNum(value){
+        var numericValue=Number(value);
+        var absoluteValue=Math.abs(numericValue);
+        if(!Number.isFinite(numericValue))return '0';
+        if(absoluteValue>=1e12)return (numericValue/1e12).toFixed(2)+'T';
+        if(absoluteValue>=1e9)return (numericValue/1e9).toFixed(2)+'B';
+        if(absoluteValue>=1e6)return (numericValue/1e6).toFixed(2)+'M';
+        if(absoluteValue>=1e3)return (numericValue/1e3).toFixed(2)+'K';
+        return numericValue.toLocaleString('en-US',{maximumFractionDigits:0});
+    }
   // ── Indicators ─────────────────────────────────────────────────────────────
   function applyIndicators(candles){
     if(!tvChart||!tvCandle)return;
@@ -8441,32 +8484,46 @@ def index():
     if(tvChart)tvChart.subscribeClick(handleClick);
   }
   function tvApplyAutoscale(){if(!tvCandle)return;var lp=tvAllLevelPrices.slice();tvCandle.applyOptions({autoscaleInfoProvider:function(original){var res=original();if(!res)return res;if(lp.length===0)return res;var pad=(res.priceRange.maxValue-res.priceRange.minValue)*0.05;var minV=Math.min.apply(null,[res.priceRange.minValue].concat(lp))-pad;var maxV=Math.max.apply(null,[res.priceRange.maxValue].concat(lp))+pad;return{priceRange:{minValue:minV,maxValue:maxV},margins:res.margins};}});}
-  function fitAll(){if(!tvChart)return;setTimeout(function(){try{tvChart.timeScale().fitContent();tvChart.priceScale('right').applyOptions({autoScale:true});tvApplyAutoscale();if(tvRsiChart)tvRsiChart.priceScale('right').applyOptions({autoScale:true});if(tvMacdChart)tvMacdChart.priceScale('right').applyOptions({autoScale:true});}catch(e){}},50);}
+    function fitAll(){if(!tvChart)return;setTimeout(function(){try{tvChart.timeScale().fitContent();tvChart.priceScale('right').applyOptions({autoScale:true});tvApplyAutoscale();if(tvRsiChart)tvRsiChart.priceScale('right').applyOptions({autoScale:true});if(tvMacdChart)tvMacdChart.priceScale('right').applyOptions({autoScale:true});}catch(e){}},50);}
     function ensureHistOverlay(){var c=document.getElementById('price-chart');if(!c)return null;var o=c.querySelector('.tv-historical-overlay');if(!o){o=document.createElement('div');o.className='tv-historical-overlay';c.appendChild(o);}return o;}
     function ensureHistCanvas(){var o=ensureHistOverlay();if(!o)return null;var canvas=o.querySelector('.tv-historical-canvas');if(!canvas){canvas=document.createElement('canvas');canvas.className='tv-historical-canvas';o.appendChild(canvas);}return canvas;}
     function syncHistCanvas(canvas,overlay){if(!canvas||!overlay)return null;var dpr=window.devicePixelRatio||1,width=Math.max(1,Math.round(overlay.clientWidth)),height=Math.max(1,Math.round(overlay.clientHeight)),pixelWidth=Math.max(1,Math.round(width*dpr)),pixelHeight=Math.max(1,Math.round(height*dpr));if(canvas.width!==pixelWidth||canvas.height!==pixelHeight){canvas.width=pixelWidth;canvas.height=pixelHeight;canvas.style.width=width+'px';canvas.style.height=height+'px';}var ctx=canvas.getContext('2d');if(!ctx)return null;ctx.setTransform(dpr,0,0,dpr,0,0);ctx.clearRect(0,0,width,height);return{ctx:ctx,width:width,height:height};}
     function ensureHistTip(){var c=document.getElementById('price-chart');if(!c)return null;var t=c.querySelector('.tv-historical-tooltip');if(!t){t=document.createElement('div');t.className='tv-historical-tooltip';c.appendChild(t);}return t;}
     function fmtHistTime(ts){return new Date(ts*1000).toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit',hour12:false,timeZone:'America/New_York'})+' ET';}
     function histTipHtml(p){var dot=p.border_color||p.color||'#fff',name=p.kind==='expected-move'?p.label+' '+p.side:p.label+' '+p.side.charAt(0),value=p.kind==='expected-move'?p.value:'$'+Number(p.price).toFixed(2)+'  '+p.value;return '<div class="tt-row"><span class="tt-dot" style="background:'+dot+'"></span><div class="tt-main"><span class="tt-name">'+name+'</span><span class="tt-value">'+value+'</span></div></div>';}
+    function snapshotBubblePoints(pd){var candles=pd.candles&&pd.candles.length?pd.candles:tvLastCandles,latest=candles&&candles.length?candles[candles.length-1]:null,t=latest?latest.time:null;if(!t)return[];var pts=[],levels=Array.isArray(pd.exposure_levels)?pd.exposure_levels:[];levels.forEach(function(level,index){var price=Number(level.price),raw=Number(level.value);if(!Number.isFinite(price))return;var label=level.type||'Level',value=level.label?String(level.label).replace(/^.*?:\s*/,''):fmtLargeNum(raw),base=raw>=0?(pd.call_color||'#00FF00'):(pd.put_color||'#FF0000');pts.push({time:t,price:price,size:level.is_max?16:12,color:level.color||base,border_color:level.is_max?(pd.max_level_color||'#800080'):base,border_width:level.is_max?2:Math.max(1,Number(level.line_width)||1),label:label,rank:index+1,side:raw>=0?'Call':'Put',value:value,kind:'exposure'});});var moves=Array.isArray(pd.expected_moves)?pd.expected_moves:[];moves.forEach(function(move,index){var upper=Number(move.upper),lower=Number(move.lower),moveValue=(Number.isFinite(upper)&&Number.isFinite(lower))?'$'+(Math.abs(upper-lower)/2).toFixed(2):'';[['Upper',upper],['Lower',lower]].forEach(function(item){var side=item[0],price=Number(item[1]);if(!Number.isFinite(price))return;pts.push({time:t,price:price,size:13,color:'rgba(3,107,252,0.82)',border_color:'#81b4ff',border_width:1,label:'Expected Move',rank:levels.length+index+1,side:side,value:moveValue,kind:'expected-move'});});});return pts;}
+    function bubblePointKey(p){return[p.time||'',Number(p.price).toFixed(4),p.kind||'exposure',p.label||'',p.side||''].join('|');}
+    function applyBubbleOverlaps(points){var groups=new Map();points.forEach(function(p){var key=[p.time||'',Number(p.price).toFixed(4),p.kind||'exposure'].join('|'),group=groups.get(key);if(!group){group=[];groups.set(key,group);}group.push(p);});groups.forEach(function(group){group.forEach(function(p,index){p.overlap_slot=index;p.overlap_count=group.length;});});return points;}
+    function priceLevelBubblePoints(pd){var hist=Array.isArray(pd.historical_exposure_levels)?pd.historical_exposure_levels.filter(function(p){return p&&p.time&&Number.isFinite(Number(p.price));}).map(function(p){return Object.assign({},p);}):[],snap=snapshotBubblePoints(pd);if(!hist.length)return applyBubbleOverlaps(snap);if(!snap.length)return applyBubbleOverlaps(hist);var seen=new Set(hist.map(function(p){return bubblePointKey(p);}));snap.forEach(function(p){var key=bubblePointKey(p);if(!seen.has(key)){seen.add(key);hist.push(p);}});return applyBubbleOverlaps(hist);}
+    function latestLevelKey(p){if((p.kind||'')==='expected-move')return['expected-move',p.label||'',p.side||''].join('|');return['exposure',p.label||'',p.rank||''].join('|');}
+    function latestLevelText(p){if((p.kind||'')==='expected-move'){var moveSide=p.side?' '+p.side:'';return(p.label||'Expected Move')+moveSide+': '+(p.value||'');}return(p.label||'Level')+': '+(p.value||'');}
+    function buildNativeLevelLabelSignature(points){if(!tvShowLatestLevelLines||!points.length)return '';return points.map(function(p){return[Number(p.price),p.border_color||p.color||'#fff',latestLevelText(p)].join('|');}).join('||');}
+    function clearNativeLevelLabels(){tvLatestLevelLabelSignature='';if(tvCandle&&tvLatestLevelLabelLines.length){tvLatestLevelLabelLines.forEach(function(line){try{tvCandle.removePriceLine(line);}catch(e){}});}tvLatestLevelLabelLines=[];}
+    function setNativeLevelLabels(points){var signature=buildNativeLevelLabelSignature(points);if(signature&&signature===tvLatestLevelLabelSignature)return;clearNativeLevelLabels();if(!tvShowLatestLevelLines||!tvCandle||!points.length)return;tvLatestLevelLabelSignature=signature;points.forEach(function(p){var price=Number(p.price);if(!Number.isFinite(price))return;var line=tvCandle.createPriceLine({price:price,color:p.border_color||p.color||'#fff',lineWidth:0,lineStyle:LightweightCharts.LineStyle.Dashed,axisLabelVisible:true,title:latestLevelText(p)});tvLatestLevelLabelLines.push(line);});}
+    function drawLatestLevelLines(ctx,width,height){if(!tvShowLatestLevelLines||!tvHistoricalRenderedPoints.length){clearNativeLevelLabels();return;}var latestByKey=new Map();tvHistoricalRenderedPoints.forEach(function(p){if(!p||p.x==null||p.y==null)return;var key=latestLevelKey(p),existing=latestByKey.get(key);if(!existing||p.time>existing.time||(p.time===existing.time&&p.x>existing.x))latestByKey.set(key,p);});var points=Array.from(latestByKey.values()).sort(function(a,b){return a.y-b.y;});if(!points.length){clearNativeLevelLabels();return;}setNativeLevelLabels(points);ctx.save();points.forEach(function(p){var color=p.border_color||p.color||'#fff',radius=(p.size||8)/2,lineStartX=Math.max(0,p.x+radius+3),lineEndX=Math.max(lineStartX,width-2);if(lineEndX<=lineStartX)return;ctx.save();ctx.strokeStyle=color;ctx.lineWidth=p.border_width||1;ctx.globalAlpha=0.92;ctx.setLineDash([4,4]);ctx.beginPath();ctx.moveTo(lineStartX,p.y);ctx.lineTo(lineEndX,p.y);ctx.stroke();ctx.restore();});ctx.restore();}
     function posHistTip(t,e){var c=document.getElementById('price-chart');if(!t||!c||!e)return;var b=c.getBoundingClientRect();var l=Math.min(Math.max(8,e.clientX-b.left+12),Math.max(8,b.width-t.offsetWidth-8));var top=Math.min(Math.max(8,e.clientY-b.top+12),Math.max(8,b.height-t.offsetHeight-8));t.style.left=l+'px';t.style.top=top+'px';}
     function addHistHoverPoint(point){var hoverRadius=Math.max(8,(point.size||8)/2+5),minBucketX=Math.floor((point.x-hoverRadius)/historicalBubbleHoverBucketSize),maxBucketX=Math.floor((point.x+hoverRadius)/historicalBubbleHoverBucketSize),minBucketY=Math.floor((point.y-hoverRadius)/historicalBubbleHoverBucketSize),maxBucketY=Math.floor((point.y+hoverRadius)/historicalBubbleHoverBucketSize);for(var bucketX=minBucketX;bucketX<=maxBucketX;bucketX++){for(var bucketY=minBucketY;bucketY<=maxBucketY;bucketY++){var key=bucketX+':'+bucketY,bucket=tvHistoricalHoverBuckets.get(key);if(!bucket){bucket=[];tvHistoricalHoverBuckets.set(key,bucket);}bucket.push(point);}}}
     function getHistHoverCandidates(cx,cy){if(!tvHistoricalHoverBuckets.size)return tvHistoricalRenderedPoints;var minBucketX=Math.floor((cx-32)/historicalBubbleHoverBucketSize),maxBucketX=Math.floor((cx+32)/historicalBubbleHoverBucketSize),minBucketY=Math.floor((cy-32)/historicalBubbleHoverBucketSize),maxBucketY=Math.floor((cy+32)/historicalBubbleHoverBucketSize),seen=new Set(),candidates=[];for(var bucketX=minBucketX;bucketX<=maxBucketX;bucketX++){for(var bucketY=minBucketY;bucketY<=maxBucketY;bucketY++){var bucket=tvHistoricalHoverBuckets.get(bucketX+':'+bucketY);if(!bucket)continue;bucket.forEach(function(point){if(seen.has(point))return;seen.add(point);candidates.push(point);});}}return candidates;}
     function findHistHoverPoints(e){var c=document.getElementById('price-chart');if(!c||!tvHistoricalRenderedPoints.length)return[];var b=c.getBoundingClientRect(),cx=e.clientX-b.left,cy=e.clientY-b.top;return getHistHoverCandidates(cx,cy).filter(function(p){var dx=cx-p.x,dy=cy-p.y,r=Math.max(8,(p.size||8)/2+5);return(dx*dx+dy*dy)<=(r*r);}).sort(function(a,bp){var ad=(cx-a.x)*(cx-a.x)+(cy-a.y)*(cy-a.y),bd=(cx-bp.x)*(cx-bp.x)+(cy-bp.y)*(cy-bp.y);return ad-bd;});}
     function updateHistTip(e){var t=ensureHistTip();if(!t)return;if(e&&e.buttons){t.style.display='none';return;}var pts=findHistHoverPoints(e);if(!pts.length){t.style.display='none';return;}var topPts=pts.slice(0,5),anchorTime=topPts[0].time;t.innerHTML='<div class="tt-head"><span class="tt-badge">'+pts.length+' bubble'+(pts.length===1?'':'s')+'</span><div class="tt-time">'+fmtHistTime(anchorTime)+'</div></div><div class="tt-list">'+topPts.map(function(p){return histTipHtml(p);}).join('')+'</div>'+(pts.length>topPts.length?'<div class="tt-more">+'+(pts.length-topPts.length)+' more</div>':'');t.style.display='block';posHistTip(t,e);}
     function getVisibleHistoricalBubblePoints(){if(!tvHistoricalPoints.length)return[];var pts=tvHistoricalPoints;try{var range=tvChart.timeScale().getVisibleLogicalRange();if(range&&tvLastCandles.length){var li=Math.max(0,Math.floor(range.from)-2),ri=Math.min(tvLastCandles.length-1,Math.ceil(range.to)+2),left=tvLastCandles[li],right=tvLastCandles[ri];if(left&&right){var span=tvLastCandles.length>1?Math.max(60,tvLastCandles[1].time-tvLastCandles[0].time):60,minTime=left.time-(span*2),maxTime=right.time+(span*2);pts=tvHistoricalPoints.filter(function(p){return p.time>=minTime&&p.time<=maxTime;});}}}catch(e){}if(pts.length<=historicalBubbleMaxVisible)return pts;var priority=[],secondary=[];pts.forEach(function(p){if(p.kind==='expected-move'||p.rank===1)priority.push(p);else secondary.push(p);});if(priority.length>=historicalBubbleMaxVisible){var pStride=Math.ceil(priority.length/historicalBubbleMaxVisible);return priority.filter(function(_,i){return i%pStride===0;});}var slots=Math.max(0,historicalBubbleMaxVisible-priority.length);if(!secondary.length||slots===0)return priority;var stride=Math.ceil(secondary.length/slots);return priority.concat(secondary.filter(function(_,i){return i%stride===0;}));}
-    function drawHistoricalBubbles(){var o=ensureHistOverlay(),canvas=ensureHistCanvas(),t=ensureHistTip();if(!o||!canvas||!tvChart||!tvCandle)return;tvHistoricalRenderedPoints=[];tvHistoricalHoverBuckets=new Map();var canvasState=syncHistCanvas(canvas,o);if(!canvasState){o.style.display='none';if(t)t.style.display='none';return;}var ctx=canvasState.ctx,width=canvasState.width,height=canvasState.height;if(!tvHistoricalPoints.length){o.style.display='none';if(t)t.style.display='none';return;}var points=getVisibleHistoricalBubblePoints();if(!points.length){o.style.display='none';if(t)t.style.display='none';return;}var visible=0;points.forEach(function(p){var x=tvChart.timeScale().timeToCoordinate(p.time),y=tvCandle.priceToCoordinate(p.price);if(x==null||y==null||Number.isNaN(x)||Number.isNaN(y))return;var size=p.size||8,radius=size/2,overlapCount=Math.max(1,p.overlap_count||1),overlapSlot=Math.max(0,Math.min(overlapCount-1,p.overlap_slot||0)),offsetStep=Math.max(4,Math.min(10,radius*0.9)),offsetX=overlapCount>1?(overlapSlot-((overlapCount-1)/2))*offsetStep:0,drawX=x+offsetX,hoverRadius=Math.max(8,radius+5);if(drawX<-hoverRadius||drawX>width+hoverRadius||y<-hoverRadius||y>height+hoverRadius)return;ctx.save();ctx.globalAlpha=0.95;ctx.fillStyle=p.color||'rgba(255,255,255,0.6)';ctx.beginPath();ctx.arc(drawX,y,radius,0,Math.PI*2);ctx.fill();ctx.globalAlpha=1;ctx.strokeStyle='rgba(0,0,0,0.25)';ctx.lineWidth=1;ctx.beginPath();ctx.arc(drawX,y,radius+1,0,Math.PI*2);ctx.stroke();ctx.strokeStyle=p.border_color||p.color||'#fff';ctx.lineWidth=p.border_width||1;ctx.beginPath();ctx.arc(drawX,y,Math.max(0.5,radius-((p.border_width||1)/2)),0,Math.PI*2);ctx.stroke();ctx.restore();var renderedPoint=Object.assign({},p,{x:drawX,y:y});tvHistoricalRenderedPoints.push(renderedPoint);addHistHoverPoint(renderedPoint);visible++;});o.style.display=visible>0?'block':'none';}
+        function getVisibleOverlayCandles(){if(!tvLastCandles.length||!tvChart)return[];var candles=tvLastCandles;try{var range=tvChart.timeScale().getVisibleLogicalRange();if(range){var li=Math.max(0,Math.floor(range.from)-2),ri=Math.min(tvLastCandles.length-1,Math.ceil(range.to)+2);candles=tvLastCandles.slice(li,ri+1);}}catch(e){}return candles;}
+        function drawPriceAboveBubbles(ctx,width){if(!tvPriceAboveBubbles||!tvChart||!tvCandle||!tvLastCandles.length)return;var candlePoints=getVisibleOverlayCandles().map(function(candle){return{candle:candle,x:tvChart.timeScale().timeToCoordinate(candle.time)};}).filter(function(point){return point.x!=null&&!Number.isNaN(point.x)&&point.x>=-24&&point.x<=width+24;}).sort(function(left,right){return left.x-right.x;});if(!candlePoints.length)return;var minDelta=Infinity;for(var index=1;index<candlePoints.length;index++){var delta=candlePoints[index].x-candlePoints[index-1].x;if(delta>0&&delta<minDelta)minDelta=delta;}var bodyWidth=Number.isFinite(minDelta)?Math.max(3,Math.min(14,Math.round(minDelta*0.68))):5,halfWidth=bodyWidth/2,upColor=tvPriceColors.up||'#00FF00',downColor=tvPriceColors.down||'#FF0000';ctx.save();candlePoints.forEach(function(entry){var candle=entry.candle,x=entry.x,openY=tvCandle.priceToCoordinate(candle.open),highY=tvCandle.priceToCoordinate(candle.high),lowY=tvCandle.priceToCoordinate(candle.low),closeY=tvCandle.priceToCoordinate(candle.close);if([openY,highY,lowY,closeY].some(function(value){return value==null||Number.isNaN(value);})){return;}var color=candle.close>=candle.open?upColor:downColor,wickTop=Math.min(highY,lowY),wickBottom=Math.max(highY,lowY),bodyTop=Math.min(openY,closeY),bodyBottom=Math.max(openY,closeY),bodyHeight=Math.max(1,Math.round(bodyBottom-bodyTop)),left=Math.round(x-halfWidth),centerX=Math.round(x)+0.5;ctx.strokeStyle=color;ctx.fillStyle=color;ctx.lineWidth=1;ctx.beginPath();ctx.moveTo(centerX,wickTop);ctx.lineTo(centerX,wickBottom);ctx.stroke();ctx.fillRect(left,Math.round(bodyTop),bodyWidth,bodyHeight);});ctx.restore();}
+        function drawHistoricalBubbles(){var o=ensureHistOverlay(),canvas=ensureHistCanvas(),t=ensureHistTip();if(!o||!canvas||!tvChart||!tvCandle){clearNativeLevelLabels();return;}tvHistoricalRenderedPoints=[];tvHistoricalHoverBuckets=new Map();if(!tvHistoricalPoints.length){clearNativeLevelLabels();o.style.display='none';if(t)t.style.display='none';return;}o.style.display='block';var canvasState=syncHistCanvas(canvas,o);if(!canvasState){clearNativeLevelLabels();o.style.display='none';if(t)t.style.display='none';return;}var ctx=canvasState.ctx,width=canvasState.width,height=canvasState.height;var points=getVisibleHistoricalBubblePoints();if(!points.length){clearNativeLevelLabels();o.style.display='none';if(t)t.style.display='none';return;}var visible=0;points.forEach(function(p){var x=tvChart.timeScale().timeToCoordinate(p.time),y=tvCandle.priceToCoordinate(p.price);if(x==null||y==null||Number.isNaN(x)||Number.isNaN(y))return;var size=p.size||8,radius=size/2,overlapCount=Math.max(1,p.overlap_count||1),overlapSlot=Math.max(0,Math.min(overlapCount-1,p.overlap_slot||0)),offsetStep=Math.max(4,Math.min(10,radius*0.9)),offsetX=overlapCount>1?(overlapSlot-((overlapCount-1)/2))*offsetStep:0,drawX=x+offsetX,hoverRadius=Math.max(8,radius+5);if(drawX<-hoverRadius||drawX>width+hoverRadius||y<-hoverRadius||y>height+hoverRadius)return;ctx.save();ctx.globalAlpha=0.95;ctx.fillStyle=p.color||'rgba(255,255,255,0.6)';ctx.beginPath();ctx.arc(drawX,y,radius,0,Math.PI*2);ctx.fill();ctx.globalAlpha=1;ctx.strokeStyle='rgba(0,0,0,0.25)';ctx.lineWidth=1;ctx.beginPath();ctx.arc(drawX,y,radius+1,0,Math.PI*2);ctx.stroke();ctx.strokeStyle=p.border_color||p.color||'#fff';ctx.lineWidth=p.border_width||1;ctx.beginPath();ctx.arc(drawX,y,Math.max(0.5,radius-((p.border_width||1)/2)),0,Math.PI*2);ctx.stroke();ctx.restore();var renderedPoint=Object.assign({},p,{x:drawX,y:y});tvHistoricalRenderedPoints.push(renderedPoint);addHistHoverPoint(renderedPoint);visible++;});if(visible>0){drawLatestLevelLines(ctx,width,height);drawPriceAboveBubbles(ctx,width);}else clearNativeLevelLabels();o.style.display=visible>0?'block':'none';}
     function scheduleHistoricalBubbleDraw(){if(historicalBubbleDrawPending)return;historicalBubbleDrawPending=true;requestAnimationFrame(function(){historicalBubbleDrawPending=false;drawHistoricalBubbles();});}
 
   // ── Main renderer ──────────────────────────────────────────────────────────
   var isFirstRender=true;
   function renderPriceChart(priceData){
-    var candles=priceData.candles||[];
     var upColor=priceData.call_color||'#00FF00',downColor=priceData.put_color||'#FF0000';
+        if(priceData.price_above_bubbles!==undefined)setPriceAboveBubblesSetting(priceData.price_above_bubbles);
+        tvPriceColors={up:upColor,down:downColor};
+        var candles=priceData.candles||[];
     popoutTimeframe=parseInt(priceData.timeframe)||1;
     lineStyleMap={dashed:LightweightCharts.LineStyle.Dashed,dotted:LightweightCharts.LineStyle.Dotted,large_dashed:LightweightCharts.LineStyle.LargeDashed};
     if(!tvChart){
       var el=document.getElementById('price-chart');
-    tvChart=LightweightCharts.createChart(el,Object.assign({},buildTVThemeOptions(),{autoSize:true,rightPriceScale:{borderColor:getThemeVar('--border-color','#333'),scaleMargins:{top:0.04,bottom:0.15},minimumWidth:72},localization:{timeFormatter:function(time){var d=new Date(time*1000);return d.toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit',hour12:false,timeZone:'America/New_York'});}},timeScale:{borderColor:getThemeVar('--border-color','#333'),timeVisible:true,secondsVisible:false,fixLeftEdge:false,fixRightEdge:false,tickMarkFormatter:function(time){var d=new Date(time*1000);return d.toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit',hour12:false,timeZone:'America/New_York'});}},handleScale:{mouseWheel:true,pinch:true,axisPressedMouseMove:true},handleScroll:{mouseWheel:true,pressedMouseMove:true,horzTouchDrag:true,vertTouchDrag:false}}));
+    tvChart=LightweightCharts.createChart(el,Object.assign({},buildTVThemeOptions(),{autoSize:true,rightPriceScale:{borderColor:getThemeVar('--border-color','#333'),scaleMargins:{top:0.04,bottom:0.15},minimumWidth:tvRightScaleMinWidth},localization:{timeFormatter:function(time){var d=new Date(time*1000);return d.toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit',hour12:false,timeZone:'America/New_York'});}},timeScale:{borderColor:getThemeVar('--border-color','#333'),timeVisible:true,secondsVisible:false,fixLeftEdge:false,fixRightEdge:false,tickMarkFormatter:function(time){var d=new Date(time*1000);return d.toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit',hour12:false,timeZone:'America/New_York'});}},handleScale:{mouseWheel:true,pinch:true,axisPressedMouseMove:true},handleScroll:{mouseWheel:true,pressedMouseMove:true,horzTouchDrag:true,vertTouchDrag:false}}));
       tvCandle=tvChart.addCandlestickSeries({upColor:upColor,downColor:downColor,borderVisible:false,wickUpColor:upColor,wickDownColor:downColor});
       tvVol=tvChart.addHistogramSeries({priceFormat:{type:'volume'},priceScaleId:'volume',lastValueVisible:false,priceLineVisible:false});
       tvChart.priceScale('volume').applyOptions({scaleMargins:{top:0.88,bottom:0}});
@@ -8498,7 +8555,8 @@ def index():
     tvVol.setData(priceData.volume||[]);
     tvLastCandles=candles;
         tvPriceLines.forEach(function(l){try{tvCandle.removePriceLine(l);}catch(e){}});tvPriceLines=[];tvAllLevelPrices=[];
-        tvHistoricalPoints=priceData.historical_exposure_levels||[];
+        tvShowLatestLevelLines=priceData.show_latest_level_lines!==false;
+        tvHistoricalPoints=priceLevelBubblePoints(priceData);
         tvHistoricalPoints.forEach(function(p){tvAllLevelPrices.push(p.price);});
         scheduleHistoricalBubbleDraw();
     tvApplyAutoscale();
@@ -8557,15 +8615,15 @@ def index():
       var op=window.opener;if(!op||op.closed)return null;
       var d=op.document;
       function val(id){var el=d.getElementById(id);return el?el.value:null;}
-      function chk(id){var el=d.getElementById(id);return el?el.checked:false;}
+    function chk(id,defaultValue){var el=d.getElementById(id);return el?el.checked:!!defaultValue;}
       var ticker=val('ticker');if(!ticker)return null;
             var expiry=[];
       var levelsTypes=[];
             try{expiry=Array.from(d.querySelectorAll('.expiry-option input[type="checkbox"]:checked')).map(function(cb){return cb.value;});}catch(e){}
-      try{levelsTypes=Array.from(d.querySelectorAll('.levels-option input:checked')).map(function(cb){return cb.value;});}catch(e){}
+            try{levelsTypes=op.getSelectedPriceLevelTypes?op.getSelectedPriceLevelTypes():Array.from(d.querySelectorAll('.levels-option input:checked')).map(function(cb){return cb.value;});}catch(e){}
             var themePayload=null;
             try{if(op.buildPopoutThemePayload)themePayload=op.buildPopoutThemePayload();}catch(e){}
-                        return{ticker:ticker,expiry:expiry,timeframe:val('timeframe')||'1',call_color:val('call_color')||'#00ff00',put_color:val('put_color')||'#ff0000',levels_types:levelsTypes,levels_count:parseInt(val('levels_count'))||3,use_heikin_ashi:chk('use_heikin_ashi'),strike_range:parseFloat(val('strike_range'))/100||0.1,highlight_max_level:chk('highlight_max_level'),max_level_color:val('max_level_color')||'#800080',coloring_mode:val('coloring_mode')||'Linear Intensity',theme_payload:themePayload};
+                                                return{ticker:ticker,expiry:expiry,timeframe:val('timeframe')||'1',call_color:val('call_color')||'#00ff00',put_color:val('put_color')||'#ff0000',levels_types:levelsTypes,levels_count:parseInt(val('levels_count'))||3,use_heikin_ashi:chk('use_heikin_ashi'),strike_range:parseFloat(val('strike_range'))/100||0.1,highlight_max_level:chk('highlight_max_level'),show_latest_level_lines:op.getShowLatestLevelLinesSetting?op.getShowLatestLevelLinesSetting():chk('show_latest_level_lines',true),price_above_bubbles:op.getPriceAboveBubblesSetting?op.getPriceAboveBubblesSetting():false,max_level_color:val('max_level_color')||'#800080',coloring_mode:val('coloring_mode')||'Linear Intensity',exposure_metric:val('exposure_metric')||'Open Interest',delta_adjusted:chk('delta_adjusted_exposures'),calculate_in_notional:chk('calculate_in_notional',true),theme_payload:themePayload};
     }catch(e){return null;}
   }
   function loadInitialData(){
@@ -8573,6 +8631,7 @@ def index():
     var settings=getSettingsFromOpener();
     if(!settings||!settings.ticker)return;
         if(settings.theme_payload)applyPopoutTheme(settings.theme_payload);
+        setPriceAboveBubblesSetting(settings.price_above_bubbles);
     popoutFetching=true;
     fetch('/update_price',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(settings)})
       .then(function(r){return r.json();})
@@ -8605,6 +8664,7 @@ def index():
     if(popoutFetching||!popoutCurrentTicker)return;
     var settings=getSettingsFromOpener();
     if(!settings)return;
+        setPriceAboveBubblesSetting(settings.price_above_bubbles);
     popoutFetching=true;
     fetch('/update_price',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(settings)})
       .then(function(r){return r.json();})
@@ -8615,7 +8675,8 @@ def index():
           if(tvCandle){
             tvPriceLines.forEach(function(l){try{tvCandle.removePriceLine(l);}catch(e){}});
             tvPriceLines=[];tvAllLevelPrices=[];
-                        tvHistoricalPoints=pd.historical_exposure_levels||[];
+                                                tvShowLatestLevelLines=pd.show_latest_level_lines!==false;
+                        tvHistoricalPoints=priceLevelBubblePoints(pd);
                         tvHistoricalPoints.forEach(function(p){tvAllLevelPrices.push(p.price);});
                         scheduleHistoricalBubbleDraw();
             tvApplyAutoscale();
@@ -9167,7 +9228,7 @@ def index():
         document.getElementById('exposure_metric').addEventListener('change', updateData);
         document.getElementById('heatmap_type').addEventListener('change', updateHeatmapOnly);
         document.getElementById('heatmap_coloring_mode').addEventListener('change', updateHeatmapOnly);
-        document.getElementById('levels_count').addEventListener('input', updateData);
+        document.getElementById('levels_count').addEventListener('input', refreshPriceLevelsOnly);
         document.getElementById('abs_gex_opacity').addEventListener('input', updateData);
 
         function getSelectedExpiryValues() {
@@ -9375,7 +9436,7 @@ def index():
                 value = formatTooltipMoney(point.y != null ? point.y : point.x);
             } else {
                 let rawValue = point?.fullData?.orientation === 'h' ? point.x : point.y;
-                if (traceName === 'Put' && typeof rawValue === 'number') {
+                if (/^(Put|Sell)$/i.test(traceName) && typeof rawValue === 'number') {
                     rawValue = Math.abs(rawValue);
                 }
                 if (typeof rawValue === 'number') {
@@ -9705,6 +9766,29 @@ def index():
             }
         }
 
+        function refreshPriceLevelsOnly() {
+            const rawLevels = notePriceLevelSelectionChanged();
+            updateLevelsDisplay();
+            syncMobilePanelButtons();
+            const hasLastData = !!(lastData && Object.keys(lastData).length);
+            if (!rawLevels.length && isPriceLevelEmptyFallbackActive()) {
+                schedulePriceLevelEmptyRefresh();
+                return;
+            }
+            if (!rawLevels.length && tvPriceChart) {
+                tvHistoricalPoints = [];
+                clearTVLatestLevelNativeLabels();
+                scheduleTVHistoricalOverlayDraw();
+            }
+            if (document.getElementById('price').checked) {
+                _priceHistoryLastKey = '';
+                fetchPriceHistory(true);
+            }
+            if (!hasLastData && !updateInProgress) {
+                updateData();
+            }
+        }
+
         document.getElementById('levels-display').addEventListener('click', function(e) {
             e.stopPropagation();
             const options = document.getElementById('levels-options');
@@ -9714,9 +9798,7 @@ def index():
         // Add event listeners for level checkboxes
         document.querySelectorAll('.levels-option input[type="checkbox"]').forEach(checkbox => {
             checkbox.addEventListener('change', function() {
-                updateLevelsDisplay();
-                syncMobilePanelButtons();
-                updateData();
+                refreshPriceLevelsOnly();
             });
         });
         
@@ -9760,7 +9842,7 @@ def index():
             const showPuts = document.getElementById('show_puts').checked;
             const showNet = document.getElementById('show_net').checked;
             const coloringMode = document.getElementById('coloring_mode').value;
-            const levelsTypes = Array.from(document.querySelectorAll('.levels-option input:checked')).map(cb => cb.value);
+            const levelsTypes = getSelectedPriceLevelTypes();
             const levelsCount = parseInt(document.getElementById('levels_count').value);
             const useHeikinAshi = document.getElementById('use_heikin_ashi').checked;
             const horizontalBars = document.getElementById('horizontal_bars').checked;
@@ -9775,6 +9857,7 @@ def index():
             const strikeRange = parseFloat(document.getElementById('strike_range').value) / 100;
             const highlightMaxLevel = document.getElementById('highlight_max_level').checked;
             const maxLevelMode = document.getElementById('max_level_mode').value;
+            const showLatestLevelLines = getShowLatestLevelLinesSetting();
             
             // Get visible charts
             const visibleCharts = {
@@ -9791,7 +9874,6 @@ def index():
                 show_open_interest: document.getElementById('open_interest').checked,
                 show_volume: document.getElementById('volume').checked,
                 show_large_trades: document.getElementById('large_trades').checked,
-                show_premium: document.getElementById('premium').checked,
                 show_centroid: document.getElementById('centroid').checked
             };
 
@@ -9806,6 +9888,7 @@ def index():
                 use_heikin_ashi: useHeikinAshi,
                 strike_range: strikeRange,
                 highlight_max_level: highlightMaxLevel,
+                show_latest_level_lines: showLatestLevelLines,
                 max_level_color: maxLevelColor,
                 coloring_mode: coloringMode
             };
@@ -9867,6 +9950,7 @@ def index():
                     call_color: callColor,
                     put_color: putColor,
                     highlight_max_level: highlightMaxLevel,
+                    show_latest_level_lines: showLatestLevelLines,
                     max_level_color: maxLevelColor,
                     max_level_mode: maxLevelMode,
                     show_price: false,  // price is fetched independently via /update_price
@@ -10317,12 +10401,14 @@ def index():
         }
 
         // ── Sub-pane chart helper functions ──────────────────────────────────
+        const tvRightScaleMinimumWidth = 88;
+
         function createSubPaneChart(element, height) {
             if (!element) return null;
             return LightweightCharts.createChart(element, Object.assign({}, buildLightweightThemeOptions(), {
                 autoSize: true,
                 height: height,
-                rightPriceScale: { borderColor: getThemeValue('--border-color', '#333333'), scaleMargins: { top: 0.1, bottom: 0.1 }, minimumWidth: 72 },
+                rightPriceScale: { borderColor: getThemeValue('--border-color', '#333333'), scaleMargins: { top: 0.1, bottom: 0.1 }, minimumWidth: tvRightScaleMinimumWidth },
                 localization: {
                     timeFormatter: (time) => {
                         const d = new Date(time * 1000);
@@ -10491,6 +10577,7 @@ def index():
                 tvArvSeries = null;
             }
         }
+
 
         // ── Drawing tools ─────────────────────────────────────────────────────
         function setDrawMode(mode) {
@@ -10828,6 +10915,70 @@ def index():
             renderIndicatorOptions();
             toolbar.appendChild(indicatorPicker);
 
+            const heikinAshiInput = document.getElementById('use_heikin_ashi');
+            if (heikinAshiInput) {
+                const chartSettingsPicker = document.createElement('details');
+                chartSettingsPicker.className = 'tv-indicator-picker';
+                const chartSettingsSummary = document.createElement('summary');
+                chartSettingsSummary.className = 'tv-tb-btn tv-indicator-summary';
+                chartSettingsSummary.title = 'Chart display settings';
+                const chartSettingsLabel = document.createElement('span');
+                chartSettingsLabel.textContent = 'Chart';
+                const chartSettingsBadge = document.createElement('span');
+                chartSettingsBadge.className = 'tv-indicator-badge';
+                chartSettingsSummary.appendChild(chartSettingsLabel);
+                chartSettingsSummary.appendChild(chartSettingsBadge);
+                chartSettingsPicker.appendChild(chartSettingsSummary);
+
+                const chartSettingsMenu = document.createElement('div');
+                chartSettingsMenu.className = 'tv-indicator-menu tv-settings-menu';
+                const heikinAshiRow = document.createElement('label');
+                heikinAshiRow.className = 'tv-settings-row';
+                heikinAshiRow.title = 'Render the price chart with Heikin-Ashi candles';
+                const heikinAshiToggle = document.createElement('input');
+                heikinAshiToggle.type = 'checkbox';
+                const heikinAshiCopy = document.createElement('div');
+                heikinAshiCopy.className = 'tv-settings-copy';
+                const heikinAshiName = document.createElement('span');
+                heikinAshiName.className = 'tv-settings-name';
+                heikinAshiName.textContent = 'Heikin-Ashi';
+                const heikinAshiDesc = document.createElement('span');
+                heikinAshiDesc.className = 'tv-settings-desc';
+                heikinAshiDesc.textContent = 'Use smoothed Heikin-Ashi candles in the price chart.';
+                heikinAshiCopy.appendChild(heikinAshiName);
+                heikinAshiCopy.appendChild(heikinAshiDesc);
+                heikinAshiRow.appendChild(heikinAshiToggle);
+                heikinAshiRow.appendChild(heikinAshiCopy);
+                chartSettingsMenu.appendChild(heikinAshiRow);
+                chartSettingsPicker.appendChild(chartSettingsMenu);
+
+                function syncChartSettingsSummary() {
+                    heikinAshiToggle.checked = !!heikinAshiInput.checked;
+                    chartSettingsBadge.textContent = 'HA';
+                    chartSettingsBadge.style.display = heikinAshiToggle.checked ? 'inline-flex' : 'none';
+                    chartSettingsSummary.title = heikinAshiToggle.checked
+                        ? 'Chart display settings · Heikin-Ashi on'
+                        : 'Chart display settings';
+                }
+
+                chartSettingsPicker.addEventListener('toggle', () => {
+                    if (chartSettingsPicker.open) {
+                        syncChartSettingsSummary();
+                    }
+                });
+                heikinAshiToggle.addEventListener('change', () => {
+                    if (heikinAshiInput.checked !== heikinAshiToggle.checked) {
+                        heikinAshiInput.checked = heikinAshiToggle.checked;
+                        heikinAshiInput.dispatchEvent(new Event('change', { bubbles: true }));
+                    }
+                    syncChartSettingsSummary();
+                    chartSettingsPicker.open = false;
+                });
+
+                syncChartSettingsSummary();
+                toolbar.appendChild(chartSettingsPicker);
+            }
+
             const levelDefs = Array.from(document.querySelectorAll('.levels-option input[type="checkbox"]')).map(input => {
                 const label = document.querySelector(`label[for="${input.id}"]`);
                 return {
@@ -10860,7 +11011,9 @@ def index():
             const levelsOptions = document.createElement('div');
             levelsOptions.className = 'tv-indicator-options';
             const levelsFooter = document.createElement('div');
-            levelsFooter.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:8px;padding-top:8px;border-top:1px solid var(--border-color);';
+            levelsFooter.style.cssText = 'display:grid;gap:8px;margin-top:8px;padding-top:8px;border-top:1px solid var(--border-color);';
+            const levelsCountRow = document.createElement('div');
+            levelsCountRow.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:8px;';
             const levelsCountLabel = document.createElement('label');
             levelsCountLabel.textContent = 'Top #';
             levelsCountLabel.style.cssText = 'font-size:11px;color:var(--text-secondary);';
@@ -10870,8 +11023,35 @@ def index():
             levelsCountInput.max = '10';
             levelsCountInput.value = hiddenLevelsCount ? hiddenLevelsCount.value : '3';
             levelsCountInput.style.cssText = 'width:58px;border:1px solid var(--border-color);border-radius:6px;background:var(--panel-bg-strong);color:var(--text-primary);padding:6px 8px;font-size:12px;';
-            levelsFooter.appendChild(levelsCountLabel);
-            levelsFooter.appendChild(levelsCountInput);
+            levelsCountRow.appendChild(levelsCountLabel);
+            levelsCountRow.appendChild(levelsCountInput);
+            const latestLevelLinesLabel = document.createElement('label');
+            latestLevelLinesLabel.htmlFor = 'show_latest_level_lines';
+            latestLevelLinesLabel.title = 'Draw a short line and label from the latest intraday level bubble to the right side of the price chart';
+            latestLevelLinesLabel.style.cssText = 'display:flex;align-items:center;gap:7px;font-size:11px;color:var(--text-secondary);cursor:pointer;';
+            const latestLevelLinesInput = document.createElement('input');
+            latestLevelLinesInput.type = 'checkbox';
+            latestLevelLinesInput.id = 'show_latest_level_lines';
+            latestLevelLinesInput.checked = getShowLatestLevelLinesSetting();
+            const latestLevelLinesText = document.createElement('span');
+            latestLevelLinesText.textContent = 'Latest Level Lines';
+            latestLevelLinesLabel.appendChild(latestLevelLinesInput);
+            latestLevelLinesLabel.appendChild(latestLevelLinesText);
+                const priceAboveBubblesLabel = document.createElement('label');
+                priceAboveBubblesLabel.htmlFor = 'price_above_bubbles';
+                priceAboveBubblesLabel.title = 'Redraw the visible candles above intraday level bubbles so price stays readable';
+                priceAboveBubblesLabel.style.cssText = 'display:flex;align-items:center;gap:7px;font-size:11px;color:var(--text-secondary);cursor:pointer;';
+                const priceAboveBubblesInput = document.createElement('input');
+                priceAboveBubblesInput.type = 'checkbox';
+                priceAboveBubblesInput.id = 'price_above_bubbles';
+                priceAboveBubblesInput.checked = getPriceAboveBubblesSetting();
+                const priceAboveBubblesText = document.createElement('span');
+                priceAboveBubblesText.textContent = 'Price On Top';
+                priceAboveBubblesLabel.appendChild(priceAboveBubblesInput);
+                priceAboveBubblesLabel.appendChild(priceAboveBubblesText);
+            levelsFooter.appendChild(levelsCountRow);
+            levelsFooter.appendChild(latestLevelLinesLabel);
+                levelsFooter.appendChild(priceAboveBubblesLabel);
 
             function getSelectedLevels() {
                 return levelDefs.filter(def => def.input.checked).map(def => def.value);
@@ -10879,11 +11059,13 @@ def index():
 
             function syncLevelsSummary() {
                 const count = getSelectedLevels().length;
+                const lineState = getShowLatestLevelLinesSetting() ? 'Lines on' : 'Lines off';
+                    const layerState = getPriceAboveBubblesSetting() ? 'Price on top' : 'Bubbles on top';
                 levelsBadge.textContent = String(count);
                 levelsBadge.style.display = count ? 'inline-flex' : 'none';
                 levelsSummary.title = count
-                    ? `${count} price level${count === 1 ? '' : 's'} selected · Top ${levelsCountInput.value}`
-                    : 'Select price levels shown on the TradingView chart';
+                        ? `${count} price level${count === 1 ? '' : 's'} selected · Top ${levelsCountInput.value} · ${lineState} · ${layerState}`
+                        : `Select price levels shown on the TradingView chart · ${lineState} · ${layerState}`;
             }
 
             function renderLevelsOptions() {
@@ -10950,6 +11132,17 @@ def index():
                 }
                 syncLevelsSummary();
             });
+            latestLevelLinesInput.addEventListener('change', () => {
+                setShowLatestLevelLinesSetting(latestLevelLinesInput.checked);
+                syncLevelsSummary();
+                if (typeof pushDataToPopout === 'function') {
+                    pushDataToPopout('price-chart');
+                }
+            });
+                priceAboveBubblesInput.addEventListener('change', () => {
+                    setPriceAboveBubblesSetting(priceAboveBubblesInput.checked);
+                    syncLevelsSummary();
+                });
 
             levelsMenu.appendChild(levelsSearch);
             levelsMenu.appendChild(levelsOptions);
@@ -11118,6 +11311,224 @@ def index():
                 + '</div>';
         }
 
+        function buildTVSnapshotBubblePoints(priceData) {
+            const candles = Array.isArray(priceData.candles) && priceData.candles.length
+                ? priceData.candles
+                : tvLastCandles;
+            const latestCandle = candles && candles.length ? candles[candles.length - 1] : null;
+            const anchorTime = latestCandle ? latestCandle.time : null;
+            if (!anchorTime) return [];
+
+            const snapshotPoints = [];
+            const exposureLevels = Array.isArray(priceData.exposure_levels) ? priceData.exposure_levels : [];
+            exposureLevels.forEach((level, index) => {
+                const price = Number(level.price);
+                if (!Number.isFinite(price)) return;
+                const rawValue = Number(level.value);
+                const label = level.type || 'Level';
+                const formattedValue = level.label
+                    ? String(level.label).replace(/^.*?:\s*/, '')
+                    : formatLargeNumberCompact(rawValue);
+                snapshotPoints.push({
+                    time: anchorTime,
+                    price,
+                    size: level.is_max ? 16 : 12,
+                    color: level.color || (rawValue >= 0 ? priceData.call_color : priceData.put_color) || '#ffffff',
+                    border_color: level.is_max ? maxLevelColor : (rawValue >= 0 ? priceData.call_color : priceData.put_color) || level.color || '#ffffff',
+                    border_width: level.is_max ? 2 : Math.max(1, Number(level.line_width) || 1),
+                    label,
+                    rank: index + 1,
+                    side: rawValue >= 0 ? 'Call' : 'Put',
+                    value: formattedValue,
+                    kind: 'exposure',
+                });
+            });
+
+            const expectedMoves = Array.isArray(priceData.expected_moves) ? priceData.expected_moves : [];
+            expectedMoves.forEach((move, index) => {
+                const upper = Number(move.upper);
+                const lower = Number(move.lower);
+                const moveValue = Number.isFinite(upper) && Number.isFinite(lower)
+                    ? '$' + (Math.abs(upper - lower) / 2).toFixed(2)
+                    : '';
+                [
+                    ['Upper', upper],
+                    ['Lower', lower],
+                ].forEach(([side, price]) => {
+                    if (!Number.isFinite(price)) return;
+                    snapshotPoints.push({
+                        time: anchorTime,
+                        price,
+                        size: 13,
+                        color: 'rgba(3,107,252,0.82)',
+                        border_color: '#81b4ff',
+                        border_width: 1,
+                        label: 'Expected Move',
+                        rank: exposureLevels.length + index + 1,
+                        side,
+                        value: moveValue,
+                        kind: 'expected-move',
+                    });
+                });
+            });
+
+            return snapshotPoints;
+        }
+
+        function getTVBubblePointKey(point) {
+            return [
+                point.time || '',
+                Number(point.price).toFixed(4),
+                point.kind || 'exposure',
+                point.label || '',
+                point.side || '',
+            ].join('|');
+        }
+
+        function applyTVBubbleOverlapMetadata(points) {
+            const groups = new Map();
+            points.forEach(point => {
+                const key = [
+                    point.time || '',
+                    Number(point.price).toFixed(4),
+                    point.kind || 'exposure',
+                ].join('|');
+                if (!groups.has(key)) groups.set(key, []);
+                groups.get(key).push(point);
+            });
+            groups.forEach(group => {
+                group.forEach((point, index) => {
+                    point.overlap_slot = index;
+                    point.overlap_count = group.length;
+                });
+            });
+            return points;
+        }
+
+        function getTVPriceLevelBubblePoints(priceData) {
+            const historicalPoints = Array.isArray(priceData.historical_exposure_levels)
+                ? priceData.historical_exposure_levels
+                    .filter(point => point && point.time && Number.isFinite(Number(point.price)))
+                    .map(point => ({ ...point }))
+                : [];
+            const snapshotPoints = buildTVSnapshotBubblePoints(priceData);
+            if (!historicalPoints.length) return applyTVBubbleOverlapMetadata(snapshotPoints);
+            if (!snapshotPoints.length) return applyTVBubbleOverlapMetadata(historicalPoints);
+
+            const seenKeys = new Set(historicalPoints.map(point => getTVBubblePointKey(point)));
+            snapshotPoints.forEach(point => {
+                const key = getTVBubblePointKey(point);
+                if (!seenKeys.has(key)) {
+                    seenKeys.add(key);
+                    historicalPoints.push(point);
+                }
+            });
+            return applyTVBubbleOverlapMetadata(historicalPoints);
+        }
+
+        function getTVLatestLevelKey(point) {
+            if ((point.kind || '') === 'expected-move') {
+                return ['expected-move', point.label || '', point.side || ''].join('|');
+            }
+            return ['exposure', point.label || '', point.rank || ''].join('|');
+        }
+
+        function formatTVLatestLevelLineText(point) {
+            if ((point.kind || '') === 'expected-move') {
+                const moveSide = point.side ? ' ' + point.side : '';
+                return `${point.label || 'Expected Move'}${moveSide}: ${point.value || ''}`;
+            }
+            return `${point.label || 'Level'}: ${point.value || ''}`;
+        }
+
+        function buildTVLatestLevelLabelSignature(points) {
+            if (!tvShowLatestLevelLines || !points.length) return '';
+            return points.map(point => [
+                Number(point.price),
+                point.border_color || point.color || '#ffffff',
+                formatTVLatestLevelLineText(point),
+            ].join('|')).join('||');
+        }
+
+        function clearTVLatestLevelNativeLabels() {
+            tvLatestLevelLabelSignature = '';
+            if (tvCandleSeries && tvLatestLevelLabelPriceLines.length) {
+                tvLatestLevelLabelPriceLines.forEach(line => {
+                    try { tvCandleSeries.removePriceLine(line); } catch(e) {}
+                });
+            }
+            tvLatestLevelLabelPriceLines = [];
+        }
+
+        function setTVLatestLevelNativeLabels(points) {
+            const signature = buildTVLatestLevelLabelSignature(points);
+            if (signature && signature === tvLatestLevelLabelSignature) return;
+            clearTVLatestLevelNativeLabels();
+            if (!tvShowLatestLevelLines || !tvCandleSeries || !points.length) return;
+            tvLatestLevelLabelSignature = signature;
+
+            points.forEach(point => {
+                const price = Number(point.price);
+                if (!Number.isFinite(price)) return;
+                const labelLine = tvCandleSeries.createPriceLine({
+                    price,
+                    color: point.border_color || point.color || '#ffffff',
+                    lineWidth: 0,
+                    lineStyle: LightweightCharts.LineStyle.Dashed,
+                    axisLabelVisible: true,
+                    title: formatTVLatestLevelLineText(point),
+                });
+                tvLatestLevelLabelPriceLines.push(labelLine);
+            });
+        }
+
+        function drawTVLatestLevelLines(context, width, height) {
+            if (!tvShowLatestLevelLines || !tvHistoricalRenderedPoints.length) {
+                clearTVLatestLevelNativeLabels();
+                return;
+            }
+
+            const latestByKey = new Map();
+            tvHistoricalRenderedPoints.forEach(point => {
+                if (!point || point.x == null || point.y == null) return;
+                const key = getTVLatestLevelKey(point);
+                const existing = latestByKey.get(key);
+                if (!existing || point.time > existing.time || (point.time === existing.time && point.x > existing.x)) {
+                    latestByKey.set(key, point);
+                }
+            });
+
+            const latestPoints = Array.from(latestByKey.values()).sort((left, right) => left.y - right.y);
+            if (!latestPoints.length) {
+                clearTVLatestLevelNativeLabels();
+                return;
+            }
+
+            setTVLatestLevelNativeLabels(latestPoints);
+
+            context.save();
+            latestPoints.forEach(point => {
+                const color = point.border_color || point.color || '#ffffff';
+                const radius = (point.size || 8) / 2;
+                const lineStartX = Math.max(0, point.x + radius + 3);
+                const lineEndX = Math.max(lineStartX, width - 2);
+                if (lineEndX <= lineStartX) return;
+
+                context.save();
+                context.strokeStyle = color;
+                context.lineWidth = point.border_width || 1;
+                context.globalAlpha = 0.92;
+                context.setLineDash([4, 4]);
+                context.beginPath();
+                context.moveTo(lineStartX, point.y);
+                context.lineTo(lineEndX, point.y);
+                context.stroke();
+                context.restore();
+            });
+
+            context.restore();
+        }
+
         function positionTVHistoricalTooltip(tooltip, event) {
             const container = document.getElementById('price-chart');
             if (!tooltip || !container || !event) return;
@@ -11280,6 +11691,85 @@ def index():
             return priorityPoints.concat(secondaryPoints.filter((_, index) => index % stride === 0));
         }
 
+        function getVisibleTVOverlayCandles() {
+            if (!tvLastCandles.length || !tvPriceChart) return [];
+
+            let visibleCandles = tvLastCandles;
+            try {
+                const visibleRange = tvPriceChart.timeScale().getVisibleLogicalRange();
+                if (visibleRange) {
+                    const leftIndex = Math.max(0, Math.floor(visibleRange.from) - 2);
+                    const rightIndex = Math.min(tvLastCandles.length - 1, Math.ceil(visibleRange.to) + 2);
+                    visibleCandles = tvLastCandles.slice(leftIndex, rightIndex + 1);
+                }
+            } catch(e) {}
+
+            return visibleCandles;
+        }
+
+        function drawTVPriceAboveBubbles(context, width) {
+            if (!getPriceAboveBubblesSetting() || !tvPriceChart || !tvCandleSeries || !tvLastCandles.length) {
+                return;
+            }
+
+            const candlePoints = getVisibleTVOverlayCandles()
+                .map(candle => ({
+                    candle,
+                    x: tvPriceChart.timeScale().timeToCoordinate(candle.time),
+                }))
+                .filter(point => point.x != null && !Number.isNaN(point.x) && point.x >= -24 && point.x <= width + 24)
+                .sort((left, right) => left.x - right.x);
+
+            if (!candlePoints.length) {
+                return;
+            }
+
+            let minDelta = Number.POSITIVE_INFINITY;
+            for (let index = 1; index < candlePoints.length; index += 1) {
+                const delta = candlePoints[index].x - candlePoints[index - 1].x;
+                if (delta > 0 && delta < minDelta) {
+                    minDelta = delta;
+                }
+            }
+
+            const bodyWidth = Number.isFinite(minDelta)
+                ? Math.max(3, Math.min(14, Math.round(minDelta * 0.68)))
+                : 5;
+            const halfWidth = bodyWidth / 2;
+            const upColor = (tvLastPriceData && tvLastPriceData.call_color) || '#00FF00';
+            const downColor = (tvLastPriceData && tvLastPriceData.put_color) || '#FF0000';
+
+            context.save();
+            candlePoints.forEach(({ candle, x }) => {
+                const openY = tvCandleSeries.priceToCoordinate(candle.open);
+                const highY = tvCandleSeries.priceToCoordinate(candle.high);
+                const lowY = tvCandleSeries.priceToCoordinate(candle.low);
+                const closeY = tvCandleSeries.priceToCoordinate(candle.close);
+                if ([openY, highY, lowY, closeY].some(value => value == null || Number.isNaN(value))) {
+                    return;
+                }
+
+                const color = candle.close >= candle.open ? upColor : downColor;
+                const wickTop = Math.min(highY, lowY);
+                const wickBottom = Math.max(highY, lowY);
+                const bodyTop = Math.min(openY, closeY);
+                const bodyBottom = Math.max(openY, closeY);
+                const bodyHeight = Math.max(1, Math.round(bodyBottom - bodyTop));
+                const left = Math.round(x - halfWidth);
+                const centerX = Math.round(x) + 0.5;
+
+                context.strokeStyle = color;
+                context.fillStyle = color;
+                context.lineWidth = 1;
+                context.beginPath();
+                context.moveTo(centerX, wickTop);
+                context.lineTo(centerX, wickBottom);
+                context.stroke();
+                context.fillRect(left, Math.round(bodyTop), bodyWidth, bodyHeight);
+            });
+            context.restore();
+        }
+
         function drawTVHistoricalOverlay() {
             const overlay = ensureTVHistoricalOverlay();
             const canvas = ensureTVHistoricalCanvas();
@@ -11288,21 +11778,26 @@ def index():
 
             tvHistoricalRenderedPoints = [];
             tvHistoricalHoverBuckets = new Map();
-            const canvasState = syncTVHistoricalCanvas(canvas, overlay);
-            if (!canvasState) {
-                overlay.style.display = 'none';
-                if (tooltip) tooltip.style.display = 'none';
-                return;
-            }
-            const { context, width, height } = canvasState;
             if (!tvHistoricalPoints.length) {
+                clearTVLatestLevelNativeLabels();
                 overlay.style.display = 'none';
                 if (tooltip) tooltip.style.display = 'none';
                 return;
             }
 
+            overlay.style.display = 'block';
+            const canvasState = syncTVHistoricalCanvas(canvas, overlay);
+            if (!canvasState) {
+                clearTVLatestLevelNativeLabels();
+                overlay.style.display = 'none';
+                if (tooltip) tooltip.style.display = 'none';
+                return;
+            }
+            const { context, width, height } = canvasState;
+
             const pointsToRender = getVisibleTVHistoricalPoints();
             if (!pointsToRender.length) {
+                clearTVLatestLevelNativeLabels();
                 overlay.style.display = 'none';
                 if (tooltip) tooltip.style.display = 'none';
                 return;
@@ -11352,6 +11847,13 @@ def index():
                 visibleCount += 1;
             }
 
+            if (visibleCount > 0) {
+                drawTVLatestLevelLines(context, width, height);
+                drawTVPriceAboveBubbles(context, width);
+            } else {
+                clearTVLatestLevelNativeLabels();
+            }
+
             overlay.style.display = visibleCount > 0 ? 'block' : 'none';
         }
 
@@ -11369,6 +11871,9 @@ def index():
             if (!container) return;
 
             tvLastPriceData = priceData;
+                if (priceData && priceData.price_above_bubbles !== undefined) {
+                    setPriceAboveBubblesSetting(priceData.price_above_bubbles, false);
+                }
             const upColor   = priceData.call_color || '#00FF00';
             const downColor = priceData.put_color  || '#FF0000';
             const candles   = priceData.candles || [];
@@ -11391,7 +11896,7 @@ def index():
                     rightPriceScale: {
                         borderColor:  getThemeValue('--border-color', '#333333'),
                         scaleMargins: { top: 0.04, bottom: 0.15 },
-                        minimumWidth: 72,
+                        minimumWidth: tvRightScaleMinimumWidth,
                     },
                     localization: {
                         timeFormatter: (time) => {
@@ -11520,7 +12025,7 @@ def index():
                 connectPriceStream(streamTicker);
             }
 
-            // Remove old dynamic price lines; historical levels now render only as bubbles.
+            // Remove old dynamic price lines before rebuilding current snapshot and historical overlays.
             tvExposurePriceLines.forEach(l => { try { tvCandleSeries.removePriceLine(l); } catch(e){} });
             tvExposurePriceLines = [];
             tvExpectedMovePriceLines.forEach(l => { try { tvCandleSeries.removePriceLine(l); } catch(e){} });
@@ -11528,7 +12033,9 @@ def index():
             clearTVHistoricalExpectedMoveSeries();
 
             tvAllLevelPrices = [];
-            tvHistoricalPoints = priceData.historical_exposure_levels || [];
+            setShowLatestLevelLinesSetting(priceData.show_latest_level_lines !== false);
+
+            tvHistoricalPoints = getTVPriceLevelBubblePoints(priceData);
             tvHistoricalPoints.forEach(point => tvAllLevelPrices.push(point.price));
             scheduleTVHistoricalOverlayDraw();
 
@@ -11557,7 +12064,6 @@ def index():
         // Standalone price chart renderer — called by /update_price without touching other charts.
         function applyPriceData(priceJson) {
             if (!document.getElementById('price').checked) return;
-            lastPriceData = priceJson; // keep for popout push
             let priceContainer = document.querySelector('.price-chart-container');
             if (!priceContainer) {
                 priceContainer = document.createElement('div');
@@ -11587,7 +12093,10 @@ def index():
             priceContainer.style.display = 'block';
             const parsed = typeof priceJson === 'string' ? JSON.parse(priceJson) : priceJson;
             if (!parsed.error) {
+                parsed.price_above_bubbles = getPriceAboveBubblesSetting();
+                lastPriceData = parsed;
                 renderTVPriceChart(parsed);
+                pushDataToPopout('price-chart');
             }
         }
 
@@ -11610,13 +12119,17 @@ def index():
                 timeframe: document.getElementById('timeframe').value,
                 call_color: callColor,
                 put_color: putColor,
-                levels_types: Array.from(document.querySelectorAll('.levels-option input:checked')).map(cb => cb.value),
+                levels_types: getSelectedPriceLevelTypes(),
                 levels_count: parseInt(document.getElementById('levels_count').value),
                 use_heikin_ashi: document.getElementById('use_heikin_ashi').checked,
                 strike_range: parseFloat(document.getElementById('strike_range').value) / 100,
                 highlight_max_level: document.getElementById('highlight_max_level').checked,
+                show_latest_level_lines: getShowLatestLevelLinesSetting(),
                 max_level_color: maxLevelColor,
                 coloring_mode: document.getElementById('coloring_mode').value,
+                exposure_metric: document.getElementById('exposure_metric').value,
+                delta_adjusted: document.getElementById('delta_adjusted_exposures').checked,
+                calculate_in_notional: document.getElementById('calculate_in_notional').checked,
             };
         }
 
@@ -11678,7 +12191,6 @@ def index():
                 open_interest: document.getElementById('open_interest').checked,
                 volume: document.getElementById('volume').checked,
                 large_trades: document.getElementById('large_trades').checked,
-                premium: document.getElementById('premium').checked,
                 centroid: document.getElementById('centroid').checked
             };
 
@@ -11877,9 +12389,139 @@ def index():
             });
         }
         
+        function escapeAttr(text) {
+            return String(text)
+                .replace(/&/g, '&amp;')
+                .replace(/"/g, '&quot;')
+                .replace(/</g, '&lt;');
+        }
+
+        function getEasternNow() {
+            return new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }));
+        }
+
+        function formatETTime() {
+            return new Intl.DateTimeFormat('en-US', {
+                timeZone: 'America/New_York',
+                hour: 'numeric',
+                minute: '2-digit',
+                hour12: true
+            }).format(new Date()) + ' ET';
+        }
+
+        function getMarketSession() {
+            const now = getEasternNow();
+            const day = now.getDay();
+            const mins = now.getHours() * 60 + now.getMinutes();
+            const closeMins = 16 * 60;
+            const timeToClose = closeMins - mins;
+            const closeLabel = timeToClose > 0
+                ? `${Math.floor(timeToClose / 60)}h ${String(timeToClose % 60).padStart(2, '0')}m to close`
+                : '';
+
+            if (day === 0 || day === 6) {
+                return {
+                    short: 'Weekend',
+                    tip: 'US equity markets are closed Sat–Sun. Index options may still decay on calendar time; cash session resumes Monday 9:30 AM ET.'
+                };
+            }
+            if (mins >= 4 * 60 && mins < 9 * 60 + 30) {
+                return {
+                    short: 'Pre-Market',
+                    tip: 'Extended hours (4:00–9:30 AM ET). Lower liquidity and wider spreads — overnight news gets priced in before the open.'
+                };
+            }
+            if (mins >= 9 * 60 + 30 && mins < 10 * 60) {
+                return {
+                    short: 'Market Open',
+                    tip: `Opening 30 minutes (9:30–10:00 AM ET) — peak volume and volatility. Opening range often sets the day\u2019s tone. ${closeLabel}.`
+                };
+            }
+            if (mins >= 10 * 60 && mins < 12 * 60) {
+                return {
+                    short: 'Morning',
+                    tip: `Morning session (10:00 AM–12:00 PM ET). Institutional flow dominates; primary intraday trend often forms here. ${closeLabel}.`
+                };
+            }
+            if (mins >= 12 * 60 && mins < 13 * 60 + 30) {
+                return {
+                    short: 'NYC Lunch',
+                    tip: `Midday lull (12:00–1:30 PM ET). Volume typically drops 30–40%; ranges tighten and mean-reversion is common. ${closeLabel}.`
+                };
+            }
+            if (mins >= 13 * 60 + 30 && mins < 15 * 60) {
+                return {
+                    short: 'Afternoon',
+                    tip: `Afternoon session (1:30–3:00 PM ET). Volume picks back up; macro releases often land around 2:00 PM ET. ${closeLabel}.`
+                };
+            }
+            if (mins >= 15 * 60 && mins < 16 * 60) {
+                return {
+                    short: 'Power Hour',
+                    tip: `Final hour (3:00–4:00 PM ET). Elevated volume, MOC imbalances, and pin risk into the close. ${closeLabel}.`
+                };
+            }
+            if (mins >= 16 * 60 && mins < 20 * 60) {
+                return {
+                    short: 'After Hours',
+                    tip: 'After-hours (4:00–8:00 PM ET). Thin liquidity — earnings reactions and headline risk; most options are closed.'
+                };
+            }
+            return {
+                short: 'Overnight',
+                tip: 'US cash equities closed (8:00 PM–4:00 AM ET). Futures trade overnight; regular session opens 9:30 AM ET.'
+            };
+        }
+
+        function buildEmUsedStatHtml(info, displayPrice) {
+            if (!info || !Number.isFinite(displayPrice)) return '';
+            const em = info.expected_move_range;
+            const high = Number(info.high);
+            const low = Number(info.low);
+            const range = high - low;
+            if (!em || em.lower == null || em.upper == null || range <= 0 || displayPrice <= 0) {
+                return '';
+            }
+
+            const emMove = Number(em.move) || ((Number(em.upper) - Number(em.lower)) / 2);
+            const emWidthPct = ((emMove * 2) / displayPrice) * 100;
+            const dayRangePct = (range / displayPrice) * 100;
+            if (emWidthPct <= 0) return '';
+
+            const usedPct = (dayRangePct / emWidthPct) * 100;
+            const tip = `Today\u2019s ${dayRangePct.toFixed(2)}% range ($${low.toFixed(2)}\u2013$${high.toFixed(2)}) has used ${usedPct.toFixed(0)}% of the ATM straddle implied move (\u00b1${emWidthPct.toFixed(2)}%). Under 100% = quieter than options priced; over 100% = range already exceeded implied move.`;
+
+            return `<div class="price-info-item" data-em-used title="${escapeAttr(tip)}"><strong>EM Used</strong><span>${usedPct.toFixed(0)}%</span></div>`;
+        }
+
+        function buildMarketContextItemsHtml() {
+            const session = getMarketSession();
+            const timeStr = formatETTime();
+            return `<div class="price-info-market-group">
+                <div class="price-info-item price-info-market" id="price-info-session" title="${escapeAttr(session.tip)}">
+                    <strong>Session</strong>
+                    <span>${session.short} · ${timeStr}</span>
+                </div>
+            </div>`;
+        }
+
+        function refreshMarketContextItems(info, displayPrice) {
+            if (!info) return;
+            const priceInfo = document.getElementById('price-info');
+            if (!priceInfo) return;
+            const price = Number.isFinite(displayPrice)
+                ? displayPrice
+                : ((livePrice !== null) ? livePrice : info.current_price);
+            const marketGroup = priceInfo.querySelector('.price-info-market-group');
+            if (marketGroup) marketGroup.remove();
+            priceInfo.insertAdjacentHTML('beforeend', buildMarketContextItemsHtml());
+        }
+
         function updatePriceInfo(info) {
+            if (!info) return;
+            lastPriceInfo = info;
             // If EM range lock is active, silently sync the slider without triggering a full re-fetch
-            if (emRangeLocked && info && info.expected_move_range) {
+            if (emRangeLocked && info.expected_move_range) {
                 applyEmRange(info.expected_move_range, false);
             }
             const priceInfo = document.getElementById('price-info');
@@ -11894,10 +12536,12 @@ def index():
                     `${info.expected_move_range.lower_pct >= 0 ? '+' : ''}${info.expected_move_range.lower_pct}%` : '';
                 const highPct = info.expected_move_range.upper_pct != null ?
                     `${info.expected_move_range.upper_pct >= 0 ? '+' : ''}${info.expected_move_range.upper_pct}%` : '';
+                const emMove = info.expected_move_range.move || ((info.expected_move_range.upper - info.expected_move_range.lower) / 2);
+                const emTip = `ATM straddle implied move: ±$${Number(emMove).toFixed(2)} (±${((emMove / info.current_price) * 100).toFixed(2)}%). Market\u2019s priced range for the selected expiry.`;
                 // lower bound is below spot -> use putColor, upper bound above spot -> callColor
                 const lowColor = putColor;
                 const highColor = callColor;
-                expectedMoveHtml = `<div class="price-info-item"><strong>Expected Move</strong><span><span style="color:${lowColor}">$${info.expected_move_range.lower.toFixed(2)} ${lowPct}</span> - <span style="color:${highColor}">$${info.expected_move_range.upper.toFixed(2)} ${highPct}</span></span></div>`;
+                expectedMoveHtml = `<div class="price-info-item" title="${escapeAttr(emTip)}"><strong>Expected Move</strong><span><span style="color:${lowColor}">$${info.expected_move_range.lower.toFixed(2)} ${lowPct}</span> - <span style="color:${highColor}">$${info.expected_move_range.upper.toFixed(2)} ${highPct}</span></span></div>`;
             }
 
             // high/low diff coloring (use call/put colors)
@@ -11911,32 +12555,40 @@ def index():
 
             // Use the live streamer price if available, otherwise use the fetched price
             const displayPrice = (livePrice !== null) ? livePrice : info.current_price;
+            const marketContextHtml = buildMarketContextItemsHtml();
+            const emUsedHtml = buildEmUsedStatHtml(info, displayPrice);
+            const volTip = `Share of today\u2019s options volume: ${info.call_percentage.toFixed(1)}% calls / ${info.put_percentage.toFixed(1)}% puts.`;
+            const expiryTip = 'Selected option expiration date(s) driving exposure and expected-move calculations.';
             priceInfo.innerHTML = `
-                <div class="price-info-item">
-                    <strong>Current Price</strong>
-                    <span data-live-price>$${displayPrice.toFixed(2)}</span>
+                <div class="price-info-stats">
+                    <div class="price-info-item price-info-primary" title="Last traded price${livePrice !== null ? ' (live stream)' : ''}.">
+                        <strong>Current Price</strong>
+                        <span data-live-price>$${displayPrice.toFixed(2)}</span>
+                    </div>
+                    <div class="price-info-item" title="Session high and how far current price sits below it.">
+                        <strong>Day High</strong>
+                        <span>$${info.high.toFixed(2)} <span style="color:${highColor}">(${highDiffPct>=0?'+':''}${highDiffPct.toFixed(2)}%)</span></span>
+                    </div>
+                    <div class="price-info-item" title="Session low and how far current price sits above it.">
+                        <strong>Day Low</strong>
+                        <span>$${info.low.toFixed(2)} <span style="color:${lowColor}">(${lowDiffPct>=0?'+':''}${lowDiffPct.toFixed(2)}%)</span></span>
+                    </div>
+                    <div class="price-info-item ${info.net_change >= 0 ? 'green' : 'red'}" title="Change vs. prior regular-session close.">
+                        <strong>Change</strong>
+                        <span>${info.net_change >= 0 ? '+' : ''}${info.net_change.toFixed(2)} (${info.net_percent >= 0 ? '+' : ''}${info.net_percent.toFixed(2)}%)</span>
+                    </div>
+                    <div class="price-info-item" title="${escapeAttr(volTip)}">
+                        <strong>Vol Ratio</strong>
+                        <span><span style="color: ${callColor}">${info.call_percentage.toFixed(2)}%</span>/<span style="color: ${putColor}">${info.put_percentage.toFixed(2)}%</span></span>
+                    </div>
+                    ${expectedMoveHtml}
+                    ${emUsedHtml}
+                    <div class="price-info-item" title="${escapeAttr(expiryTip)}">
+                        <strong>Expiries</strong>
+                        <span>${expiryText}</span>
+                    </div>
                 </div>
-                <div class="price-info-item">
-                    <strong>Day High</strong>
-                    <span>$${info.high.toFixed(2)} <span style="color:${highColor}">(${highDiffPct>=0?'+':''}${highDiffPct.toFixed(2)}%)</span></span>
-                </div>
-                <div class="price-info-item">
-                    <strong>Day Low</strong>
-                    <span>$${info.low.toFixed(2)} <span style="color:${lowColor}">(${lowDiffPct>=0?'+':''}${lowDiffPct.toFixed(2)}%)</span></span>
-                </div>
-                <div class="price-info-item ${info.net_change >= 0 ? 'green' : 'red'}">
-                    <strong>Change</strong>
-                    <span>${info.net_change >= 0 ? '+' : ''}${info.net_change.toFixed(2)} (${info.net_percent >= 0 ? '+' : ''}${info.net_percent.toFixed(2)}%)</span>
-                </div>
-                <div class="price-info-item">
-                    <strong>Vol Ratio</strong>
-                    <span><span style="color: ${callColor}">${info.call_percentage.toFixed(2)}%</span>/<span style="color: ${putColor}">${info.put_percentage.toFixed(2)}%</span></span>
-                </div>
-                ${expectedMoveHtml}
-                <div class="price-info-item">
-                    <strong>Expiries</strong>
-                    <span>${expiryText}</span>
-                </div>
+                ${marketContextHtml}
             `;
         }
         
@@ -12047,7 +12699,12 @@ def index():
         
         // Add event listeners for control checkboxes
         document.querySelectorAll('.control-group input[type="checkbox"]').forEach(checkbox => {
-            checkbox.addEventListener('change', updateData);
+            checkbox.addEventListener('change', function() {
+                if (checkbox.closest('.levels-option')) {
+                    return;
+                }
+                updateData();
+            });
         });
 
         document.getElementById('mobile-toggle-filters').addEventListener('click', function() {
@@ -12183,6 +12840,13 @@ def index():
 
         // Auto-update every 1 second
         updateInterval = setInterval(updateData, 1000);
+
+        // Refresh session clock / market-context items every minute
+        marketContextTimer = setInterval(function() {
+            if (lastPriceInfo) {
+                refreshMarketContextItems(lastPriceInfo, livePrice !== null ? livePrice : lastPriceInfo.current_price);
+            }
+        }, 60000);
         
         // Handle window resize
         window.addEventListener('resize', () => {
@@ -12195,6 +12859,7 @@ def index():
         // Cleanup on page unload
         window.addEventListener('beforeunload', () => {
             clearInterval(updateInterval);
+            if (marketContextTimer) clearInterval(marketContextTimer);
             disconnectPriceStream();
             Object.values(charts).forEach(chart => {
                 Plotly.purge(chart);
@@ -12237,9 +12902,10 @@ def index():
                 show_puts: document.getElementById('show_puts').checked,
                 show_net: document.getElementById('show_net').checked,
                 coloring_mode: document.getElementById('coloring_mode').value,
-                levels_types: Array.from(document.querySelectorAll('.levels-option input:checked')).map(cb => cb.value),
+                levels_types: getSelectedPriceLevelTypes(),
                 levels_count: document.getElementById('levels_count').value,
                 use_heikin_ashi: document.getElementById('use_heikin_ashi').checked,
+                    price_above_bubbles: getPriceAboveBubblesSetting(),
                 horizontal_bars: document.getElementById('horizontal_bars').checked,
                 show_abs_gex: document.getElementById('show_abs_gex').checked,
                 abs_gex_opacity: document.getElementById('abs_gex_opacity').value,
@@ -12247,6 +12913,7 @@ def index():
                 call_color: document.getElementById('call_color').value,
                 put_color: document.getElementById('put_color').value,
                 highlight_max_level: document.getElementById('highlight_max_level').checked,
+                show_latest_level_lines: getShowLatestLevelLinesSetting(),
                 max_level_color: document.getElementById('max_level_color').value,
                 max_level_mode: document.getElementById('max_level_mode').value,
                 em_range_locked: emRangeLocked,
@@ -12262,11 +12929,10 @@ def index():
                     vomma: document.getElementById('vomma').checked,
                     color: document.getElementById('color').checked,
                     options_volume: document.getElementById('options_volume').checked,
-                    open_interest: document.getElementById('open_interest').checked,
+                        open_interest: document.getElementById('open_interest').checked,
                     volume: document.getElementById('volume').checked,
                     large_trades: document.getElementById('large_trades').checked,
-                    premium: document.getElementById('premium').checked,
-                    centroid: document.getElementById('centroid').checked
+                        centroid: document.getElementById('centroid').checked
                 }
             };
         }
@@ -12319,6 +12985,12 @@ def index():
             if (settings.highlight_max_level !== undefined) {
                 document.getElementById('highlight_max_level').checked = settings.highlight_max_level;
             }
+            if (settings.show_latest_level_lines !== undefined) {
+                setShowLatestLevelLinesSetting(settings.show_latest_level_lines);
+            }
+                if (settings.price_above_bubbles !== undefined) {
+                    setPriceAboveBubblesSetting(settings.price_above_bubbles);
+                }
             if (settings.max_level_color) {
                 document.getElementById('max_level_color').value = settings.max_level_color;
                 maxLevelColor = settings.max_level_color;
@@ -12711,15 +13383,10 @@ def update():
         
         if data.get('show_options_volume', True):
             response['options_volume'] = create_options_volume_chart(calls, puts, S, strike_range, call_color, put_color, coloring_mode, show_calls, show_puts, show_net, expiry_dates, horizontal, highlight_max_level=highlight_max_level, max_level_color=max_level_color, max_level_mode=max_level_mode)
+
         
         if data.get('show_open_interest', True):
             response['open_interest'] = create_open_interest_chart(calls, puts, S, strike_range, call_color, put_color, coloring_mode, show_calls, show_puts, show_net, expiry_dates, horizontal, highlight_max_level=highlight_max_level, max_level_color=max_level_color, max_level_mode=max_level_mode)
-        
-        if data.get('show_premium', True):
-            response['premium'] = create_premium_chart(calls, puts, S, strike_range, call_color, put_color, coloring_mode, show_calls, show_puts, show_net, expiry_dates, horizontal, highlight_max_level=highlight_max_level, max_level_color=max_level_color, max_level_mode=max_level_mode)
-        
-        if data.get('show_large_trades', True):
-            response['large_trades'] = create_large_trades_table(calls, puts, S, strike_range, call_color, put_color, expiry_dates)
         
         if data.get('show_centroid', True):
             response['centroid'] = create_centroid_chart(ticker, call_color, put_color, expiry_dates)
@@ -12916,8 +13583,16 @@ def update_price():
         strike_range = float(data.get('strike_range', 0.1))
         use_heikin_ashi = data.get('use_heikin_ashi', False)
         highlight_max_level = data.get('highlight_max_level', False)
+        show_latest_level_lines = data.get('show_latest_level_lines', True)
         max_level_color = data.get('max_level_color', '#800080')
         coloring_mode = data.get('coloring_mode', 'Linear Intensity')
+        exposure_metric = data.get('exposure_metric', 'Open Interest')
+        delta_adjusted = data.get('delta_adjusted', False)
+        cin_val = data.get('calculate_in_notional', True)
+        if isinstance(cin_val, str):
+            calculate_in_notional = cin_val.lower() == 'true'
+        else:
+            calculate_in_notional = bool(cin_val)
 
         price_data = get_price_history(ticker, timeframe=timeframe)
 
@@ -12927,6 +13602,32 @@ def update_price():
         cached = _options_cache.get((ticker, expiry_key), {})
         calls = cached.get('calls')
         puts = cached.get('puts')
+
+        requires_options_data = bool(exposure_levels_types) and expiry_dates
+        if requires_options_data and (calls is None or puts is None):
+            if len(expiry_dates) == 1:
+                calls, puts = fetch_options_for_date(
+                    ticker,
+                    expiry_dates[0],
+                    exposure_metric=exposure_metric,
+                    delta_adjusted=delta_adjusted,
+                    calculate_in_notional=calculate_in_notional,
+                )
+            else:
+                calls, puts = fetch_options_for_multiple_dates(
+                    ticker,
+                    expiry_dates,
+                    exposure_metric=exposure_metric,
+                    delta_adjusted=delta_adjusted,
+                    calculate_in_notional=calculate_in_notional,
+                )
+
+            if not (calls.empty and puts.empty):
+                _options_cache[(ticker, expiry_key)] = {
+                    'calls': calls.copy(),
+                    'puts': puts.copy(),
+                    'S': cached.get('S'),
+                }
 
         price_chart = prepare_price_chart_data(
             price_data=price_data,
@@ -12943,6 +13644,7 @@ def update_price():
             coloring_mode=coloring_mode,
             ticker=ticker,
             selected_expiries=expiry_dates,
+            show_latest_level_lines=show_latest_level_lines,
         )
         # Inject timeframe so the popout candle-close timer knows the selected interval
         try:

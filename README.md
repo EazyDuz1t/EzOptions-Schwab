@@ -113,7 +113,6 @@ A real-time options trading dashboard that integrates with the Schwab API to pro
 ### Volume Analysis
 - Options volume by strike
 - Call/Put volume ratios
-- Premium analysis by strike
 
 ### Options Chain
 - Sortable options chain table
