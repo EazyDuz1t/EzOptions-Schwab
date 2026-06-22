@@ -1,4 +1,4 @@
-﻿from flask import Flask, render_template_string, jsonify, request, Response, stream_with_context
+from flask import Flask, render_template_string, jsonify, request, Response, stream_with_context
 import pandas as pd
 import plotly.graph_objects as go
 import numpy as np
@@ -6,6 +6,7 @@ from bisect import bisect_left
 from datetime import datetime, timedelta
 import math
 import time
+import re
 import schwabdev
 import os
 from dotenv import load_dotenv
@@ -39,7 +40,19 @@ FAVICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
 """
 
 MAX_RETAINED_SESSION_DATES = 2
-_retention_lock = threading.Lock()
+_APP_DIR = os.path.dirname(os.path.abspath(__file__))
+OPTIONS_DB_PATH = os.path.join(_APP_DIR, 'options_data.db')
+SETTINGS_PATH = os.path.join(_APP_DIR, 'settings.json')
+_DB_BUSY_TIMEOUT_SEC = 30
+_db_write_lock = threading.RLock()
+
+
+def get_options_db_connection():
+    """Open options_data.db with WAL mode and busy timeout for concurrent access."""
+    conn = sqlite3.connect(OPTIONS_DB_PATH, timeout=_DB_BUSY_TIMEOUT_SEC)
+    conn.execute('PRAGMA journal_mode=WAL')
+    conn.execute('PRAGMA synchronous=NORMAL')
+    return conn
 # Global error handlers for Flask
 @app.errorhandler(404)
 def not_found_error(error):
@@ -57,7 +70,7 @@ def internal_error(error):
 
 # Initialize SQLite database
 def init_db():
-    with closing(sqlite3.connect('options_data.db')) as conn:
+    with _db_write_lock, closing(get_options_db_connection()) as conn:
         with closing(conn.cursor()) as cursor:
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS interval_data (
@@ -147,6 +160,15 @@ def init_db():
                 cursor.execute("ALTER TABLE centroid_data ADD COLUMN expiry_key TEXT NOT NULL DEFAULT ''")
             except sqlite3.OperationalError:
                 pass
+
+            # Indices for fast lookups by (ticker, date) and (ticker, date, expiry_key)
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_interval_data_td ON interval_data(ticker, date)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_interval_data_tde ON interval_data(ticker, date, expiry_key)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_interval_data_ts ON interval_data(ticker, date, timestamp)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_interval_session_td ON interval_session_data(ticker, date)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_interval_session_tde ON interval_session_data(ticker, date, expiry_key)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_centroid_td ON centroid_data(ticker, date)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_centroid_tde ON centroid_data(ticker, date, expiry_key)')
             conn.commit()
 
 def is_market_hours():
@@ -313,21 +335,9 @@ def store_centroid_data(ticker, price, calls, puts, expiry_key=''):
     
     current_time = int(current_time_est.timestamp())
     current_date = current_time_est.strftime('%Y-%m-%d')
-
-    # Keep the DB bounded to the two most recent session dates.
-    clear_old_data()
     
     # Round to nearest 5-minute interval (300 seconds)
     interval_timestamp = (current_time // 300) * 300
-    
-    # Delete existing data for this 5-minute interval to update with most recent data
-    with closing(sqlite3.connect('options_data.db')) as conn:
-        with closing(conn.cursor()) as cursor:
-            cursor.execute('''
-                DELETE FROM centroid_data 
-                WHERE ticker = ? AND timestamp = ? AND expiry_key = ? AND date = ?
-            ''', (ticker, interval_timestamp, expiry_key, current_date))
-            conn.commit()
     
     # Calculate centroids (volume-weighted average strike prices)
     call_centroid = 0
@@ -353,72 +363,69 @@ def store_centroid_data(ticker, price, calls, puts, expiry_key=''):
             weighted_strikes = puts_with_volume['strike'] * puts_with_volume['volume']
             put_centroid = weighted_strikes.sum() / put_volume
     
-    # Only store if we have volume data
-    if call_volume > 0 or put_volume > 0:
-        with closing(sqlite3.connect('options_data.db')) as conn:
+    with _db_write_lock:
+        with closing(get_options_db_connection()) as conn:
             with closing(conn.cursor()) as cursor:
                 cursor.execute('''
-                    INSERT INTO centroid_data (
-                        ticker, timestamp, price, call_centroid, put_centroid,
-                        call_volume, put_volume, expiry_key, date
-                    )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ''', (
-                    ticker,
-                    interval_timestamp,
-                    price,
-                    call_centroid,
-                    put_centroid,
-                    call_volume,
-                    put_volume,
-                    expiry_key,
-                    current_date,
-                ))
+                    DELETE FROM centroid_data
+                    WHERE ticker = ? AND timestamp = ? AND expiry_key = ? AND date = ?
+                ''', (ticker, interval_timestamp, expiry_key, current_date))
+                if call_volume > 0 or put_volume > 0:
+                    cursor.execute('''
+                        INSERT INTO centroid_data (
+                            ticker, timestamp, price, call_centroid, put_centroid,
+                            call_volume, put_volume, expiry_key, date
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ''', (
+                        ticker,
+                        interval_timestamp,
+                        price,
+                        call_centroid,
+                        put_centroid,
+                        call_volume,
+                        put_volume,
+                        expiry_key,
+                        current_date,
+                    ))
                 conn.commit()
+
+def _market_hours_bounds(date_str):
+    """Return (open_ts, close_ts) Unix timestamps for 9:30–16:00 ET on the given date string."""
+    est = pytz.timezone('US/Eastern')
+    day = datetime.strptime(date_str, '%Y-%m-%d')
+    open_dt = est.localize(day.replace(hour=9, minute=30, second=0, microsecond=0))
+    close_dt = est.localize(day.replace(hour=16, minute=0, second=0, microsecond=0))
+    return int(open_dt.timestamp()), int(close_dt.timestamp())
+
 
 # Function to get centroid data
 def get_centroid_data(ticker, date=None, expiry_key=None):
     """Get centroid data for current trading session only (market hours)"""
     if date is None:
-        # Get current date in Eastern Time
-        est = pytz.timezone('US/Eastern')
-        current_date_est = datetime.now(est).strftime('%Y-%m-%d')
-        date = current_date_est
-    
-    with closing(sqlite3.connect('options_data.db')) as conn:
+        date = datetime.now(pytz.timezone('US/Eastern')).strftime('%Y-%m-%d')
+
+    open_ts, close_ts = _market_hours_bounds(date)
+
+    with closing(get_options_db_connection()) as conn:
         with closing(conn.cursor()) as cursor:
             if expiry_key is None:
                 cursor.execute('''
                     SELECT timestamp, price, call_centroid, put_centroid, call_volume, put_volume
                     FROM centroid_data
                     WHERE ticker = ? AND date = ?
+                      AND timestamp >= ? AND timestamp <= ?
                     ORDER BY timestamp
-                ''', (ticker, date))
+                ''', (ticker, date, open_ts, close_ts))
             else:
                 cursor.execute('''
                     SELECT timestamp, price, call_centroid, put_centroid, call_volume, put_volume
                     FROM centroid_data
                     WHERE ticker = ? AND date = ? AND expiry_key = ?
+                      AND timestamp >= ? AND timestamp <= ?
                     ORDER BY timestamp
-                ''', (ticker, date, expiry_key))
-            
-            # Filter data to only include market hours (9:30 AM - 4:00 PM ET)
-            all_data = cursor.fetchall()
-            filtered_data = []
-            
-            for row in all_data:
-                timestamp = row[0]
-                # Convert timestamp to Eastern Time
-                dt_est = datetime.fromtimestamp(timestamp, pytz.timezone('US/Eastern'))
-                
-                # Check if within market hours
-                market_open = dt_est.replace(hour=9, minute=30, second=0, microsecond=0)
-                market_close = dt_est.replace(hour=16, minute=0, second=0, microsecond=0)
-                
-                if market_open <= dt_est <= market_close and dt_est.weekday() < 5:
-                    filtered_data.append(row)
-            
-            return filtered_data
+                ''', (ticker, date, expiry_key, open_ts, close_ts))
+            return cursor.fetchall()
 
 # Function to store interval data
 def store_interval_data(ticker, price, strike_range, calls, puts, expiry_key=''):
@@ -428,9 +435,6 @@ def store_interval_data(ticker, price, strike_range, calls, puts, expiry_key='')
     current_time_est = datetime.now(est)
     current_time = int(current_time_est.timestamp())
     current_date = current_time_est.strftime('%Y-%m-%d')
-
-    # Keep the DB bounded to the two most recent session dates.
-    clear_old_data()
     
     # Store interval overlays at 1-minute resolution so they can be aggregated
     # to whatever candle timeframe the chart is using.
@@ -443,195 +447,166 @@ def store_interval_data(ticker, price, strike_range, calls, puts, expiry_key='')
     range_calls = calls[(calls['strike'] >= min_strike) & (calls['strike'] <= max_strike)]
     range_puts = puts[(puts['strike'] >= min_strike) & (puts['strike'] <= max_strike)]
 
-    def _empty_exposure():
-        return {
-            'gamma': 0,
-            'delta': 0,
-            'vanna': 0,
-            'charm': 0,
-            'volume': 0,
-            'speed': 0,
-            'vomma': 0,
-            'color': 0,
-            'call_gamma': 0,
-            'put_gamma': 0,
-        }
-    
-    # Calculate per-strike exposures used by the historical intraday overlays.
-    exposure_by_strike = {}
-    for _, row in range_calls.iterrows():
-        strike = row['strike']
-        gamma = row['GEX']
-        delta = row['DEX']
-        vanna = row['VEX']
-        charm = row['Charm']
-        speed = row['Speed']
-        vomma = row['Vomma']
-        color = row['Color']
-        cur = exposure_by_strike.get(strike, _empty_exposure())
-        cur['gamma'] = cur.get('gamma',0) + gamma
-        cur['delta'] = cur.get('delta',0) + delta
-        cur['vanna'] = cur.get('vanna',0) + vanna
-        cur['charm'] = cur.get('charm',0) + charm
-        cur['volume'] = cur.get('volume',0) + row['volume']
-        cur['speed'] = cur.get('speed',0) + speed
-        cur['vomma'] = cur.get('vomma',0) + vomma
-        cur['color'] = cur.get('color',0) + color
-        cur['call_gamma'] = cur.get('call_gamma',0) + gamma
-        exposure_by_strike[strike] = cur
-        
-    for _, row in range_puts.iterrows():
-        strike = row['strike']
-        gamma = row['GEX']
-        delta = row['DEX']
-        vanna = row['VEX']
-        charm = row['Charm']
-        speed = row['Speed']
-        vomma = row['Vomma']
-        color = row['Color']
-        cur = exposure_by_strike.get(strike, _empty_exposure())
-        cur['gamma'] = cur.get('gamma',0) - gamma
-        cur['delta'] = cur.get('delta',0) + delta
-        cur['vanna'] = cur.get('vanna',0) + vanna
-        cur['charm'] = cur.get('charm',0) + charm
-        cur['volume'] = cur.get('volume',0) - row['volume']
-        cur['speed'] = cur.get('speed',0) + speed
-        cur['vomma'] = cur.get('vomma',0) + vomma
-        cur['color'] = cur.get('color',0) + color
-        cur['put_gamma'] = cur.get('put_gamma',0) + gamma
-        exposure_by_strike[strike] = cur
+    # Build per-strike net exposures using vectorized groupby instead of iterrows
+    _agg_src = ['strike', 'GEX', 'DEX', 'VEX', 'Charm', 'volume', 'Speed', 'Vomma', 'Color']
+    _sum_cols = ['call_gamma','put_gamma','net_gamma','net_delta','net_vanna',
+                 'net_charm','net_volume','net_speed','net_vomma','net_color']
+
+    if not range_calls.empty:
+        c = range_calls[_agg_src].copy()
+        c['call_gamma'] = c['GEX']
+        c['put_gamma'] = 0.0
+        c['net_gamma'] = c['GEX']
+        c['net_delta'] = c['DEX']
+        c['net_vanna'] = c['VEX']
+        c['net_charm'] = c['Charm']
+        c['net_volume'] = c['volume']
+        c['net_speed'] = c['Speed']
+        c['net_vomma'] = c['Vomma']
+        c['net_color'] = c['Color']
+    else:
+        c = pd.DataFrame(columns=['strike'] + _sum_cols)
+
+    if not range_puts.empty:
+        p = range_puts[_agg_src].copy()
+        p['call_gamma'] = 0.0
+        p['put_gamma'] = p['GEX']
+        p['net_gamma'] = -p['GEX']
+        p['net_delta'] = p['DEX']
+        p['net_vanna'] = p['VEX']
+        p['net_charm'] = p['Charm']
+        p['net_volume'] = -p['volume']
+        p['net_speed'] = p['Speed']
+        p['net_vomma'] = p['Vomma']
+        p['net_color'] = p['Color']
+    else:
+        p = pd.DataFrame(columns=['strike'] + _sum_cols)
+
+    combined_exp = pd.concat([c[['strike']+_sum_cols], p[['strike']+_sum_cols]], ignore_index=True)
+    grouped = combined_exp.groupby('strike', sort=False)[_sum_cols].sum()
+    grouped['abs_gex_total'] = grouped['call_gamma'].abs() + grouped['put_gamma'].abs()
 
     expected_move_snapshot = calculate_expected_move_snapshot(calls, puts, price)
-    
-    # Store data for each strike
-    with closing(sqlite3.connect('options_data.db')) as conn:
-        with closing(conn.cursor()) as cursor:
-            cursor.execute('''
-                DELETE FROM interval_data
-                WHERE ticker = ? AND timestamp = ? AND expiry_key = ? AND date = ?
-            ''', (ticker, interval_timestamp, expiry_key, current_date))
-            cursor.execute('''
-                DELETE FROM interval_session_data
-                WHERE ticker = ? AND timestamp = ? AND expiry_key = ? AND date = ?
-            ''', (ticker, interval_timestamp, expiry_key, current_date))
 
-            for strike, exposure in exposure_by_strike.items():
-                abs_gex_total = abs(exposure.get('call_gamma',0)) + abs(exposure.get('put_gamma',0))
+    n = len(grouped)
+    strikes_list = grouped.index.tolist()
+    rows_to_insert = list(zip(
+        [ticker] * n,
+        [interval_timestamp] * n,
+        [price] * n,
+        strikes_list,
+        grouped['net_gamma'].tolist(),
+        grouped['net_delta'].tolist(),
+        grouped['net_vanna'].tolist(),
+        grouped['net_charm'].tolist(),
+        grouped['net_volume'].tolist(),
+        grouped['net_speed'].tolist(),
+        grouped['net_vomma'].tolist(),
+        grouped['net_color'].tolist(),
+        grouped['abs_gex_total'].tolist(),
+        [expiry_key] * n,
+        [current_date] * n,
+    ))
+
+    with _db_write_lock:
+        with closing(get_options_db_connection()) as conn:
+            with closing(conn.cursor()) as cursor:
                 cursor.execute('''
+                    DELETE FROM interval_data
+                    WHERE ticker = ? AND timestamp = ? AND expiry_key = ? AND date = ?
+                ''', (ticker, interval_timestamp, expiry_key, current_date))
+                cursor.execute('''
+                    DELETE FROM interval_session_data
+                    WHERE ticker = ? AND timestamp = ? AND expiry_key = ? AND date = ?
+                ''', (ticker, interval_timestamp, expiry_key, current_date))
+
+                cursor.executemany('''
                     INSERT INTO interval_data (
                         ticker, timestamp, price, strike, net_gamma, net_delta, net_vanna,
                         net_charm, net_volume, net_speed, net_vomma, net_color,
                         abs_gex_total, expiry_key, date
                     )
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ''', (
-                    ticker,
-                    interval_timestamp,
-                    price,
-                    strike,
-                    exposure['gamma'],
-                    exposure['delta'],
-                    exposure['vanna'],
-                    exposure['charm'],
-                    exposure['volume'],
-                    exposure['speed'],
-                    exposure['vomma'],
-                    exposure['color'],
-                    abs_gex_total,
-                    expiry_key,
-                    current_date,
-                ))
+                ''', rows_to_insert)
 
-            if expected_move_snapshot:
-                cursor.execute('''
-                    INSERT INTO interval_session_data (
-                        ticker, timestamp, price, expected_move, expected_move_upper,
-                        expected_move_lower, expiry_key, date
-                    )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ''', (
-                    ticker,
-                    interval_timestamp,
-                    price,
-                    expected_move_snapshot['move'],
-                    expected_move_snapshot['upper'],
-                    expected_move_snapshot['lower'],
-                    expiry_key,
-                    current_date,
-                ))
-            conn.commit()
+                if expected_move_snapshot:
+                    cursor.execute('''
+                        INSERT INTO interval_session_data (
+                            ticker, timestamp, price, expected_move, expected_move_upper,
+                            expected_move_lower, expiry_key, date
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ''', (
+                        ticker,
+                        interval_timestamp,
+                        price,
+                        expected_move_snapshot['move'],
+                        expected_move_snapshot['upper'],
+                        expected_move_snapshot['lower'],
+                        expiry_key,
+                        current_date,
+                    ))
+                conn.commit()
 
 # Function to get interval data
 def get_interval_data(ticker, date=None, expiry_key=None):
     if date is None:
         date = datetime.now(pytz.timezone('US/Eastern')).strftime('%Y-%m-%d')
-    
-    with closing(sqlite3.connect('options_data.db')) as conn:
+
+    open_ts, close_ts = _market_hours_bounds(date)
+
+    with closing(get_options_db_connection()) as conn:
         with closing(conn.cursor()) as cursor:
             if expiry_key is None:
                 cursor.execute('''
-                      SELECT timestamp, price, strike, net_gamma, net_delta, net_vanna, net_charm,
-                          abs_gex_total, net_volume, net_speed, net_vomma, net_color
+                    SELECT timestamp, price, strike, net_gamma, net_delta, net_vanna, net_charm,
+                        abs_gex_total, net_volume, net_speed, net_vomma, net_color
                     FROM interval_data
                     WHERE ticker = ? AND date = ?
+                      AND timestamp >= ? AND timestamp <= ?
                     ORDER BY timestamp, strike
-                ''', (ticker, date))
+                ''', (ticker, date, open_ts, close_ts))
             else:
                 cursor.execute('''
-                      SELECT timestamp, price, strike, net_gamma, net_delta, net_vanna, net_charm,
-                          abs_gex_total, net_volume, net_speed, net_vomma, net_color
+                    SELECT timestamp, price, strike, net_gamma, net_delta, net_vanna, net_charm,
+                        abs_gex_total, net_volume, net_speed, net_vomma, net_color
                     FROM interval_data
                     WHERE ticker = ? AND date = ? AND expiry_key = ?
+                      AND timestamp >= ? AND timestamp <= ?
                     ORDER BY timestamp, strike
-                ''', (ticker, date, expiry_key))
-            all_data = cursor.fetchall()
-
-    est = pytz.timezone('US/Eastern')
-    filtered = []
-    for row in all_data:
-        dt = datetime.fromtimestamp(row[0], est)
-        market_open = dt.replace(hour=9, minute=30, second=0, microsecond=0)
-        market_close = dt.replace(hour=16, minute=0, second=0, microsecond=0)
-        if dt.weekday() < 5 and market_open <= dt <= market_close:
-            filtered.append(row)
-    return filtered
+                ''', (ticker, date, expiry_key, open_ts, close_ts))
+            return cursor.fetchall()
 
 
 def get_interval_session_data(ticker, date=None, expiry_key=None):
     if date is None:
         date = datetime.now(pytz.timezone('US/Eastern')).strftime('%Y-%m-%d')
 
-    with closing(sqlite3.connect('options_data.db')) as conn:
+    open_ts, close_ts = _market_hours_bounds(date)
+
+    with closing(get_options_db_connection()) as conn:
         with closing(conn.cursor()) as cursor:
             if expiry_key is None:
                 cursor.execute('''
                     SELECT timestamp, price, expected_move, expected_move_upper, expected_move_lower
                     FROM interval_session_data
                     WHERE ticker = ? AND date = ?
+                      AND timestamp >= ? AND timestamp <= ?
                     ORDER BY timestamp
-                ''', (ticker, date))
+                ''', (ticker, date, open_ts, close_ts))
             else:
                 cursor.execute('''
                     SELECT timestamp, price, expected_move, expected_move_upper, expected_move_lower
                     FROM interval_session_data
                     WHERE ticker = ? AND date = ? AND expiry_key = ?
+                      AND timestamp >= ? AND timestamp <= ?
                     ORDER BY timestamp
-                ''', (ticker, date, expiry_key))
-            all_data = cursor.fetchall()
-
-    est = pytz.timezone('US/Eastern')
-    filtered = []
-    for row in all_data:
-        dt = datetime.fromtimestamp(row[0], est)
-        market_open = dt.replace(hour=9, minute=30, second=0, microsecond=0)
-        market_close = dt.replace(hour=16, minute=0, second=0, microsecond=0)
-        if dt.weekday() < 5 and market_open <= dt <= market_close:
-            filtered.append(row)
-    return filtered
+                ''', (ticker, date, expiry_key, open_ts, close_ts))
+            return cursor.fetchall()
 
 def get_last_session_date(ticker, table='interval_data', expiry_key=None):
     """Return the most recent date that has data for ticker, or None."""
-    with closing(sqlite3.connect('options_data.db')) as conn:
+    with closing(get_options_db_connection()) as conn:
         with closing(conn.cursor()) as cursor:
             if expiry_key is None:
                 cursor.execute(f'SELECT MAX(date) FROM {table} WHERE ticker = ?', (ticker,))
@@ -649,8 +624,8 @@ def clear_old_data():
     tables = ('interval_data', 'centroid_data', 'interval_session_data')
     deleted_rows = {}
 
-    with _retention_lock:
-        with closing(sqlite3.connect('options_data.db')) as conn:
+    with _db_write_lock:
+        with closing(get_options_db_connection()) as conn:
             with closing(conn.cursor()) as cursor:
                 for table_name in tables:
                     cursor.execute(f'''
@@ -685,7 +660,7 @@ def clear_centroid_session_data(ticker):
     est = pytz.timezone('US/Eastern')
     today = datetime.now(est).strftime('%Y-%m-%d')
     
-    with closing(sqlite3.connect('options_data.db')) as conn:
+    with _db_write_lock, closing(get_options_db_connection()) as conn:
         with closing(conn.cursor()) as cursor:
             cursor.execute('''
                 DELETE FROM centroid_data
@@ -720,6 +695,9 @@ current_expiry = None
 # Cache for last fetched options data per ticker — used by /update_price
 # so the price chart can refresh independently without re-fetching the full chain.
 _options_cache = {}  # (ticker, expiry_key) -> {'calls': DataFrame, 'puts': DataFrame, 'S': float}
+
+# Spot price populated by fetch_options_for_date so /update can skip a redundant quote call.
+_chain_spot_cache = {}  # ticker -> (price, fetched_at_unix_ts)
 
 # Initialize Schwab client
 try:
@@ -986,11 +964,20 @@ def aggregate_by_strike(df, value_columns, strike_interval):
     
     return aggregated
 
+# CBOE VIX1D-style floor: persist near-term inputs when < 60 minutes remain (see CBOE VIX1D methodology).
+T_EXPIRATION_FLOOR_MINUTES = 60
+SECONDS_PER_YEAR = 365 * 24 * 3600
+
 def calculate_time_to_expiration(expiry_date):
     """
     Calculate time to expiration in years using Eastern Time.
+
+    Uses a 60-minute floor per CBOE VIX1D near-term handling so Black-Scholes
+    Greeks do not blow up in the final hour. Returns 0.0 after expiration
+    (4:00 PM ET on expiry day for standard equity/PM-settled options).
+
     expiry_date: datetime.date object or string 'YYYY-MM-DD'
-    Returns: time in years (float)
+    Returns: time in years (float), or 0.0 if already expired
     """
     try:
         et_tz = pytz.timezone('US/Eastern')
@@ -1001,62 +988,60 @@ def calculate_time_to_expiration(expiry_date):
         elif isinstance(expiry_date, datetime):
             expiry_date = expiry_date.date()
             
-        # Set expiration to 4:00 PM ET on the expiration date
+        # Standard equity / PM-settled index options expire at 4:00 PM ET
         expiry_dt = datetime.combine(expiry_date, datetime.min.time()) + timedelta(hours=16)
         expiry_dt = et_tz.localize(expiry_dt)
         
-        # Calculate time difference in years
-        diff = expiry_dt - now_et
-        t = diff.total_seconds() / (365 * 24 * 3600)
-        
-        return t
+        seconds_left = (expiry_dt - now_et).total_seconds()
+        if seconds_left <= 0:
+            return 0.0
+
+        minutes_left = seconds_left / 60.0
+        if minutes_left < T_EXPIRATION_FLOOR_MINUTES:
+            minutes_left = T_EXPIRATION_FLOOR_MINUTES
+
+        return (minutes_left * 60.0) / SECONDS_PER_YEAR
              
     except Exception as e:
         print(f"Error calculating time to expiration: {e}")
-        return 0
+        return 0.0
 
 def fetch_options_for_date(ticker, date, exposure_metric="Open Interest", delta_adjusted: bool = False, calculate_in_notional: bool = True, S=None):
     if client is None:
         raise Exception("Schwab API client not initialized. Check your environment variables.")
     
     if ticker == "MARKET" or ticker == "MARKET2":
-        # Step 1: Initialize Base
+        # MARKET: synthetic SPX-centered view blending $SPX + SPY exposures.
+        # Raw dollar-notional exposures are mapped onto the SPX strike grid via moneyness.
         base_ticker = "$SPX" if ticker == "MARKET" else "SPY"
         base_price = S if S else get_current_price(base_ticker)
         
         if not base_price:
              return pd.DataFrame(), pd.DataFrame()
 
-        # Fetch Base chain to build strike grid
+        # Fetch base chain to build the SPX strike grid
         base_calls_raw, base_puts_raw = fetch_options_for_date(base_ticker, date, exposure_metric, delta_adjusted, calculate_in_notional)
         
         if base_calls_raw.empty and base_puts_raw.empty:
             return pd.DataFrame(), pd.DataFrame()
 
-        # Step 2: Components to combine
-        # Calculate bucket size from the base chain's actual strike spacing
-        # (e.g. SPX → typically $5, SPY → $1). Avoids hardcoding.
+        # Bucket size from base chain strike spacing (SPX ~$5, SPY ~$1)
         base_all_strikes = []
         if not base_calls_raw.empty: base_all_strikes.extend(base_calls_raw['strike'].tolist())
         if not base_puts_raw.empty: base_all_strikes.extend(base_puts_raw['strike'].tolist())
         bucket_size = get_strike_interval(base_all_strikes) if base_all_strikes else 5.0
 
         if ticker == "MARKET":
-            component_tickers = ["$SPX", "$NDX", "QQQ", "SPY"]
+            component_tickers = ["$SPX", "SPY"]
         else:
             component_tickers = ["SPY"]
         
         calls_list = []
         puts_list = []
 
-        # Columns that get per-Greek normalization
-        exposure_cols = ['GEX', 'DEX', 'VEX', 'Charm', 'Speed', 'Vomma', 'Color']
-        activity_cols = ['openInterest', 'volume']
+        # Columns split across SPX buckets during moneyness interpolation
+        weight_cols = ['GEX', 'DEX', 'VEX', 'Charm', 'Speed', 'Vomma', 'Color', 'openInterest', 'volume']
 
-        # First pass: collect data and compute per-Greek total absolute exposure
-        # for each component.  This lets us normalize each Greek independently
-        # so that e.g. 5 000 OI on IWM is proportionally as loud as 500 000 on SPX.
-        component_data = []
         for comp_tick in component_tickers:
             if comp_tick == base_ticker:
                 c, p = base_calls_raw.copy(), base_puts_raw.copy()
@@ -1069,86 +1054,17 @@ def fetch_options_for_date(ticker, date, exposure_metric="Open Interest", delta_
             
             if c.empty and p.empty: continue
             
-            # Use total open interest as the stable sizing anchor.
-            # OI only updates overnight, so normalization factors stay constant
-            # between live updates — preventing Greek exposure jumps caused by
-            # the per-Greek totals (GEX, DEX…) swinging with every price tick.
-            comp_oi = 0
-            if not c.empty and 'openInterest' in c.columns:
-                comp_oi += c['openInterest'].sum()
-            if not p.empty and 'openInterest' in p.columns:
-                comp_oi += p['openInterest'].sum()
-            comp_oi = max(comp_oi, 1)  # avoid /0
-            # Same anchor value for every column so the ratio base_oi/comp_oi
-            # is applied uniformly across all Greeks and activity columns.
-            totals = {col: comp_oi for col in exposure_cols + activity_cols}
-
-            component_data.append({
-                'ticker': comp_tick,
-                'price': comp_price,
-                'calls': c,
-                'puts': p,
-                'totals': totals          # dict keyed by column name
-            })
-        
-        if not component_data:
-            return pd.DataFrame(), pd.DataFrame()
-        
-        # OI-based reference anchor: base_oi / comp_oi is the single scale
-        # factor applied to all columns for every non-base component.
-        # Because OI only changes overnight, this ratio stays constant between
-        # live price-update cycles — eliminating the intraday Greek-jump problem
-        # that arose when per-Greek totals (GEX ∝ S², DEX ∝ S) swung with price.
-        base_cd = next((cd for cd in component_data if cd['ticker'] == base_ticker), component_data[0])
-        base_totals = base_cd['totals']  # {col: base_oi} for all cols
-
-        # Second pass: OI-anchored normalization, then moneyness strike mapping.
-        # Base component (SPX) is untouched (factor = 1.0).
-        # Non-base: scale so their total OI matches base OI, then apply to Greeks.
-        for cd in component_data:
-            comp_tick = cd['ticker']
-            comp_price = cd['price']
-            c = cd['calls']
-            p = cd['puts']
-            totals = cd['totals']
-            
             is_base = (comp_tick == base_ticker)
 
-            # Build per-column norm factors anchored to base component.
-            # Base component: factor = 1.0 (unchanged).
-            # Non-base: factor = base_total / component_total (scale up to match SPX magnitude).
-            col_norm = {}
-            for col in exposure_cols + activity_cols:
-                if is_base:
-                    col_norm[col] = 1.0
-                else:
-                    col_norm[col] = base_totals[col] / totals[col]
-            
-            # Process Calls
             if not c.empty:
                 c = c.copy()
-                
-                # Normalize each column independently (Greeks + OI/Volume)
-                # Base component is untouched (factor=1.0), others scaled to match base
-                for col in exposure_cols + activity_cols:
-                    if col in c.columns and not is_base:
-                        c[col] = c[col] * col_norm[col]
-                
                 if is_base:
-                    # Base component: strikes are already native SPX strikes.
-                    # No moneyness mapping needed — just snap to nearest bucket
-                    # to avoid floating-point ghost rows.
                     c['strike'] = (c['strike'] / bucket_size).round() * bucket_size
                     calls_list.append(c)
                 else:
-                    # Map strikes to base-equivalent via moneyness with linear
-                    # interpolation between the two nearest buckets.  This prevents
-                    # "bucket-hopping" where a small price change snaps 100% of a
-                    # strike's exposure from one bucket to an adjacent one.
-                    # Total exposure is conserved: weight_lo + weight_hi = 1.0.
-                    weight_cols = exposure_cols + activity_cols
+                    # Map to SPX-equivalent strike via moneyness; interpolate across
+                    # adjacent buckets so exposure is conserved (weight_lo + weight_hi = 1).
                     exact = (c['strike'] / comp_price) * base_price
-                    # Round to avoid floating-point boundary jitter
                     exact = exact.round(6)
                     bucket_lo = np.floor(exact / bucket_size) * bucket_size
                     bucket_hi = bucket_lo + bucket_size
@@ -1167,24 +1083,13 @@ def fetch_options_for_date(ticker, date, exposure_metric="Open Interest", delta_
                     calls_list.append(c_lo)
                     calls_list.append(c_hi)
 
-            # Process Puts
             if not p.empty:
                 p = p.copy()
-                
-                # Normalize each column independently (Greeks + OI/Volume)
-                # Base component is untouched (factor=1.0), others scaled to match base
-                for col in exposure_cols + activity_cols:
-                    if col in p.columns and not is_base:
-                        p[col] = p[col] * col_norm[col]
-                
                 if is_base:
-                    # Base component: strikes are already native SPX strikes.
                     p['strike'] = (p['strike'] / bucket_size).round() * bucket_size
                     puts_list.append(p)
                 else:
-                    # Map strikes to base-equivalent via moneyness with linear interpolation
                     exact = (p['strike'] / comp_price) * base_price
-                    # Round to avoid floating-point boundary jitter
                     exact = exact.round(6)
                     bucket_lo = np.floor(exact / bucket_size) * bucket_size
                     bucket_hi = bucket_lo + bucket_size
@@ -1203,22 +1108,16 @@ def fetch_options_for_date(ticker, date, exposure_metric="Open Interest", delta_
                     puts_list.append(p_lo)
                     puts_list.append(p_hi)
 
-        # Step 3: Combine and Aggregate by Strike
         combined_calls = pd.concat(calls_list, ignore_index=True) if calls_list else pd.DataFrame()
         combined_puts = pd.concat(puts_list, ignore_index=True) if puts_list else pd.DataFrame()
 
         def aggregate_market_data(df):
             if df.empty: return df
             sum_cols = ['openInterest', 'volume', 'GEX', 'DEX', 'VEX', 'Charm', 'Speed', 'Vomma', 'Color']
-            avg_cols = ['lastPrice', 'bid', 'ask', 'impliedVolatility', 'delta', 'gamma', 'vega', 'theta', 'rho']
-            
             agg_dict = {col: 'sum' for col in sum_cols if col in df.columns}
-            agg_dict.update({col: 'mean' for col in avg_cols if col in df.columns})
-            
             for col in df.columns:
                 if col not in agg_dict and col != 'strike':
                     agg_dict[col] = 'first'
-                    
             return df.groupby('strike', as_index=False).agg(agg_dict)
 
         combined_calls = aggregate_market_data(combined_calls)
@@ -1251,127 +1150,106 @@ def fetch_options_for_date(ticker, date, exposure_metric="Open Interest", delta_
             S = get_current_price(ticker)
         if S is None:
             return pd.DataFrame(), pd.DataFrame()
-        
-        # Calculate time to expiration in years
+
+        # Cache spot price so /update can skip a redundant quote API call
+        _chain_spot_cache[ticker] = (S, time.time())
+
+        # Calculate time to expiration in years (60-min CBOE floor applied inside)
         t = calculate_time_to_expiration(expiry)
-        t = max(t, 1e-5)  # Minimum 1 minute
         r = 0.02  # risk-free rate (2% as default to match Yahoo script)
         
         calls_data = []
         puts_data = []
         display_tickers = format_display_ticker(ticker)
-        
+        expiry_date_obj = expiry  # datetime.date — same for all options in this call
+
+        # Parse options into plain dicts WITHOUT computing Greeks (vectorized below)
         for exp_date, strikes in chain.get('callExpDateMap', {}).items():
             for strike, options in strikes.items():
                 for option in options:
-                    if any(option['symbol'].startswith(t) for t in display_tickers):
+                    if any(option['symbol'].startswith(dt) for dt in display_tickers):
                         K = float(option['strikePrice'])
                         raw_vol = float(option.get('volatility', -999.0))
                         vol = (raw_vol / 100) if raw_vol > 0 else 0.20
-                        
-                        # Calculate Greeks
-                        if t > 0 and vol > 0 and K > 0:
-                            delta, gamma, vega, vanna = calculate_greeks('c', S, K, t, vol, r, 0)
-                            theta = calculate_theta('c', S, K, t, vol, r, 0)
-                            rho = calculate_rho('c', S, K, t, vol, r, 0)
-                        else:
-                            delta = gamma = theta = vega = rho = 0
-                        
-                        option_data = {
+                        last = float(option['last'])
+                        bid = float(option['bid'])
+                        ask = float(option['ask'])
+                        calls_data.append({
                             'contractSymbol': option['symbol'],
                             'strike': K,
-                            'lastPrice': float(option['last']),
-                            'bid': float(option['bid']),
-                            'ask': float(option['ask']),
+                            'lastPrice': last,
+                            'bid': bid,
+                            'ask': ask,
                             'volume': int(option['totalVolume']),
                             'openInterest': int(option['openInterest']),
                             'impliedVolatility': vol,
                             'inTheMoney': option['inTheMoney'],
-                            'expiration': datetime.strptime(exp_date.split(':')[0], '%Y-%m-%d').date(),
-                            'delta': delta,
-                            'gamma': gamma,
-                            'theta': theta,
-                            'vega': vega,
-                            'rho': rho
-                        }
-                        option_data['side'] = infer_side(option_data['lastPrice'], option_data['bid'], option_data['ask'])
-                        calls_data.append(option_data)
-        
+                            'expiration': expiry_date_obj,
+                            'side': infer_side(last, bid, ask),
+                        })
+
         for exp_date, strikes in chain.get('putExpDateMap', {}).items():
             for strike, options in strikes.items():
                 for option in options:
-                    if any(option['symbol'].startswith(t) for t in display_tickers):
+                    if any(option['symbol'].startswith(dt) for dt in display_tickers):
                         K = float(option['strikePrice'])
                         raw_vol = float(option.get('volatility', -999.0))
                         vol = (raw_vol / 100) if raw_vol > 0 else 0.20
-                        
-                        # Calculate Greeks
-                        if t > 0 and vol > 0 and K > 0:
-                            delta, gamma, vega, vanna = calculate_greeks('p', S, K, t, vol, r, 0)
-                            theta = calculate_theta('p', S, K, t, vol, r, 0)
-                            rho = calculate_rho('p', S, K, t, vol, r, 0)
-                        else:
-                            delta = gamma = theta = vega = rho = 0
-                        
-                        option_data = {
+                        last = float(option['last'])
+                        bid = float(option['bid'])
+                        ask = float(option['ask'])
+                        puts_data.append({
                             'contractSymbol': option['symbol'],
                             'strike': K,
-                            'lastPrice': float(option['last']),
-                            'bid': float(option['bid']),
-                            'ask': float(option['ask']),
+                            'lastPrice': last,
+                            'bid': bid,
+                            'ask': ask,
                             'volume': int(option['totalVolume']),
                             'openInterest': int(option['openInterest']),
                             'impliedVolatility': vol,
                             'inTheMoney': option['inTheMoney'],
-                            'expiration': datetime.strptime(exp_date.split(':')[0], '%Y-%m-%d').date(),
-                            'delta': delta,
-                            'gamma': gamma,
-                            'theta': theta,
-                            'vega': vega,
-                            'rho': rho
-                        }
-                        option_data['side'] = infer_side(option_data['lastPrice'], option_data['bid'], option_data['ask'])
-                        puts_data.append(option_data)
-        
-        # Calculate exposures with selected metric
-        for option_data in calls_data:
-            weight = 0
-            if exposure_metric == 'Volume':
-                weight = option_data['volume']
-            elif exposure_metric == 'Max OI vs Volume':
-                # Use the greater of OI and volume as the weight
-                oi = option_data['openInterest']
-                vol = option_data['volume']
-                weight = max(oi, vol)
-            elif exposure_metric == 'OI + Volume':
-                # Use the sum of OI and volume as the weight
-                weight = option_data['openInterest'] + option_data['volume']
-            else: # Open Interest
-                weight = option_data['openInterest']
-                
-            exposures = calculate_greek_exposures(option_data, S, weight, delta_adjusted=delta_adjusted, calculate_in_notional=calculate_in_notional)
-            option_data.update(exposures)
+                            'expiration': expiry_date_obj,
+                            'side': infer_side(last, bid, ask),
+                        })
 
-        for option_data in puts_data:
-            weight = 0
-            if exposure_metric == 'Volume':
-                weight = option_data['volume']
-            elif exposure_metric == 'Max OI vs Volume':
-                # Use the greater of OI and volume as the weight
-                oi = option_data['openInterest']
-                vol = option_data['volume']
-                weight = max(oi, vol)
-            elif exposure_metric == 'OI + Volume':
-                # Use the sum of OI and volume as the weight
-                weight = option_data['openInterest'] + option_data['volume']
-            else: # Open Interest
-                weight = option_data['openInterest']
-                
-            exposures = calculate_greek_exposures(option_data, S, weight, delta_adjusted=delta_adjusted, calculate_in_notional=calculate_in_notional)
-            option_data.update(exposures)
+        def _apply_vectorized_greeks(option_list, flag_int):
+            """Vectorized Greek + exposure computation for a list of option dicts."""
+            if not option_list:
+                return pd.DataFrame()
+            df = pd.DataFrame(option_list)
+            if t <= 0:
+                for col in ('delta','gamma','theta','vega','rho','DEX','GEX','VEX','Charm','Speed','Vomma','Color'):
+                    df[col] = 0.0
+                return df
 
-        calls = pd.DataFrame(calls_data)
-        puts = pd.DataFrame(puts_data)
+            K_arr = df['strike'].to_numpy(dtype=float)
+            sigma_arr = df['impliedVolatility'].to_numpy(dtype=float)
+
+            # Compute exposure weight per selected metric
+            oi_arr = df['openInterest'].to_numpy(dtype=float)
+            vol_arr = df['volume'].to_numpy(dtype=float)
+            if exposure_metric == 'Volume':
+                weight_arr = vol_arr
+            elif exposure_metric == 'Max OI vs Volume':
+                weight_arr = np.maximum(oi_arr, vol_arr)
+            elif exposure_metric == 'OI + Volume':
+                weight_arr = oi_arr + vol_arr
+            else:
+                weight_arr = oi_arr
+
+            results = _compute_all_greeks_and_exposures_vectorized(
+                np.full(len(df), flag_int, dtype=np.int8),
+                S, K_arr, t, sigma_arr, weight_arr,
+                r=r, q=0,
+                delta_adjusted=delta_adjusted,
+                calculate_in_notional=calculate_in_notional,
+            )
+            for col, arr in results.items():
+                df[col] = arr
+            return df
+
+        calls = _apply_vectorized_greeks(calls_data, 0)
+        puts = _apply_vectorized_greeks(puts_data, 1)
         return calls, puts
         
     except Exception as e:
@@ -1379,6 +1257,105 @@ def fetch_options_for_date(ticker, date, exposure_metric="Open Interest", delta_
         print(msg)
         # Propagate so callers (API routes) can return the error to clients
         raise Exception(msg)
+
+def _compute_all_greeks_and_exposures_vectorized(
+    flags, S, K_arr, t, sigma_arr, weight_arr, r=0.02, q=0,
+    delta_adjusted=False, calculate_in_notional=True,
+):
+    """
+    Vectorized computation of all Greeks and exposures for an array of options.
+    flags: numpy int array — 0 = call, 1 = put
+    K_arr, sigma_arr, weight_arr: numpy float arrays (same length as flags)
+    t: scalar time to expiration in years (same for all options in a single-date call)
+    Returns a dict mapping column name -> numpy array.
+    """
+    t = max(float(t), 1e-5)
+    sqrt_t = math.sqrt(t)
+
+    # Guard against zero/negative sigma — replace with 0.20 floor
+    sigma_arr = np.where(sigma_arr > 0, sigma_arr, 0.20)
+
+    log_SK = np.log(S / K_arr)
+    d1 = (log_SK + (r - q + 0.5 * sigma_arr ** 2) * t) / (sigma_arr * sqrt_t)
+    d2 = d1 - sigma_arr * sqrt_t
+
+    exp_qt = math.exp(-q * t)
+    exp_rt = math.exp(-r * t)
+    norm_d1 = norm.pdf(d1)
+    cdf_d1 = norm.cdf(d1)
+    cdf_d2 = norm.cdf(d2)
+    cdf_neg_d1 = 1.0 - cdf_d1
+    cdf_neg_d2 = 1.0 - cdf_d2
+
+    # Delta
+    call_delta = exp_qt * cdf_d1
+    put_delta = exp_qt * (cdf_d1 - 1.0)
+    delta = np.where(flags == 0, call_delta, put_delta)
+
+    # Gamma (same for calls and puts)
+    gamma = exp_qt * norm_d1 / (S * sigma_arr * sqrt_t)
+
+    # Vega (same)
+    vega = S * exp_qt * norm_d1 * sqrt_t
+
+    # Vanna (same)
+    vanna = -exp_qt * norm_d1 * d2 / sigma_arr
+
+    # Theta
+    term1 = -S * exp_qt * norm_d1 * sigma_arr / (2.0 * sqrt_t)
+    call_theta = term1 - r * K_arr * exp_rt * cdf_d2 + q * S * exp_qt * cdf_d1
+    put_theta = term1 + r * K_arr * exp_rt * cdf_neg_d2 - q * S * exp_qt * cdf_neg_d1
+    theta = np.where(flags == 0, call_theta, put_theta)
+
+    # Rho
+    call_rho = K_arr * t * exp_rt * cdf_d2
+    put_rho = -K_arr * t * exp_rt * cdf_neg_d2
+    rho = np.where(flags == 0, call_rho, put_rho)
+
+    # Charm
+    inner_charm = norm_d1 * (2.0 * (r - q) * t - d2 * sigma_arr * sqrt_t) / (2.0 * t * sigma_arr * sqrt_t)
+    call_charm = -exp_qt * (inner_charm - q * cdf_d1)
+    put_charm = -exp_qt * (inner_charm + q * cdf_neg_d1)
+    charm = np.where(flags == 0, call_charm, put_charm)
+
+    # Speed
+    speed = -gamma * (d1 / (sigma_arr * sqrt_t) + 1.0) / S
+
+    # Vomma
+    vomma = vega * (d1 * d2) / sigma_arr
+
+    # Color
+    color = -exp_qt * (norm_d1 / (2.0 * S * t * sigma_arr * sqrt_t)) * \
+            (1.0 + (2.0 * (r - q) * t - d2 * sigma_arr * sqrt_t) * d1 / (2.0 * t * sigma_arr * sqrt_t))
+
+    # --- Exposure calculations ---
+    contract_size = 100
+    spot_mult = S if calculate_in_notional else 1.0
+
+    dex = delta * weight_arr * contract_size * spot_mult
+    gex = gamma * weight_arr * contract_size * S * spot_mult * 0.01
+    vex = vanna * weight_arr * contract_size * spot_mult * 0.01
+    charm_exp = charm * weight_arr * contract_size * spot_mult / 365.0
+    speed_exp = speed * weight_arr * contract_size * S * spot_mult * 0.01
+    vomma_exp = vomma * weight_arr * contract_size * 0.01
+    color_exp = color * weight_arr * contract_size * S * spot_mult * 0.01 / 365.0
+
+    if delta_adjusted:
+        abs_delta = np.abs(delta)
+        gex *= abs_delta
+        vex *= abs_delta
+        charm_exp *= abs_delta
+        speed_exp *= abs_delta
+        vomma_exp *= abs_delta
+        color_exp *= abs_delta
+
+    return {
+        'delta': delta, 'gamma': gamma, 'vega': vega, 'vanna': vanna,
+        'theta': theta, 'rho': rho,
+        'DEX': dex, 'GEX': gex, 'VEX': vex, 'Charm': charm_exp,
+        'Speed': speed_exp, 'Vomma': vomma_exp, 'Color': color_exp,
+    }
+
 
 def calculate_greeks(flag, S, K, t, sigma, r=0.02, q=0):
     """Calculate delta, gamma, vega, vanna."""
@@ -1493,16 +1470,19 @@ def calculate_greek_exposures(option, S, weight, delta_adjusted: bool = False, c
     # Recalculate Greeks to ensure consistency with S and t
     vol = option['impliedVolatility']
     
-    # Calculate time to expiration in years
+    # Calculate time to expiration in years (60-min CBOE floor applied inside)
     expiry_date = option['expiration']
     t = calculate_time_to_expiration(expiry_date)
-    t = max(t, 1e-5)  # Minimum time to prevent division by zero
+    if t <= 0:
+        return {
+            'DEX': 0, 'GEX': 0, 'VEX': 0, 'Charm': 0,
+            'Speed': 0, 'Vomma': 0, 'Color': 0,
+        }
     
     # Determine flag (c/p) based on symbol if possible, or use parameter
     flag = 'c'
     if 'P' in option['contractSymbol'] and not 'C' in option['contractSymbol']:
          flag = 'p'
-    import re
     match = re.search(r'\d{6}([CP])', option['contractSymbol'])
     if match:
         flag = match.group(1).lower()
@@ -1758,6 +1738,69 @@ def build_chart_title_text(base_title, selected_expiries=None, showing_last_sess
     return chart_title
 
 
+def calc_linear_trend_line(timestamps, values):
+    """Fit a least-squares trend through valid points; returns (times, trend_values) or (None, None)."""
+    points = [
+        (index, timestamp, value)
+        for index, (timestamp, value) in enumerate(zip(timestamps, values))
+        if value is not None and math.isfinite(value)
+    ]
+    if len(points) < 2:
+        return None, None
+
+    n = len(points)
+    sum_x = sum(point[0] for point in points)
+    sum_y = sum(point[2] for point in points)
+    sum_xy = sum(point[0] * point[2] for point in points)
+    sum_xx = sum(point[0] * point[0] for point in points)
+    denominator = (n * sum_xx) - (sum_x * sum_x)
+    slope = 0 if denominator == 0 else ((n * sum_xy) - (sum_x * sum_y)) / denominator
+    intercept = (sum_y - (slope * sum_x)) / n
+
+    trend_times = [point[1] for point in points]
+    trend_values = [intercept + (slope * point[0]) for point in points]
+    return trend_times, trend_values
+
+
+def compute_iv_stats(calls, puts, _spot=None):
+    """Compute volume-weighted IV stats for the price-info bar."""
+    if (calls is None or calls.empty) and (puts is None or puts.empty):
+        return None
+
+    def _valid_iv(value):
+        try:
+            iv = float(value)
+        except (TypeError, ValueError):
+            return False
+        return math.isfinite(iv) and iv > 0
+
+    def _volume_weighted_iv(df):
+        if df is None or df.empty or 'impliedVolatility' not in df.columns:
+            return None
+        valid = df[df['impliedVolatility'].apply(_valid_iv)].copy()
+        if valid.empty:
+            return None
+        if 'volume' in valid.columns:
+            weighted = valid[valid['volume'] > 0]
+            if not weighted.empty:
+                total_vol = weighted['volume'].sum()
+                return float((weighted['impliedVolatility'] * weighted['volume']).sum() / total_vol)
+        return float(valid['impliedVolatility'].mean())
+
+    def _pct(iv):
+        return round(iv * 100, 2) if iv is not None else None
+
+    call_vw_iv = _pct(_volume_weighted_iv(calls))
+    put_vw_iv = _pct(_volume_weighted_iv(puts))
+    if call_vw_iv is None and put_vw_iv is None:
+        return None
+
+    return {
+        'call_vw_iv': call_vw_iv,
+        'put_vw_iv': put_vw_iv,
+    }
+
+
 def build_bar_chart_title(base_title, call_total, put_total, net_total, call_color, put_color,
                           selected_expiries=None):
     return build_chart_title_text(base_title, selected_expiries=selected_expiries)
@@ -1958,6 +2001,17 @@ def create_exposure_heatmap(calls, puts, S, strike_range=0.02, show_calls=True, 
         actual_values.append(value_row)
         text_values.append(text_row)
 
+    global_peak = max((abs(value) for row in actual_values for value in row), default=0.0)
+    exposure_floor = global_peak * 0.01 if global_peak > 0 else 0.0
+    visible_indices = [
+        si for si in range(len(strikes))
+        if max((abs(actual_values[si][ei]) for ei in range(len(expiry_labels))), default=0.0) > exposure_floor
+    ]
+    if visible_indices and len(visible_indices) < len(strikes):
+        strikes = [strikes[si] for si in visible_indices]
+        actual_values = [actual_values[si] for si in visible_indices]
+        text_values = [text_values[si] for si in visible_indices]
+
     if heatmap_coloring_mode == 'Per Expiration':
         column_maxima = []
         for expiry_index in range(len(expiry_labels)):
@@ -2099,6 +2153,8 @@ def create_exposure_heatmap(calls, puts, S, strike_range=0.02, show_calls=True, 
         compact_expiry_ticktext = compact_expiry_labels
 
     expiry_tick_font_size = 10 if len(expiry_labels) <= 8 else 9
+    y_pad = strike_interval * 0.5
+    y_range = [strikes[0] - y_pad, strikes[-1] + y_pad]
     fig.update_layout(
         shapes=list(fig.layout.shapes) + highlight_shapes,
         title=build_left_aligned_title(chart_title, text_color=text_color),
@@ -2126,6 +2182,7 @@ def create_exposure_heatmap(calls, puts, S, strike_range=0.02, show_calls=True, 
             categoryorder='array',
             categoryarray=expiry_labels,
             tickangle=0,
+            constrain='domain',
         ),
         yaxis=dict(
             title='Price',
@@ -2136,19 +2193,20 @@ def create_exposure_heatmap(calls, puts, S, strike_range=0.02, show_calls=True, 
             showgrid=False,
             zeroline=False,
             tickformat=y_tick_format,
-            range=[min_strike, max_strike],
+            range=y_range,
             autorange=False,
+            constrain='domain',
         ),
         plot_bgcolor=background_color,
         paper_bgcolor=background_color,
         font=dict(color=text_color),
-        margin=dict(l=48, r=92, t=56, b=40),
+        margin=dict(l=44, r=52, t=48, b=32),
         hoverlabel=dict(
             bgcolor=background_color,
             font_size=12,
             font_family='Arial',
         ),
-        height=560,
+        transition=dict(duration=0, easing='linear'),
     )
 
     return fig.to_json()
@@ -2903,7 +2961,41 @@ def aggregate_to_hourly(candles):
         })
     return result
 
-def get_price_history(ticker, timeframe=1):
+# Schwab API hard limit: minute-frequency data is only available for the last 10 trading days.
+# Requesting a wider date range via startDate/endDate simply returns no extra candles.
+SCHWAB_MAX_MINUTE_TRADING_DAYS = 10
+
+# Realistic bars per trading day for each supported timeframe (390 min market session).
+_BARS_PER_DAY = {1: 390, 5: 78, 10: 39, 15: 26, 30: 13, 60: 7}
+
+
+def schwab_max_bars(timeframe):
+    """Return the absolute maximum indicator-warmup bars the Schwab API can deliver."""
+    bpd = _BARS_PER_DAY.get(int(timeframe), 78)
+    return SCHWAB_MAX_MINUTE_TRADING_DAYS * bpd
+
+
+def _price_history_params(timeframe, lookback_bars=220):
+    """
+    Return (period_type, period, calendar_span_days) for the Schwab price-history call.
+
+    Schwab only serves up to SCHWAB_MAX_MINUTE_TRADING_DAYS of intraday data.
+    We always request that full window so indicators have the most context possible,
+    but we never ask for more than the API can deliver.
+    """
+    bpd = _BARS_PER_DAY.get(int(timeframe), 78)
+    max_bars = SCHWAB_MAX_MINUTE_TRADING_DAYS * bpd
+
+    # Clamp the caller's request to what the API can actually return
+    effective_bars = max(bpd * 2, min(max_bars, int(lookback_bars)))
+    trading_days = max(2, min(SCHWAB_MAX_MINUTE_TRADING_DAYS, math.ceil(effective_bars / bpd) + 1))
+
+    # Add extra calendar days to absorb weekends and market holidays
+    calendar_span = trading_days * 2 + 3
+    return 'day', trading_days, calendar_span
+
+
+def get_price_history(ticker, timeframe=1, lookback_bars=220):
     if ticker == "MARKET":
         ticker = "$SPX"
     elif ticker == "MARKET2":
@@ -2912,20 +3004,19 @@ def get_price_history(ticker, timeframe=1):
         # Get current time in EST
         est = datetime.now(pytz.timezone('US/Eastern'))
         current_date = est.date()
-        
-        # Calculate start date (5 days ago to ensure we get previous trading day)
-        start_date = datetime.combine(current_date - timedelta(days=5), datetime.min.time())
-        end_date = datetime.combine(current_date + timedelta(days=1), datetime.min.time())
-        
+
         # Schwab API only supports minute frequencies: 1, 5, 10, 15, 30.
         # For 60-min (hourly), fetch 30-min candles and aggregate after.
         api_frequency = 30 if timeframe == 60 else timeframe
+        period_type, period, calendar_span_days = _price_history_params(timeframe, lookback_bars=lookback_bars)
+        start_date = datetime.combine(current_date - timedelta(days=calendar_span_days), datetime.min.time())
+        end_date = datetime.combine(current_date + timedelta(days=1), datetime.min.time())
 
         # Convert dates to milliseconds since epoch
         response = client.price_history(
             symbol=ticker,
-            periodType="day",
-            period=5,  # Get 5 days of data
+            periodType=period_type,
+            period=period,
             frequencyType="minute",
             frequency=api_frequency,
             startDate=int(start_date.timestamp() * 1000),
@@ -3705,7 +3796,7 @@ def prepare_price_chart_data(price_data, calls=None, puts=None, exposure_levels_
                               strike_range=0.1, use_heikin_ashi=False,
                               highlight_max_level=False, max_level_color='#800080',
                               coloring_mode='Linear Intensity', ticker=None, selected_expiries=None,
-                              show_latest_level_lines=True):
+                              show_latest_level_lines=True, timeframe=1):
     """Return raw OHLCV + overlay data as JSON for TradingView Lightweight Charts rendering."""
     import json as _json
 
@@ -3771,7 +3862,7 @@ def prepare_price_chart_data(price_data, calls=None, puts=None, exposure_levels_
         lc_volume.append({'time': ts, 'value': c['volume'],
                           'color': call_color if is_up else put_color})
 
-    # Multi-day raw candles for indicator warmup (SMA200, EMA, etc. need prior-day history)
+    # Multi-day raw candles for indicator warmup (FBB/SMA200 need up to 200 prior bars)
     lc_indicator_candles = [
         {'time': int(c['datetime'] / 1000), 'open': c['open'], 'high': c['high'],
          'low': c['low'], 'close': c['close'], 'volume': c.get('volume', 0)}
@@ -3930,6 +4021,8 @@ def prepare_price_chart_data(price_data, calls=None, puts=None, exposure_levels_
         'historical_exposure_levels': historical_exposure_levels,
         'historical_expected_moves': historical_expected_moves,
         'indicator_candles': lc_indicator_candles,
+        'indicator_candles_count': len(lc_indicator_candles),
+        'max_indicator_bars': schwab_max_bars(timeframe),
         'current_day_start_time': current_day_start_time,
     })
 
@@ -4772,6 +4865,30 @@ def create_centroid_chart(ticker, call_color='#00FF00', put_color='#FF0000', sel
         connectgaps=False
     ))
 
+    call_trend_times, call_trend_values = calc_linear_trend_line(timestamps, call_centroids)
+    if call_trend_times:
+        fig.add_trace(go.Scatter(
+            x=call_trend_times,
+            y=call_trend_values,
+            mode='lines',
+            name='Call Trend',
+            line=dict(color=call_color, width=2, dash='dash'),
+            hovertemplate=build_time_hover_template('Call Trend', [('Trend', '$%{y:.2f}')]),
+            connectgaps=False
+        ))
+
+    put_trend_times, put_trend_values = calc_linear_trend_line(timestamps, put_centroids)
+    if put_trend_times:
+        fig.add_trace(go.Scatter(
+            x=put_trend_times,
+            y=put_trend_values,
+            mode='lines',
+            name='Put Trend',
+            line=dict(color=put_color, width=2, dash='dash'),
+            hovertemplate=build_time_hover_template('Put Trend', [('Trend', '$%{y:.2f}')]),
+            connectgaps=False
+        ))
+
     # Add price line last (bottom layer)
     fig.add_trace(go.Scatter(
         x=timestamps,
@@ -4860,30 +4977,43 @@ def infer_side(last, bid, ask):
         return 0  # indeterminate
 
 def fetch_options_for_multiple_dates(ticker, dates, exposure_metric="Open Interest", delta_adjusted: bool = False, calculate_in_notional: bool = True):
-    """Fetch options for multiple expiration dates and combine them"""
+    """Fetch options for multiple expiration dates concurrently and combine them."""
+    results = {}
+    exceptions = {}
+
+    def _fetch(date):
+        try:
+            calls, puts = fetch_options_for_date(
+                ticker, date,
+                exposure_metric=exposure_metric,
+                delta_adjusted=delta_adjusted,
+                calculate_in_notional=calculate_in_notional,
+            )
+            results[date] = (calls, puts)
+        except Exception as e:
+            exceptions[date] = e
+            print(f"Error fetching options for {date}: {e}")
+
+    threads = [threading.Thread(target=_fetch, args=(date,), daemon=True) for date in dates]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
     all_calls = []
     all_puts = []
-    last_exception = None
-    
     for date in dates:
-        try:
-            calls, puts = fetch_options_for_date(ticker, date, exposure_metric=exposure_metric, delta_adjusted=delta_adjusted, calculate_in_notional=calculate_in_notional)
+        if date in results:
+            calls, puts = results[date]
             if not calls.empty:
                 all_calls.append(calls)
             if not puts.empty:
                 all_puts.append(puts)
-        except Exception as e:
-            msg = f"Error fetching options for {date}: {e}"
-            print(msg)
-            last_exception = e
-            continue
-    
-    # Combine all dataframes
+
     combined_calls = pd.concat(all_calls, ignore_index=True) if all_calls else pd.DataFrame()
     combined_puts = pd.concat(all_puts, ignore_index=True) if all_puts else pd.DataFrame()
-    # If we couldn't fetch any data and there was an exception, propagate it
-    if combined_calls.empty and combined_puts.empty and last_exception is not None:
-        raise last_exception
+    if combined_calls.empty and combined_puts.empty and exceptions:
+        raise next(iter(exceptions.values()))
 
     return combined_calls, combined_puts
 
@@ -4904,6 +5034,9 @@ def index():
     <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
     <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
     <style>
+        *, *::before, *::after {
+            box-sizing: border-box;
+        }
         body {
             background-color: #1E1E1E;
             color: white;
@@ -5256,14 +5389,17 @@ def index():
         }
 
         .heatmap-chart-shell {
-            display: flex;
-            flex-direction: column;
+            display: grid;
+            grid-template-rows: auto minmax(0, 1fr);
+            flex: 1 1 0;
             width: 100%;
             height: 100%;
             min-width: 0;
             min-height: 0;
             gap: 8px;
             padding: 8px;
+            box-sizing: border-box;
+            overflow: hidden;
         }
 
         .heatmap-chart-toolbar {
@@ -5273,8 +5409,8 @@ def index():
             gap: 8px;
             flex-wrap: wrap;
             padding: 0 0 0 82px;
-            flex: 0 0 auto;
             align-content: flex-start;
+            grid-row: 1;
         }
 
         .heatmap-chart-toolbar-controls {
@@ -5327,12 +5463,15 @@ def index():
         }
 
         .heatmap-plot {
-            flex: 1;
+            grid-row: 2;
             width: 100%;
+            height: 100%;
             min-width: 0;
             min-height: 0;
             border-radius: 12px;
             overflow: hidden;
+            box-sizing: border-box;
+            position: relative;
         }
 
         /* TradingView-style price chart overrides */
@@ -5349,6 +5488,7 @@ def index():
             height: var(--price-chart-height, 680px) !important;
             border-radius: 0 0 0 0;
             overflow: hidden;
+            position: relative;
             /* override .chart-container defaults that conflict */
             margin-bottom: 0 !important;
         }
@@ -5656,6 +5796,138 @@ def index():
             color: #9ea7b3;
             line-height: 1.35;
         }
+        /* Indicator option row — wraps toggle button + gear icon */
+        .tv-indicator-option-row {
+            display: flex;
+            align-items: stretch;
+            gap: 4px;
+        }
+        .tv-indicator-option-row .tv-indicator-option {
+            flex: 1;
+            min-width: 0;
+        }
+        .tv-indicator-settings-btn {
+            flex-shrink: 0;
+            width: 28px;
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            background: var(--toolbar-button-bg);
+            color: var(--text-muted);
+            font-size: 13px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: background 0.15s, color 0.15s;
+        }
+        .tv-indicator-settings-btn:hover {
+            background: var(--toolbar-button-hover);
+            color: var(--text-primary);
+            border-color: var(--accent-color);
+        }
+        /* Floating indicator settings panel — fixed to viewport, never clipped */
+        .tv-ind-settings-panel {
+            position: fixed;
+            width: 300px;
+            background: var(--panel-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            box-shadow: 0 16px 40px rgba(0,0,0,0.55);
+            z-index: 9999;
+            overflow: hidden;
+        }
+        .tv-ind-settings-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 10px 14px;
+            background: var(--panel-bg-alt);
+            border-bottom: 1px solid var(--border-color);
+            font-size: 13px;
+            font-weight: 600;
+            color: var(--text-primary);
+        }
+        .tv-ind-settings-close {
+            background: none;
+            border: none;
+            color: var(--text-muted);
+            font-size: 16px;
+            cursor: pointer;
+            padding: 0 4px;
+            line-height: 1;
+        }
+        .tv-ind-settings-close:hover { color: var(--text-primary); }
+        .tv-ind-settings-body {
+            padding: 10px 12px;
+            display: grid;
+            gap: 8px;
+        }
+        .tv-ind-param-row {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+            padding: 5px 2px;
+        }
+        .tv-ind-param-label {
+            font-size: 12px;
+            color: var(--text-secondary);
+            flex: 1;
+        }
+        .tv-ind-param-row input[type="number"] {
+            width: 72px;
+            background: var(--panel-bg-strong);
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+            color: var(--text-primary);
+            padding: 4px 8px;
+            font-size: 12px;
+            outline: none;
+        }
+        .tv-ind-param-row input[type="number"]:focus { border-color: var(--accent-color); }
+        .tv-ind-param-row input[type="color"] {
+            width: 36px; height: 26px;
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+            background: none;
+            cursor: pointer;
+            padding: 0;
+        }
+        .tv-ind-param-row input[type="checkbox"] {
+            width: 16px; height: 16px;
+            cursor: pointer;
+            accent-color: var(--accent-color);
+        }
+        /* Warmup warning badge on indicator summary */
+        .tv-indicator-warn-badge {
+            display: none;
+            font-size: 11px;
+            color: #ffb74d;
+            margin-left: 2px;
+        }
+        /* Warning highlight on individual indicator option when it can't be fully warmed up */
+        .tv-indicator-option-row.warmup-warn .tv-indicator-option.active {
+            border-color: #ffb74d;
+            background: #2a1f0a;
+        }
+        .tv-indicator-option-row.warmup-warn .tv-indicator-option-name::after {
+            content: ' ⚠';
+            font-size: 9px;
+            color: #ffb74d;
+        }
+        /* SMC overlay canvas — rendered above chart, pointer-events none */
+        .tv-smc-overlay {
+            position: absolute;
+            inset: 0;
+            pointer-events: none;
+            z-index: 20;
+            overflow: hidden;
+            display: none;
+        }
+        .tv-smc-overlay canvas {
+            position: absolute;
+            inset: 0;
+        }
         /* Indicator legend — inside canvas, pointer-events none so it doesn't block */
         .tv-indicator-legend {
             position: absolute;
@@ -5752,10 +6024,12 @@ def index():
             letter-spacing: 0.5px;
         }
         .price-info {
-            display: flex;
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) auto;
             align-items: stretch;
-            gap: 0;
+            gap: 6px;
             width: 100%;
+            max-width: 100%;
             margin: 0 0 14px;
             padding: 8px;
             background-color: var(--panel-bg);
@@ -5763,18 +6037,21 @@ def index():
             border: 1px solid var(--border-color);
             border-radius: 14px;
             box-shadow: var(--button-shadow);
-            overflow-x: auto;
-            scrollbar-width: thin;
+            overflow: hidden;
         }
-        .price-info-stats,
+        .price-info-stats {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: stretch;
+            align-content: flex-start;
+            gap: 6px;
+            min-width: 0;
+        }
         .price-info-market-group {
             display: flex;
             align-items: stretch;
             gap: 6px;
             flex: 0 0 auto;
-        }
-        .price-info-market-group {
-            margin-left: auto;
             padding-left: 10px;
             border-left: 1px solid var(--border-color);
         }
@@ -5832,6 +6109,10 @@ def index():
         }
         .price-info-item[title] {
             cursor: help;
+        }
+        .price-info-item.price-info-market {
+            flex-shrink: 0;
+            align-self: stretch;
         }
         button {
             padding: 8px 16px;
@@ -6058,16 +6339,13 @@ def index():
                 height: 350px;
             }
             .price-info {
-                flex-direction: column;
-                align-items: stretch;
+                grid-template-columns: 1fr;
                 padding: 8px;
             }
-            .price-info-stats,
-            .price-info-market-group {
+            .price-info-stats {
                 flex-wrap: wrap;
             }
             .price-info-market-group {
-                margin-left: 0;
                 padding-left: 0;
                 border-left: none;
                 border-top: 1px solid var(--border-color);
@@ -6112,8 +6390,9 @@ def index():
             padding: 0;
             line-height: 1;
         }
-        .chart-container:hover .chart-fullscreen-btn,
-        .chart-fullscreen-btn:focus {
+        .chart-container:not(.fullscreen):hover .chart-fullscreen-btn,
+        .price-chart-container:not(.fullscreen) .chart-container:hover .chart-fullscreen-btn,
+        .chart-fullscreen-btn:focus-visible {
             opacity: 1;
         }
         .chart-fullscreen-btn:hover {
@@ -6121,7 +6400,8 @@ def index():
             color: #fff;
             border-color: #777;
         }
-        .chart-container.fullscreen {
+        .chart-container.fullscreen,
+        .price-chart-container.fullscreen {
             position: fixed !important;
             top: 0 !important;
             left: 0 !important;
@@ -6134,19 +6414,112 @@ def index():
             padding: 10px !important;
             background-color: #1E1E1E !important;
             box-sizing: border-box !important;
-            overflow: visible !important;
+            overflow: hidden !important;
         }
-        .chart-container.fullscreen > div {
+        .chart-container.fullscreen {
+            display: flex !important;
+            flex-direction: column !important;
+        }
+        .chart-container.fullscreen > div:not(.chart-fullscreen-chrome) {
+            flex: 1 1 auto !important;
             width: 100% !important;
-            height: 100% !important;
-            overflow: visible !important;
+            min-height: 0 !important;
+            height: auto !important;
+            overflow: hidden !important;
         }
-        .chart-container.fullscreen .chart-fullscreen-btn {
-            opacity: 1;
+        .chart-container.fullscreen.js-plotly-plot {
+            min-height: 0 !important;
+        }
+        .chart-container.fullscreen .plot-container.plotly {
+            flex: 1 1 auto !important;
+            width: 100% !important;
+            min-height: 0 !important;
+            height: 100% !important;
+        }
+        .chart-container.fullscreen .heatmap-chart-shell {
+            display: grid !important;
+            grid-template-rows: auto minmax(0, 1fr) !important;
+            height: 100% !important;
+            min-height: 0 !important;
+        }
+        .chart-container.fullscreen .heatmap-plot {
+            min-height: 0 !important;
+        }
+        .price-chart-container.fullscreen {
+            display: flex !important;
+            flex-direction: column !important;
+            padding: 0 !important;
+        }
+        .price-chart-container.fullscreen .tv-toolbar-container {
+            flex: 0 0 auto;
+            border-radius: 0;
+            z-index: 10000;
+        }
+        .price-chart-container.fullscreen #price-chart {
+            flex: 1 1 auto !important;
+            height: auto !important;
+            min-height: 0 !important;
+            border-radius: 0 !important;
+        }
+        .price-chart-container.fullscreen .tv-sub-pane {
+            flex: 0 0 auto;
+        }
+        .chart-fullscreen-chrome {
+            display: none !important;
             position: fixed;
-            top: 14px;
-            left: 14px;
+            inset: 0;
+            width: 0;
+            height: 0;
+            overflow: visible;
+            pointer-events: none;
+            flex: 0 0 0 !important;
+            min-height: 0 !important;
+            margin: 0 !important;
+            padding: 0 !important;
+            border: 0 !important;
+        }
+        .chart-container.fullscreen .chart-fullscreen-chrome,
+        .price-chart-container.fullscreen .chart-fullscreen-chrome {
+            display: block !important;
+        }
+        .chart-fullscreen-hoverzone {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 48px;
             z-index: 10001;
+            pointer-events: auto;
+        }
+        .chart-fullscreen-logo {
+            position: fixed;
+            top: 6px;
+            left: 10px;
+            z-index: 10002;
+            font-family: Arial, sans-serif;
+            font-size: 11px;
+            font-weight: bold;
+            color: var(--accent-color);
+            opacity: 0.7;
+            pointer-events: none;
+            letter-spacing: 0.5px;
+        }
+        .chart-container.fullscreen .chart-fullscreen-btn,
+        .price-chart-container.fullscreen .chart-fullscreen-btn {
+            opacity: 0;
+            position: fixed;
+            top: 10px;
+            left: 10px;
+            right: auto;
+            z-index: 10004;
+        }
+        .chart-container.fullscreen:has(.chart-fullscreen-hoverzone:hover) .chart-fullscreen-btn,
+        .price-chart-container.fullscreen:has(.chart-fullscreen-hoverzone:hover) .chart-fullscreen-btn,
+        .chart-container.fullscreen .chart-fullscreen-btn:hover,
+        .chart-container.fullscreen .chart-fullscreen-btn:focus-visible,
+        .price-chart-container.fullscreen .chart-fullscreen-btn:hover,
+        .price-chart-container.fullscreen .chart-fullscreen-btn:focus-visible {
+            opacity: 1;
         }
         /* Pop-out button */
         .chart-popout-btn {
@@ -6169,8 +6542,9 @@ def index():
             padding: 0;
             line-height: 1;
         }
-        .chart-container:hover .chart-popout-btn,
-        .chart-popout-btn:focus {
+        .chart-container:not(.fullscreen):hover .chart-popout-btn,
+        .price-chart-container:not(.fullscreen) .chart-container:hover .chart-popout-btn,
+        .chart-popout-btn:focus-visible {
             opacity: 1;
         }
         .chart-popout-btn:hover {
@@ -6178,12 +6552,22 @@ def index():
             color: #fff;
             border-color: #777;
         }
-        .chart-container.fullscreen .chart-popout-btn {
-            opacity: 1;
+        .chart-container.fullscreen .chart-popout-btn,
+        .price-chart-container.fullscreen .chart-popout-btn {
+            opacity: 0;
             position: fixed;
-            top: 14px;
-            left: 50px;
-            z-index: 10001;
+            top: 10px;
+            left: 46px;
+            right: auto;
+            z-index: 10004;
+        }
+        .chart-container.fullscreen:has(.chart-fullscreen-hoverzone:hover) .chart-popout-btn,
+        .price-chart-container.fullscreen:has(.chart-fullscreen-hoverzone:hover) .chart-popout-btn,
+        .chart-container.fullscreen .chart-popout-btn:hover,
+        .chart-container.fullscreen .chart-popout-btn:focus-visible,
+        .price-chart-container.fullscreen .chart-popout-btn:hover,
+        .price-chart-container.fullscreen .chart-popout-btn:focus-visible {
+            opacity: 1;
         }
 
         :root {
@@ -6442,7 +6826,8 @@ def index():
             border-color: var(--accent-color);
             color: var(--text-primary);
         }
-        .chart-container.fullscreen {
+        .chart-container.fullscreen,
+        .price-chart-container.fullscreen {
             background-color: var(--chart-bg) !important;
         }
         body[data-theme="neon"] .header {
@@ -6663,20 +7048,26 @@ def index():
                 display: flex;
                 flex-direction: row;
                 flex-wrap: nowrap;
-                gap: 0;
+                align-items: stretch;
+                gap: 8px;
                 overflow-x: auto;
+                overflow-y: hidden;
                 padding: 8px;
                 scroll-snap-type: x proximity;
                 -webkit-overflow-scrolling: touch;
             }
-            body.mobile-layout .price-info-stats,
+            body.mobile-layout .price-info-stats {
+                display: flex;
+                flex: 0 0 auto;
+                gap: 8px;
+                flex-wrap: nowrap;
+                min-width: 0;
+            }
             body.mobile-layout .price-info-market-group {
                 display: flex;
                 flex: 0 0 auto;
                 gap: 8px;
                 flex-wrap: nowrap;
-            }
-            body.mobile-layout .price-info-market-group {
                 margin-left: auto;
                 padding-left: 10px;
                 border-left: 1px solid var(--border-color);
@@ -6739,9 +7130,14 @@ def index():
             body.mobile-layout .chart-container.fullscreen {
                 padding: 12px 8px 8px !important;
             }
-            body.mobile-layout .chart-container.fullscreen .chart-fullscreen-btn {
+            body.mobile-layout .price-chart-container.fullscreen {
+                padding: 0 !important;
+            }
+            body.mobile-layout .chart-container.fullscreen .chart-fullscreen-btn,
+            body.mobile-layout .price-chart-container.fullscreen .chart-fullscreen-btn {
                 top: 10px;
                 left: 10px;
+                right: auto;
             }
         }
         @media screen and (max-width: 640px) {
@@ -6763,6 +7159,12 @@ def index():
                 opacity: 1;
                 width: 38px;
                 height: 38px;
+            }
+            .chart-container.fullscreen:has(.chart-fullscreen-hoverzone:hover) .chart-fullscreen-btn,
+            .price-chart-container.fullscreen:has(.chart-fullscreen-hoverzone:hover) .chart-fullscreen-btn,
+            .chart-container.fullscreen .chart-fullscreen-btn:hover,
+            .price-chart-container.fullscreen .chart-fullscreen-btn:hover {
+                opacity: 1;
             }
             .chart-popout-btn {
                 display: none;
@@ -6795,7 +7197,7 @@ def index():
                 <div class="controls">
                     <div class="control-group">
                         <label for="ticker">Ticker:</label>
-                        <input type="text" id="ticker" placeholder="Enter Ticker" value="SPY" title="Enter a ticker symbol (e.g., SPY, AAPL) or special aggregate tickers: 'MARKET' (SPX base) or 'MARKET2' (SPY base)">
+                        <input type="text" id="ticker" placeholder="Enter Ticker" value="SPY" title="Enter a ticker symbol (e.g., SPY, AAPL) or special aggregate tickers: 'MARKET' (SPX grid + SPY exposures) or 'MARKET2' (SPY base)">
                     </div>
                     <div class="control-group">
                         <label for="timeframe">Timeframe:</label>
@@ -7113,6 +7515,26 @@ def index():
         let tvArvChart = null, tvArvSeries = null;
         // Persist active indicators across data refreshes
         let tvActiveInds = new Set();
+        // Per-indicator configurable parameters (persisted with settings)
+        let tvIndicatorParams = {
+            smc:    { swing_len: 5, show_ob: true, show_fvg: true, show_bos: true, show_swings: true, show_eqhl: true },
+            bb:     { period: 20, mult: 2 },
+            fbb:    { length: 200, mult: 3 },
+            rsi:    { period: 14 },
+            macd:   { fast: 12, slow: 26, signal: 9 },
+            atr:    { period: 14 },
+            sma9:   { period: 9 },   sma20:  { period: 20 },  sma50:  { period: 50 },
+            sma100: { period: 100 }, sma200: { period: 200 },
+            ema9:   { period: 9 },   ema21:  { period: 21 },  ema50:  { period: 50 },
+            ema100: { period: 100 }, ema200: { period: 200 },
+            wma20:  { period: 20 },  wma50:  { period: 50 },
+        };
+        // SMC canvas draw state
+        let tvSmcData = null;
+        let tvSmcDrawPending = false;
+        let tvSmcDomEventsBound = false;
+        // Max bars the Schwab API can supply for the current timeframe (updated on each price fetch)
+        let tvMaxIndicatorBars = 3900;
         // Auto-range: when true, chart fits all data on every update; when false, zoom/pan is preserved
         let tvAutoRange = false;
         // Time-scale sync state
@@ -7757,11 +8179,15 @@ def index():
                 try { tvArvChart.applyOptions(buildLightweightThemeOptions()); } catch (e) {}
             }
             Object.keys(charts).forEach(key => {
-                const div = document.getElementById(`${key}-chart`);
+                const div = getPlotlyChartElement(key);
                 if (!div || !div._fullLayout || key === 'large_trades') return;
                 try {
                     Plotly.relayout(div, buildPlotlyThemeRelayout(div));
-                    Plotly.Plots.resize(div);
+                    if (key === 'heatmap') {
+                        resizeHeatmapPlot();
+                    } else {
+                        Plotly.Plots.resize(div);
+                    }
                 } catch (e) {}
             });
             scheduleTVHistoricalOverlayDraw();
@@ -8087,44 +8513,180 @@ def index():
         const fsExpandSvg = '<svg viewBox="0 0 14 14" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M1 5V1h4M9 1h4v4M13 9v4H9M5 13H1V9"/></svg>';
         const fsCollapseSvg = '<svg viewBox="0 0 14 14" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M5 1v4H1M9 5h4V1M9 13V9h4M1 9h4v4"/></svg>';
 
-        function toggleChartFullscreen(container) {
-            const isFullscreen = container.classList.contains('fullscreen');
+        function getChartFullscreenTarget(container) {
+            if (!container) return null;
+            if (container.id === 'price-chart') {
+                return container.closest('.price-chart-container') || container;
+            }
+            return container;
+        }
 
-            // Exit any other fullscreen chart first
-            document.querySelectorAll('.chart-container.fullscreen').forEach(el => {
+        function queryFullscreenCharts() {
+            return document.querySelectorAll('.chart-container.fullscreen, .price-chart-container.fullscreen');
+        }
+
+        function isChartFullscreenActive(containerId) {
+            const container = document.getElementById(containerId);
+            if (!container) return false;
+            if (container.classList.contains('fullscreen')) return true;
+            if (containerId === 'price-chart') {
+                const wrapper = container.closest('.price-chart-container');
+                return !!(wrapper && wrapper.classList.contains('fullscreen'));
+            }
+            return false;
+        }
+
+        function getChartFullscreenButton(container, target) {
+            if (container && container.querySelector('.chart-fullscreen-btn')) {
+                return container.querySelector('.chart-fullscreen-btn');
+            }
+            return target ? target.querySelector('.chart-fullscreen-btn') : null;
+        }
+
+        function getPlotlyLayoutSize(containerEl, plotEl) {
+            if (!containerEl || !plotEl) return null;
+            const plotContainer = plotEl.querySelector('.plot-container') || plotEl;
+            const width = plotContainer.clientWidth || containerEl.clientWidth;
+            const height = plotContainer.clientHeight || containerEl.clientHeight;
+            if (width < 2 || height < 2) return null;
+            return { width, height };
+        }
+
+        function resizePlotlyChart(containerOrEl) {
+            const el = typeof containerOrEl === 'string'
+                ? document.getElementById(containerOrEl)
+                : containerOrEl;
+            if (!el) return;
+            if (el.id === 'heatmap-chart') {
+                try { resizeHeatmapPlot(); } catch(e) {}
+                return;
+            }
+            const plotEl = el.classList.contains('js-plotly-plot') ? el : el.querySelector('.js-plotly-plot');
+            if (!plotEl) return;
+
+            const size = getPlotlyLayoutSize(el, plotEl);
+            if (!size) return;
+
+            try {
+                const containerId = el.id;
+                const baseMargins = { l: 38, r: 68, t: 56, b: 16 };
+                const inFullscreen = containerId && isChartFullscreenActive(containerId);
+                Plotly.relayout(plotEl, {
+                    width: size.width,
+                    height: size.height,
+                    autosize: !inFullscreen,
+                    margin: containerId ? getChartMargins(containerId, baseMargins) : baseMargins,
+                });
+                Plotly.Plots.resize(plotEl);
+            } catch (e) {}
+        }
+
+        function resizePlotlyInContainer(el) {
+            resizePlotlyChart(el);
+        }
+
+        function schedulePlotlyChartResize(containerId) {
+            requestAnimationFrame(() => {
+                resizePlotlyChart(containerId);
+                requestAnimationFrame(() => resizePlotlyChart(containerId));
+            });
+        }
+
+        function resizeTvPriceCharts() {
+            const tvContainer = document.getElementById('price-chart');
+            if (!tvContainer) return;
+            const width = tvContainer.clientWidth;
+            const height = tvContainer.clientHeight;
+            if (tvPriceChart && width > 0 && height > 0) {
+                try { tvPriceChart.applyOptions({ width, height }); } catch(e) {}
+            }
+            try { scheduleTVHistoricalOverlayDraw(); } catch(e) {}
+        }
+
+        function resizeChartsAfterFullscreen() {
+            const doResize = () => {
+                document.querySelectorAll('.chart-container').forEach(resizePlotlyChart);
+                queryFullscreenCharts().forEach(resizePlotlyChart);
+                resizeTvPriceCharts();
+            };
+            requestAnimationFrame(() => {
+                doResize();
+                requestAnimationFrame(doResize);
+            });
+            setTimeout(doResize, 100);
+            setTimeout(doResize, 300);
+        }
+
+        function exitAllFullscreenCharts() {
+            queryFullscreenCharts().forEach(el => {
                 el.classList.remove('fullscreen');
-                const b = el.querySelector('.chart-fullscreen-btn');
+                const btnHost = el.querySelector('#price-chart') || el;
+                const b = btnHost.querySelector('.chart-fullscreen-btn');
                 if (b) b.innerHTML = fsExpandSvg;
             });
+            document.body.style.overflow = '';
+        }
 
-            if (!isFullscreen) {
-                container.classList.add('fullscreen');
+        function toggleChartFullscreen(container) {
+            const target = getChartFullscreenTarget(container);
+            if (!target) return;
+            const wasFullscreen = target.classList.contains('fullscreen');
+
+            exitAllFullscreenCharts();
+
+            if (!wasFullscreen) {
+                target.classList.add('fullscreen');
                 document.body.style.overflow = 'hidden';
-                const b = container.querySelector('.chart-fullscreen-btn');
+                const b = getChartFullscreenButton(container, target);
                 if (b) b.innerHTML = fsCollapseSvg;
-            } else {
-                document.body.style.overflow = '';
             }
 
-            // Let Plotly know about the size change; also trigger TV chart resize
-            requestAnimationFrame(() => {
-                document.querySelectorAll('.chart-container').forEach(el => {
-                    const plot = el.querySelector('.js-plotly-plot');
-                    if (plot) { try { Plotly.Plots.resize(plot); } catch(e) {} }
-                });
-                // Resize TradingView price chart
-                const tvContainer = document.getElementById('price-chart');
-                if (tvPriceChart && tvContainer) {
-                    tvPriceChart.applyOptions({ width: tvContainer.clientWidth });
+            resizeChartsAfterFullscreen();
+        }
+
+        function ensureChartFullscreenChrome(container) {
+            const target = getChartFullscreenTarget(container);
+            if (!target) return;
+
+            let chrome = target.querySelector('.chart-fullscreen-chrome');
+            if (!chrome) {
+                chrome = document.createElement('div');
+                chrome.className = 'chart-fullscreen-chrome';
+
+                const hoverzone = document.createElement('div');
+                hoverzone.className = 'chart-fullscreen-hoverzone';
+                hoverzone.setAttribute('aria-hidden', 'true');
+
+                const logo = document.createElement('div');
+                logo.className = 'chart-fullscreen-logo';
+                logo.textContent = 'EzDuz1t Options';
+
+                chrome.appendChild(hoverzone);
+                chrome.appendChild(logo);
+                target.appendChild(chrome);
+            } else if (!chrome.querySelector('.chart-fullscreen-hoverzone')) {
+                const hoverzone = document.createElement('div');
+                hoverzone.className = 'chart-fullscreen-hoverzone';
+                hoverzone.setAttribute('aria-hidden', 'true');
+                chrome.insertBefore(hoverzone, chrome.firstChild);
+            }
+
+            // Migrate legacy standalone logo nodes into chrome
+            target.querySelectorAll(':scope > .chart-fullscreen-logo').forEach(legacyLogo => {
+                if (!chrome.contains(legacyLogo)) {
+                    legacyLogo.remove();
                 }
             });
         }
 
         function addFullscreenButton(container) {
-            if (!container || container.querySelector('.chart-fullscreen-btn')) return;
+            if (!container) return;
+            ensureChartFullscreenChrome(container);
+            if (container.querySelector('.chart-fullscreen-btn')) return;
+            const target = getChartFullscreenTarget(container);
             const btn = document.createElement('button');
             btn.className = 'chart-fullscreen-btn';
-            btn.innerHTML = container.classList.contains('fullscreen') ? fsCollapseSvg : fsExpandSvg;
+            btn.innerHTML = (target && target.classList.contains('fullscreen')) ? fsCollapseSvg : fsExpandSvg;
             btn.title = 'Toggle fullscreen (Esc to exit)';
             btn.addEventListener('click', function(e) {
                 e.stopPropagation();
@@ -8136,30 +8698,14 @@ def index():
 
         // ESC key exits fullscreen chart
         document.addEventListener('keydown', function(e) {
-            if (e.key === 'Escape') {
-                const fs = document.querySelector('.chart-container.fullscreen');
-                if (fs) {
-                    fs.classList.remove('fullscreen');
-                    document.body.style.overflow = '';
-                    const b = fs.querySelector('.chart-fullscreen-btn');
-                    if (b) b.innerHTML = fsExpandSvg;
-                    requestAnimationFrame(() => {
-                        document.querySelectorAll('.chart-container').forEach(el => {
-                            const plot = el.querySelector('.js-plotly-plot');
-                            if (plot) { try { Plotly.Plots.resize(plot); } catch(e) {} }
-                        });
-                        const tvContainer = document.getElementById('price-chart');
-                        if (tvPriceChart && tvContainer) {
-                            tvPriceChart.applyOptions({ width: tvContainer.clientWidth });
-                        }
-                    });
-                }
+            if (e.key === 'Escape' && queryFullscreenCharts().length) {
+                exitAllFullscreenCharts();
+                resizeChartsAfterFullscreen();
             }
         });
         // Helper: returns appropriate Plotly margins depending on whether chart is fullscreen
         function getChartMargins(containerId, defaultMargins) {
-            const container = document.getElementById(containerId);
-            if (container && container.classList.contains('fullscreen')) {
+            if (isChartFullscreenActive(containerId)) {
                 return {
                     l: Math.max(defaultMargins.l || 50, 60),
                     r: Math.max(defaultMargins.r || 50, 130),
@@ -8278,6 +8824,9 @@ def index():
   var tvAllLevelPrices=[];
     var tvHistoricalPoints=[];
   var tvLastCandles=[];
+  var tvIndicatorCandles=[];
+  var tvCurrentDayStartTime=0;
+  var tvIndicatorRefreshTimer=null;
   var tvDrawMode=null, tvDrawStart=null;
   var tvAutoRange=false;
   var tvSyncHandlers=[], tvSyncingTS=false;
@@ -8349,6 +8898,9 @@ def index():
     function calcWMA(c,p){var r=[],d=p*(p+1)/2;for(var i=0;i<c.length;i++){if(i<p-1){r.push(null);continue;}var ws=0;for(var w=1;w<=p;w++){ws+=c[i-p+w]*w;}r.push(ws/d);}return r;}
   function calcVWAP(cs){var cp=0,cv=0;return cs.map(function(c){var t=(c.high+c.low+c.close)/3;cp+=t*c.volume;cv+=c.volume;return cv>0?cp/cv:c.close;});}
   function calcBB(c,p,m){p=p||20;m=m||2;var s=calcSMA(c,p);return s.map(function(mid,i){if(mid===null)return{upper:null,mid:null,lower:null};var sl=c.slice(Math.max(0,i-p+1),i+1),v=sl.reduce(function(a,b){return a+(b-mid)*(b-mid);},0)/sl.length,sd=Math.sqrt(v);return{upper:mid+m*sd,mid:mid,lower:mid-m*sd};});}
+  function calcRollingStdev(v,p){return v.map(function(_,i){if(i<p-1)return null;var sl=v.slice(i-p+1,i+1),m=sl.reduce(function(a,b){return a+b;},0)/p;return Math.sqrt(sl.reduce(function(a,b){return a+(b-m)*(b-m);},0)/p);});}
+  function calcVWMA(v,vol,p){return v.map(function(_,i){if(i<p-1)return null;var sp=0,sv=0,sl=v.slice(i-p+1,i+1);for(var j=i-p+1;j<=i;j++){var vv=vol[j]||0;sp+=v[j]*vv;sv+=vv;}return sv>0?sp/sv:sl.reduce(function(a,b){return a+b;},0)/p;});}
+  function calcFBB(candles,len,mult){len=len||200;mult=mult||3;var src=candles.map(function(c){return(c.high+c.low+c.close)/3;}),vol=candles.map(function(c){return c.volume||0;}),basis=calcVWMA(src,vol,len),sd=calcRollingStdev(src,len);return candles.map(function(_,i){if(basis[i]===null||sd[i]===null)return{basis:null,upper:null,lower:null};var dev=mult*sd[i];return{basis:basis[i],upper:basis[i]+dev,lower:basis[i]-dev};});}
   function calcRSI(c,p){p=p||14;var r=[];for(var i=0;i<c.length;i++){if(i<p){r.push(null);continue;}var g=0,l=0;for(var j=i-p+1;j<=i;j++){var d=c[j]-c[j-1];if(d>0)g+=d;else l-=d;}var ag=g/p,al=l/p;r.push(al===0?100:100-100/(1+ag/al));}return r;}
   function calcATR(candles,p){p=p||14;var r=[];for(var i=0;i<candles.length;i++){var tr;if(i===0){tr=candles[i].high-candles[i].low;}else{tr=Math.max(candles[i].high-candles[i].low,Math.abs(candles[i].high-candles[i-1].close),Math.abs(candles[i].low-candles[i-1].close));}if(i<p-1){r.push(null);continue;}if(r.length===0||r[r.length-1]===null){var sum=0;for(var j=i-p+1;j<=i;j++){var t2;if(j===0){t2=candles[j].high-candles[j].low;}else{t2=Math.max(candles[j].high-candles[j].low,Math.abs(candles[j].high-candles[j-1].close),Math.abs(candles[j].low-candles[j-1].close));}sum+=t2;}r.push(sum/p);}else{r.push((r[r.length-1]*(p-1)+tr)/p);}}return r;}
     function calcAutoTrendLine(candles,dayStart){dayStart=dayStart||0;var points=(dayStart>0?candles.filter(function(c){return c.time>=dayStart;}):candles).map(function(c){return{time:c.time,close:Number(c.close)};}).filter(function(point){return Number.isFinite(point.close);});if(points.length<2)return[];var sumX=0,sumY=0,sumXY=0,sumXX=0,n=points.length;points.forEach(function(point,index){sumX+=index;sumY+=point.close;sumXY+=index*point.close;sumXX+=index*index;});var denom=(n*sumXX)-(sumX*sumX),slope=denom===0?0:((n*sumXY)-(sumX*sumY))/denom,intercept=(sumY-(slope*sumX))/n;return points.map(function(point,index){return{time:point.time,value:intercept+(slope*index)};});}
@@ -8371,28 +8923,33 @@ def index():
         return numericValue.toLocaleString('en-US',{maximumFractionDigits:0});
     }
   // ── Indicators ─────────────────────────────────────────────────────────────
-  function applyIndicators(candles){
+  function applyIndicators(){
     if(!tvChart||!tvCandle)return;
+    var candles=tvIndicatorCandles.length?tvIndicatorCandles:tvLastCandles;
+    if(!candles.length)return;
+    var dayStart=tvCurrentDayStartTime||0;
+    function todayOnly(pairs){return pairs.filter(function(p){return p&&(!dayStart||p.time>=dayStart);});}
     var times=candles.map(function(c){return c.time;}),closes=candles.map(function(c){return c.close;});
     function mkLine(col,lw,title){return tvChart.addLineSeries({color:col,lineWidth:lw||1,priceScaleId:'right',lastValueVisible:true,priceLineVisible:false,title:title||''});}
     // Remove deactivated
     Object.keys(tvIndSeries).forEach(function(k){if(!activeInds.has(k)){var s=tvIndSeries[k];if(Array.isArray(s))s.forEach(function(x){try{tvChart.removeSeries(x);}catch(e){}});else{try{tvChart.removeSeries(s);}catch(e){};}delete tvIndSeries[k];}});
-        if(activeInds.has('sma9')){if(!tvIndSeries['sma9'])tvIndSeries['sma9']=mkLine('#ffe082',1,'SMA9');tvIndSeries['sma9'].setData(calcSMA(closes,9).map(function(v,i){return v!==null?{time:times[i],value:v}:null;}).filter(Boolean));}
-        if(activeInds.has('sma20')){if(!tvIndSeries['sma20'])tvIndSeries['sma20']=mkLine('#f0c040',1,'SMA20');tvIndSeries['sma20'].setData(calcSMA(closes,20).map(function(v,i){return v!==null?{time:times[i],value:v}:null;}).filter(Boolean));}
-        if(activeInds.has('sma50')){if(!tvIndSeries['sma50'])tvIndSeries['sma50']=mkLine('#40a0f0',1,'SMA50');tvIndSeries['sma50'].setData(calcSMA(closes,50).map(function(v,i){return v!==null?{time:times[i],value:v}:null;}).filter(Boolean));}
-        if(activeInds.has('sma100')){if(!tvIndSeries['sma100'])tvIndSeries['sma100']=mkLine('#7fd1ff',1,'SMA100');tvIndSeries['sma100'].setData(calcSMA(closes,100).map(function(v,i){return v!==null?{time:times[i],value:v}:null;}).filter(Boolean));}
-        if(activeInds.has('sma200')){if(!tvIndSeries['sma200'])tvIndSeries['sma200']=mkLine('#e040fb',1,'SMA200');tvIndSeries['sma200'].setData(calcSMA(closes,200).map(function(v,i){return v!==null?{time:times[i],value:v}:null;}).filter(Boolean));}
-        if(activeInds.has('ema9')){if(!tvIndSeries['ema9'])tvIndSeries['ema9']=mkLine('#ff9900',1,'EMA9');tvIndSeries['ema9'].setData(calcEMA(closes,9).map(function(v,i){return v!==null?{time:times[i],value:v}:null;}).filter(Boolean));}
-        if(activeInds.has('ema21')){if(!tvIndSeries['ema21'])tvIndSeries['ema21']=mkLine('#00e5ff',1,'EMA21');tvIndSeries['ema21'].setData(calcEMA(closes,21).map(function(v,i){return v!==null?{time:times[i],value:v}:null;}).filter(Boolean));}
-        if(activeInds.has('ema50')){if(!tvIndSeries['ema50'])tvIndSeries['ema50']=mkLine('#ff7096',1,'EMA50');tvIndSeries['ema50'].setData(calcEMA(closes,50).map(function(v,i){return v!==null?{time:times[i],value:v}:null;}).filter(Boolean));}
-        if(activeInds.has('ema100')){if(!tvIndSeries['ema100'])tvIndSeries['ema100']=mkLine('#b388ff',1,'EMA100');tvIndSeries['ema100'].setData(calcEMA(closes,100).map(function(v,i){return v!==null?{time:times[i],value:v}:null;}).filter(Boolean));}
-        if(activeInds.has('ema200')){if(!tvIndSeries['ema200'])tvIndSeries['ema200']=mkLine('#00c853',1,'EMA200');tvIndSeries['ema200'].setData(calcEMA(closes,200).map(function(v,i){return v!==null?{time:times[i],value:v}:null;}).filter(Boolean));}
-        if(activeInds.has('wma20')){if(!tvIndSeries['wma20'])tvIndSeries['wma20']=mkLine('#ffd166',1,'WMA20');tvIndSeries['wma20'].setData(calcWMA(closes,20).map(function(v,i){return v!==null?{time:times[i],value:v}:null;}).filter(Boolean));}
-        if(activeInds.has('wma50')){if(!tvIndSeries['wma50'])tvIndSeries['wma50']=mkLine('#8ecae6',1,'WMA50');tvIndSeries['wma50'].setData(calcWMA(closes,50).map(function(v,i){return v!==null?{time:times[i],value:v}:null;}).filter(Boolean));}
-        if(activeInds.has('vwap')){if(!tvIndSeries['vwap'])tvIndSeries['vwap']=mkLine('#ffffff',1,'VWAP');var vv=calcVWAP(candles.map(function(c,i){return{high:candles[i].high,low:candles[i].low,close:candles[i].close,volume:c.volume||0};}));tvIndSeries['vwap'].setData(vv.map(function(v,i){return{time:times[i],value:v};}));}
-        if(activeInds.has('bb')){var bb=calcBB(closes);if(!tvIndSeries['bb']){tvIndSeries['bb']=[mkLine('rgba(100,180,255,0.8)',1,'BB U'),mkLine('rgba(100,180,255,0.5)',1,'BB M'),mkLine('rgba(100,180,255,0.8)',1,'BB L')];}var bbSeries=tvIndSeries['bb'];bbSeries[0].setData(bb.map(function(v,i){return v.upper!==null?{time:times[i],value:v.upper}:null;}).filter(Boolean));bbSeries[1].setData(bb.map(function(v,i){return v.mid!==null?{time:times[i],value:v.mid}:null;}).filter(Boolean));bbSeries[2].setData(bb.map(function(v,i){return v.lower!==null?{time:times[i],value:v.lower}:null;}).filter(Boolean));}
-        if(activeInds.has('atr')){var atrV=calcATR(candles),e20=calcEMA(closes,20),mult=1.5;if(!tvIndSeries['atr']){tvIndSeries['atr']=[mkLine('rgba(255,152,0,0.8)',1,'ATR U'),mkLine('rgba(255,152,0,0.8)',1,'ATR L')];}var atrSeries=tvIndSeries['atr'];atrSeries[0].setData(e20.map(function(v,i){return(v!==null&&atrV[i]!==null)?{time:times[i],value:v+mult*atrV[i]}:null;}).filter(Boolean));atrSeries[1].setData(e20.map(function(v,i){return(v!==null&&atrV[i]!==null)?{time:times[i],value:v-mult*atrV[i]}:null;}).filter(Boolean));}
-                if(activeInds.has('auto_trend')){if(!tvIndSeries['auto_trend'])tvIndSeries['auto_trend']=tvChart.addLineSeries({color:'#ffca28',lineWidth:2,lineStyle:LightweightCharts.LineStyle.LargeDashed,priceScaleId:'right',lastValueVisible:true,priceLineVisible:false,title:'Auto Trend'});tvIndSeries['auto_trend'].setData(calcAutoTrendLine(candles));}
+        if(activeInds.has('sma9')){if(!tvIndSeries['sma9'])tvIndSeries['sma9']=mkLine('#ffe082',1,'SMA9');tvIndSeries['sma9'].setData(todayOnly(calcSMA(closes,9).map(function(v,i){return v!==null?{time:times[i],value:v}:null;})));}
+        if(activeInds.has('sma20')){if(!tvIndSeries['sma20'])tvIndSeries['sma20']=mkLine('#f0c040',1,'SMA20');tvIndSeries['sma20'].setData(todayOnly(calcSMA(closes,20).map(function(v,i){return v!==null?{time:times[i],value:v}:null;})));}
+        if(activeInds.has('sma50')){if(!tvIndSeries['sma50'])tvIndSeries['sma50']=mkLine('#40a0f0',1,'SMA50');tvIndSeries['sma50'].setData(todayOnly(calcSMA(closes,50).map(function(v,i){return v!==null?{time:times[i],value:v}:null;})));}
+        if(activeInds.has('sma100')){if(!tvIndSeries['sma100'])tvIndSeries['sma100']=mkLine('#7fd1ff',1,'SMA100');tvIndSeries['sma100'].setData(todayOnly(calcSMA(closes,100).map(function(v,i){return v!==null?{time:times[i],value:v}:null;})));}
+        if(activeInds.has('sma200')){if(!tvIndSeries['sma200'])tvIndSeries['sma200']=mkLine('#e040fb',1,'SMA200');tvIndSeries['sma200'].setData(todayOnly(calcSMA(closes,200).map(function(v,i){return v!==null?{time:times[i],value:v}:null;})));}
+        if(activeInds.has('ema9')){if(!tvIndSeries['ema9'])tvIndSeries['ema9']=mkLine('#ff9900',1,'EMA9');tvIndSeries['ema9'].setData(todayOnly(calcEMA(closes,9).map(function(v,i){return v!==null?{time:times[i],value:v}:null;})));}
+        if(activeInds.has('ema21')){if(!tvIndSeries['ema21'])tvIndSeries['ema21']=mkLine('#00e5ff',1,'EMA21');tvIndSeries['ema21'].setData(todayOnly(calcEMA(closes,21).map(function(v,i){return v!==null?{time:times[i],value:v}:null;})));}
+        if(activeInds.has('ema50')){if(!tvIndSeries['ema50'])tvIndSeries['ema50']=mkLine('#ff7096',1,'EMA50');tvIndSeries['ema50'].setData(todayOnly(calcEMA(closes,50).map(function(v,i){return v!==null?{time:times[i],value:v}:null;})));}
+        if(activeInds.has('ema100')){if(!tvIndSeries['ema100'])tvIndSeries['ema100']=mkLine('#b388ff',1,'EMA100');tvIndSeries['ema100'].setData(todayOnly(calcEMA(closes,100).map(function(v,i){return v!==null?{time:times[i],value:v}:null;})));}
+        if(activeInds.has('ema200')){if(!tvIndSeries['ema200'])tvIndSeries['ema200']=mkLine('#00c853',1,'EMA200');tvIndSeries['ema200'].setData(todayOnly(calcEMA(closes,200).map(function(v,i){return v!==null?{time:times[i],value:v}:null;})));}
+        if(activeInds.has('wma20')){if(!tvIndSeries['wma20'])tvIndSeries['wma20']=mkLine('#ffd166',1,'WMA20');tvIndSeries['wma20'].setData(todayOnly(calcWMA(closes,20).map(function(v,i){return v!==null?{time:times[i],value:v}:null;})));}
+        if(activeInds.has('wma50')){if(!tvIndSeries['wma50'])tvIndSeries['wma50']=mkLine('#8ecae6',1,'WMA50');tvIndSeries['wma50'].setData(todayOnly(calcWMA(closes,50).map(function(v,i){return v!==null?{time:times[i],value:v}:null;})));}
+        if(activeInds.has('vwap')){var todayCandles=dayStart>0?candles.filter(function(c){return c.time>=dayStart;}):candles;if(!tvIndSeries['vwap'])tvIndSeries['vwap']=mkLine('#ffffff',1,'VWAP');var vv=calcVWAP(todayCandles.map(function(c){return{high:c.high,low:c.low,close:c.close,volume:c.volume||0};}));tvIndSeries['vwap'].setData(vv.map(function(v,i){return{time:todayCandles[i].time,value:v};}));}
+        if(activeInds.has('bb')){var bb=calcBB(closes);if(!tvIndSeries['bb']){tvIndSeries['bb']=[mkLine('rgba(100,180,255,0.8)',1,'BB U'),mkLine('rgba(100,180,255,0.5)',1,'BB M'),mkLine('rgba(100,180,255,0.8)',1,'BB L')];}var bbSeries=tvIndSeries['bb'];bbSeries[0].setData(todayOnly(bb.map(function(v,i){return v.upper!==null?{time:times[i],value:v.upper}:null;})));bbSeries[1].setData(todayOnly(bb.map(function(v,i){return v.mid!==null?{time:times[i],value:v.mid}:null;})));bbSeries[2].setData(todayOnly(bb.map(function(v,i){return v.lower!==null?{time:times[i],value:v.lower}:null;})));}
+        if(activeInds.has('fbb')){var fbb=calcFBB(candles);if(!tvIndSeries['fbb']||tvIndSeries['fbb'].length!==3){if(tvIndSeries['fbb']){tvIndSeries['fbb'].forEach(function(s){try{tvChart.removeSeries(s);}catch(e){}});}tvIndSeries['fbb']=[mkLine('#e040fb',2,'FBB Basis'),mkLine('#ef5350',2,'FBB Upper'),mkLine('#66bb6a',2,'FBB Lower')];}var fbbSeries=tvIndSeries['fbb'];fbbSeries[0].setData(todayOnly(fbb.map(function(v,i){return v.basis!==null?{time:times[i],value:v.basis}:null;})));fbbSeries[1].setData(todayOnly(fbb.map(function(v,i){return v.upper!==null?{time:times[i],value:v.upper}:null;})));fbbSeries[2].setData(todayOnly(fbb.map(function(v,i){return v.lower!==null?{time:times[i],value:v.lower}:null;})));}
+        if(activeInds.has('atr')){var atrV=calcATR(candles),e20=calcEMA(closes,20),mult=1.5;if(!tvIndSeries['atr']){tvIndSeries['atr']=[mkLine('rgba(255,152,0,0.8)',1,'ATR U'),mkLine('rgba(255,152,0,0.8)',1,'ATR L')];}var atrSeries=tvIndSeries['atr'];atrSeries[0].setData(todayOnly(e20.map(function(v,i){return(v!==null&&atrV[i]!==null)?{time:times[i],value:v+mult*atrV[i]}:null;})));atrSeries[1].setData(todayOnly(e20.map(function(v,i){return(v!==null&&atrV[i]!==null)?{time:times[i],value:v-mult*atrV[i]}:null;})));}
+                if(activeInds.has('auto_trend')){if(!tvIndSeries['auto_trend'])tvIndSeries['auto_trend']=tvChart.addLineSeries({color:'#ffca28',lineWidth:2,lineStyle:LightweightCharts.LineStyle.LargeDashed,priceScaleId:'right',lastValueVisible:true,priceLineVisible:false,title:'Auto Trend'});tvIndSeries['auto_trend'].setData(calcAutoTrendLine(candles,dayStart));}
     if(activeInds.has('rsi'))applyRsiPane(candles,times);else destroyRsiPane();
     if(activeInds.has('macd'))applyMacdPane(candles,times);else destroyMacdPane();
     updateLegend();
@@ -8421,8 +8978,8 @@ def index():
   function updateLegend(){
     var cont=document.getElementById('price-chart');if(!cont)return;
     var leg=cont.querySelector('.ind-legend');if(!leg){leg=document.createElement('div');leg.className='ind-legend';cont.appendChild(leg);}
-    var cols={sma9:'#ffe082',sma20:'#f0c040',sma50:'#40a0f0',sma100:'#7fd1ff',sma200:'#e040fb',ema9:'#ff9900',ema21:'#00e5ff',ema50:'#ff7096',ema100:'#b388ff',ema200:'#00c853',wma20:'#ffd166',wma50:'#8ecae6',vwap:'#ffffff',bb:'rgba(100,180,255,0.8)',auto_trend:'#ffca28',rsi:'#e91e63',macd:'#2196f3',atr:'rgba(255,152,0,0.8)'};
-    var lbls={sma9:'SMA9',sma20:'SMA20',sma50:'SMA50',sma100:'SMA100',sma200:'SMA200',ema9:'EMA9',ema21:'EMA21',ema50:'EMA50',ema100:'EMA100',ema200:'EMA200',wma20:'WMA20',wma50:'WMA50',vwap:'VWAP',bb:'BB(20,2)',auto_trend:'Auto Trend',rsi:'RSI14',macd:'MACD',atr:'ATR Bands'};
+    var cols={sma9:'#ffe082',sma20:'#f0c040',sma50:'#40a0f0',sma100:'#7fd1ff',sma200:'#e040fb',ema9:'#ff9900',ema21:'#00e5ff',ema50:'#ff7096',ema100:'#b388ff',ema200:'#00c853',wma20:'#ffd166',wma50:'#8ecae6',vwap:'#ffffff',bb:'rgba(100,180,255,0.8)',fbb:'#e040fb',auto_trend:'#ffca28',rsi:'#e91e63',macd:'#2196f3',atr:'rgba(255,152,0,0.8)'};
+    var lbls={sma9:'SMA9',sma20:'SMA20',sma50:'SMA50',sma100:'SMA100',sma200:'SMA200',ema9:'EMA9',ema21:'EMA21',ema50:'EMA50',ema100:'EMA100',ema200:'EMA200',wma20:'WMA20',wma50:'WMA50',vwap:'VWAP',bb:'BB(20,2)',fbb:'FBB(200,3)',auto_trend:'Auto Trend',rsi:'RSI14',macd:'MACD',atr:'ATR Bands'};
     leg.innerHTML=Object.keys(tvIndSeries).map(function(k){return '<div class="ind-item"><div class="ind-swatch" style="background:'+( cols[k]||'#888')+'"></div>'+(lbls[k]||k)+'</div>';}).join('');
   }
 
@@ -8449,7 +9006,7 @@ def index():
     while(tb.children.length>2)tb.removeChild(tb.lastChild);
     function btn(text,title,onClick,extra){var b=document.createElement('button');b.className='tb-btn'+(extra?' '+extra:'');b.textContent=text;b.title=title;b.addEventListener('click',onClick);return b;}
     function sep(){var d=document.createElement('div');d.className='tv-tb-sep';return d;}
-        var inds=[{k:'sma9',l:'SMA9',t:'Simple Moving Average (9)'},{k:'sma20',l:'SMA20',t:'Simple Moving Average (20)'},{k:'sma50',l:'SMA50',t:'Simple Moving Average (50)'},{k:'sma100',l:'SMA100',t:'Simple Moving Average (100)'},{k:'sma200',l:'SMA200',t:'Simple Moving Average (200)'},{k:'ema9',l:'EMA9',t:'Exponential Moving Average (9)'},{k:'ema21',l:'EMA21',t:'Exponential Moving Average (21)'},{k:'ema50',l:'EMA50',t:'Exponential Moving Average (50)'},{k:'ema100',l:'EMA100',t:'Exponential Moving Average (100)'},{k:'ema200',l:'EMA200',t:'Exponential Moving Average (200)'},{k:'wma20',l:'WMA20',t:'Weighted Moving Average (20)'},{k:'wma50',l:'WMA50',t:'Weighted Moving Average (50)'},{k:'vwap',l:'VWAP',t:'Volume Weighted Average Price'},{k:'bb',l:'BB',t:'Bollinger Bands (20, 2)'},{k:'auto_trend',l:'Auto Trend',t:'Automatic linear-regression trend line for the current session'},{k:'rsi',l:'RSI',t:'Relative Strength Index (14) — sub-pane'},{k:'macd',l:'MACD',t:'MACD (12, 26, 9) — sub-pane'},{k:'atr',l:'ATR',t:'Average True Range (14)'}];
+        var inds=[{k:'sma9',l:'SMA9',t:'Simple Moving Average (9)'},{k:'sma20',l:'SMA20',t:'Simple Moving Average (20)'},{k:'sma50',l:'SMA50',t:'Simple Moving Average (50)'},{k:'sma100',l:'SMA100',t:'Simple Moving Average (100)'},{k:'sma200',l:'SMA200',t:'Simple Moving Average (200)'},{k:'ema9',l:'EMA9',t:'Exponential Moving Average (9)'},{k:'ema21',l:'EMA21',t:'Exponential Moving Average (21)'},{k:'ema50',l:'EMA50',t:'Exponential Moving Average (50)'},{k:'ema100',l:'EMA100',t:'Exponential Moving Average (100)'},{k:'ema200',l:'EMA200',t:'Exponential Moving Average (200)'},{k:'wma20',l:'WMA20',t:'Weighted Moving Average (20)'},{k:'wma50',l:'WMA50',t:'Weighted Moving Average (50)'},{k:'vwap',l:'VWAP',t:'Volume Weighted Average Price'},{k:'bb',l:'BB',t:'Bollinger Bands (20, 2)'},{k:'fbb',l:'FBB',t:'Fibonacci Bollinger Bands (200, 3)'},{k:'auto_trend',l:'Auto Trend',t:'Automatic linear-regression trend line for the current session'},{k:'rsi',l:'RSI',t:'Relative Strength Index (14) — sub-pane'},{k:'macd',l:'MACD',t:'MACD (12, 26, 9) — sub-pane'},{k:'atr',l:'ATR',t:'Average True Range (14)'},{k:'smc',l:'SMC',t:'Smart Money Concepts — Order Blocks, FVGs, BOS/CHoCH'}];
         var indPicker=document.createElement('details');indPicker.className='tv-indicator-picker';
         var indSummary=document.createElement('summary');indSummary.className='tb-btn tv-indicator-summary';indSummary.title='Search and toggle indicators';
         var indLabel=document.createElement('span');indLabel.textContent='Indicators';
@@ -8459,7 +9016,7 @@ def index():
         var indSearch=document.createElement('input');indSearch.type='search';indSearch.className='tv-indicator-search';indSearch.placeholder='Search indicators';indSearch.autocomplete='off';
         var indOptions=document.createElement('div');indOptions.className='tv-indicator-options';
         function syncIndicatorSummary(){var count=activeInds.size;indBadge.textContent=String(count);indBadge.style.display=count?'inline-flex':'none';}
-        function renderIndicatorOptions(){var query=(indSearch.value||'').trim().toLowerCase();indOptions.innerHTML='';var matches=inds.filter(function(def){return def.l.toLowerCase().indexOf(query)!==-1||def.t.toLowerCase().indexOf(query)!==-1;});if(!matches.length){var empty=document.createElement('div');empty.className='tv-indicator-option-empty';empty.textContent='No matching indicators';indOptions.appendChild(empty);return;}matches.forEach(function(def){var option=document.createElement('button');option.type='button';option.className='tv-indicator-option';if(activeInds.has(def.k))option.classList.add('active');var name=document.createElement('span');name.className='tv-indicator-option-name';name.textContent=def.l;var desc=document.createElement('span');desc.className='tv-indicator-option-desc';desc.textContent=def.t;option.appendChild(name);option.appendChild(desc);option.addEventListener('click',function(){if(activeInds.has(def.k))activeInds.delete(def.k);else activeInds.add(def.k);syncIndicatorSummary();renderIndicatorOptions();applyIndicators(tvLastCandles);});indOptions.appendChild(option);});}
+        function renderIndicatorOptions(){var query=(indSearch.value||'').trim().toLowerCase();indOptions.innerHTML='';var matches=inds.filter(function(def){return def.l.toLowerCase().indexOf(query)!==-1||def.t.toLowerCase().indexOf(query)!==-1;});if(!matches.length){var empty=document.createElement('div');empty.className='tv-indicator-option-empty';empty.textContent='No matching indicators';indOptions.appendChild(empty);return;}matches.forEach(function(def){var option=document.createElement('button');option.type='button';option.className='tv-indicator-option';if(activeInds.has(def.k))option.classList.add('active');var name=document.createElement('span');name.className='tv-indicator-option-name';name.textContent=def.l;var desc=document.createElement('span');desc.className='tv-indicator-option-desc';desc.textContent=def.t;option.appendChild(name);option.appendChild(desc);option.addEventListener('click',function(){if(activeInds.has(def.k))activeInds.delete(def.k);else activeInds.add(def.k);syncIndicatorSummary();renderIndicatorOptions();applyIndicators();});indOptions.appendChild(option);});}
         indSearch.addEventListener('input',renderIndicatorOptions);
         indPicker.addEventListener('toggle',function(){if(indPicker.open){setTimeout(function(){indSearch.focus();indSearch.select();},0);}else{indSearch.value='';renderIndicatorOptions();}});
         indMenu.appendChild(indSearch);indMenu.appendChild(indOptions);indPicker.appendChild(indMenu);syncIndicatorSummary();renderIndicatorOptions();tb.appendChild(indPicker);
@@ -8554,13 +9111,15 @@ def index():
     tvCandle.setData(candles);
     tvVol.setData(priceData.volume||[]);
     tvLastCandles=candles;
+    tvIndicatorCandles=(priceData.indicator_candles&&priceData.indicator_candles.length>0)?priceData.indicator_candles:candles;
+    tvCurrentDayStartTime=priceData.current_day_start_time||0;
         tvPriceLines.forEach(function(l){try{tvCandle.removePriceLine(l);}catch(e){}});tvPriceLines=[];tvAllLevelPrices=[];
         tvShowLatestLevelLines=priceData.show_latest_level_lines!==false;
         tvHistoricalPoints=priceLevelBubblePoints(priceData);
         tvHistoricalPoints.forEach(function(p){tvAllLevelPrices.push(p.price);});
         scheduleHistoricalBubbleDraw();
     tvApplyAutoscale();
-    if(activeInds.size>0)applyIndicators(candles);
+    if(activeInds.size>0)applyIndicators();
     if(isFirstRender||tvAutoRange){fitAll();isFirstRender=false;}
   }
 
@@ -8574,10 +9133,15 @@ def index():
       var updated={time:lc.time,open:lc.open,high:Math.max(lc.high,last),low:Math.min(lc.low,last),close:last,volume:lc.volume||0};
       try{tvCandle.update(updated);}catch(e){}
       tvLastCandles[tvLastCandles.length-1]=updated;
+      var icLast=tvIndicatorCandles[tvIndicatorCandles.length-1];
+      if(icLast&&icLast.time===updated.time){tvIndicatorCandles[tvIndicatorCandles.length-1]=updated;}
+      if(activeInds.size>0){clearTimeout(tvIndicatorRefreshTimer);tvIndicatorRefreshTimer=setTimeout(applyIndicators,2000);}
     }else if(minuteStart>lc.time){
       var newC={time:minuteStart,open:last,high:last,low:last,close:last,volume:0};
       try{tvCandle.update(newC);}catch(e){}
       tvLastCandles.push(newC);
+      tvIndicatorCandles.push(newC);
+      if(activeInds.size>0){clearTimeout(tvIndicatorRefreshTimer);applyIndicators();}
     }
   }
   function applyRealtimeCandle(candle){
@@ -8586,7 +9150,9 @@ def index():
     try{tvCandle.update(c);}catch(e){}
     var idx=tvLastCandles.findIndex(function(x){return x.time===c.time;});
     if(idx>=0){tvLastCandles[idx]=c;}else{tvLastCandles.push(c);tvLastCandles.sort(function(a,b){return a.time-b.time;});}
-    if(activeInds.size>0)applyIndicators(tvLastCandles);
+    var icIdx=tvIndicatorCandles.findIndex(function(x){return x.time===c.time;});
+    if(icIdx>=0){tvIndicatorCandles[icIdx]=c;}else{tvIndicatorCandles.push(c);tvIndicatorCandles.sort(function(a,b){return a.time-b.time;});}
+    if(activeInds.size>0)applyIndicators();
   }
 
   // ── SSE price stream ───────────────────────────────────────────────────────
@@ -9059,7 +9625,7 @@ def index():
     const cellH = plotH / Math.max(1, nrows);
     const newSize = Math.max(6, Math.min(20, Math.floor(Math.min(cellW, cellH) * 0.38)));
     if (fl.annotations[cellAnnotIdxs[0]].font && fl.annotations[cellAnnotIdxs[0]].font.size === newSize) return;
-    const relayoutUpdate = {};
+    const relayoutUpdate = { 'transition.duration': 0 };
     cellAnnotIdxs.forEach(i => { relayoutUpdate['annotations[' + i + '].font.size'] = newSize; });
     try { Plotly.relayout(div, relayoutUpdate); } catch(e) {}
   }
@@ -9599,13 +10165,36 @@ def index():
             chartData.layout.height = null;
             chartData.layout.margin = getChartMargins(containerId, baseMargins);
 
-            if (chartData.layout.xaxis) {
-                chartData.layout.xaxis.autorange = true;
-            }
-            if (chartData.layout.yaxis) {
-                chartData.layout.yaxis.autorange = true;
+            if (key !== 'heatmap') {
+                if (chartData.layout.xaxis) {
+                    chartData.layout.xaxis.autorange = true;
+                }
+                if (chartData.layout.yaxis) {
+                    chartData.layout.yaxis.autorange = true;
+                }
             }
             applyThemeToPlotlyLayout(chartData.layout);
+
+            // Pre-compute heatmap annotation font size so the first render is correct
+            // and no follow-up relayout (which causes a visible size-change flash) is needed.
+            if (key === 'heatmap' && chartData.layout && Array.isArray(chartData.layout.annotations)) {
+                const trace = chartData.data && chartData.data[0];
+                const ncols = (trace && trace.x) ? trace.x.length : 1;
+                const nrows = (trace && trace.y) ? trace.y.length : 1;
+                const margin = chartData.layout.margin || {l: 44, r: 52, t: 48, b: 32};
+                const containerW = plotElement.clientWidth  || container.clientWidth  || 400;
+                const containerH = plotElement.clientHeight || container.clientHeight || 300;
+                const plotW = Math.max(1, containerW - (margin.l || 0) - (margin.r || 0));
+                const plotH = Math.max(1, containerH - (margin.t || 0) - (margin.b || 0));
+                const cellW = plotW / Math.max(1, ncols);
+                const cellH = plotH / Math.max(1, nrows);
+                const preSize = Math.max(6, Math.min(20, Math.floor(Math.min(cellW, cellH) * 0.38)));
+                chartData.layout.annotations.forEach(a => {
+                    if (a.xref === 'x' && a.yref === 'y' && !a.showarrow) {
+                        a.font = Object.assign({}, a.font, { size: preSize });
+                    }
+                });
+            }
 
             const config = {
                 responsive: true,
@@ -9623,12 +10212,16 @@ def index():
                 charts[key] = plotPromise;
             }
 
-            Promise.resolve(plotPromise).then(() => attachPlotlyCustomTooltip(plotElement));
-
-            if (key === 'heatmap') {
-                updateHeatmapTextSize(containerId);
-                attachHeatmapResizeObserver(containerId);
-            }
+            Promise.resolve(plotPromise).then(() => {
+                attachPlotlyCustomTooltip(plotElement);
+                if (key === 'heatmap') {
+                    scheduleHeatmapPlotResize(containerId);
+                    attachHeatmapResizeObserver(containerId);
+                } else {
+                    schedulePlotlyChartResize(containerId);
+                    attachPlotlyResizeObserver(containerId);
+                }
+            });
 
             addFullscreenButton(container);
             addPopoutButton(container);
@@ -9636,19 +10229,73 @@ def index():
         }
 
         let _heatmapResizeObserver = null;
+        const _plotlyResizeObservers = new Map();
+
+        function attachPlotlyResizeObserver(containerId) {
+            if (containerId === 'heatmap-chart') {
+                attachHeatmapResizeObserver(containerId);
+                return;
+            }
+            const container = document.getElementById(containerId);
+            if (!container || typeof ResizeObserver === 'undefined') return;
+
+            const existing = _plotlyResizeObservers.get(containerId);
+            if (existing) {
+                existing.observer.disconnect();
+                clearTimeout(existing.timer);
+            }
+
+            let timer = null;
+            const observer = new ResizeObserver(() => {
+                clearTimeout(timer);
+                timer = setTimeout(() => resizePlotlyChart(container), 120);
+            });
+            observer.observe(container);
+            _plotlyResizeObservers.set(containerId, { observer, timer });
+        }
+
+        function resizeHeatmapPlot() {
+            const plotEl = getPlotlyChartElement('heatmap');
+            if (!plotEl) return;
+            const width = plotEl.clientWidth;
+            const height = plotEl.clientHeight;
+            if (width < 2 || height < 2) return;
+            try {
+                Plotly.relayout(plotEl, { width, height });
+                Plotly.Plots.resize(plotEl);
+            } catch (e) {}
+        }
+
+        function scheduleHeatmapPlotResize(containerId) {
+            requestAnimationFrame(() => {
+                resizeHeatmapPlot();
+                requestAnimationFrame(() => {
+                    resizeHeatmapPlot();
+                    updateHeatmapTextSize(containerId);
+                });
+            });
+        }
 
         function attachHeatmapResizeObserver(containerId) {
             if (_heatmapResizeObserver) {
                 _heatmapResizeObserver.disconnect();
             }
-            const el = document.getElementById(containerId);
-            if (!el || typeof ResizeObserver === 'undefined') return;
+            const plotEl = getPlotlyChartElement('heatmap');
+            const containerEl = document.getElementById(containerId);
+            const observeEl = plotEl || containerEl;
+            if (!observeEl || typeof ResizeObserver === 'undefined') return;
             let _heatmapResizeTimer = null;
             _heatmapResizeObserver = new ResizeObserver(() => {
                 clearTimeout(_heatmapResizeTimer);
-                _heatmapResizeTimer = setTimeout(() => updateHeatmapTextSize(containerId), 120);
+                _heatmapResizeTimer = setTimeout(() => {
+                    resizeHeatmapPlot();
+                    updateHeatmapTextSize(containerId);
+                }, 120);
             });
-            _heatmapResizeObserver.observe(el);
+            _heatmapResizeObserver.observe(observeEl);
+            if (containerEl && containerEl !== observeEl) {
+                _heatmapResizeObserver.observe(containerEl);
+            }
         }
 
         function updateHeatmapTextSize(containerId) {
@@ -9672,7 +10319,7 @@ def index():
             const cellH = plotH / Math.max(1, nrows);
             const newSize = Math.max(6, Math.min(20, Math.floor(Math.min(cellW, cellH) * 0.38)));
             if (fl.annotations[cellAnnotIdxs[0]].font && fl.annotations[cellAnnotIdxs[0]].font.size === newSize) return;
-            const relayoutUpdate = {};
+            const relayoutUpdate = { 'transition.duration': 0 };
             cellAnnotIdxs.forEach(i => { relayoutUpdate[`annotations[${i}].font.size`] = newSize; });
             try { Plotly.relayout(div, relayoutUpdate); } catch(e) {}
         }
@@ -10082,6 +10729,42 @@ def index():
                 return { upper: mid + mult * sd, mid, lower: mid - mult * sd };
             });
         }
+        function calcRollingStdev(values, period) {
+            return values.map((_, i) => {
+                if (i < period - 1) return null;
+                const slice = values.slice(i - period + 1, i + 1);
+                const mean = slice.reduce((a, b) => a + b, 0) / period;
+                const variance = slice.reduce((a, b) => a + (b - mean) ** 2, 0) / period;
+                return Math.sqrt(variance);
+            });
+        }
+        function calcVWMA(values, volumes, period) {
+            return values.map((_, i) => {
+                if (i < period - 1) return null;
+                let sumPV = 0, sumVol = 0;
+                const slice = values.slice(i - period + 1, i + 1);
+                for (let j = i - period + 1; j <= i; j++) {
+                    const vol = volumes[j] || 0;
+                    sumPV += values[j] * vol;
+                    sumVol += vol;
+                }
+                if (sumVol > 0) return sumPV / sumVol;
+                return slice.reduce((a, b) => a + b, 0) / period;
+            });
+        }
+        function calcFBB(candles, length=200, mult=3.0) {
+            const src = candles.map(c => (c.high + c.low + c.close) / 3);
+            const volumes = candles.map(c => c.volume || 0);
+            const basis = calcVWMA(src, volumes, length);
+            const stdev = calcRollingStdev(src, length);
+            return candles.map((_, i) => {
+                if (basis[i] === null || stdev[i] === null) {
+                    return { basis: null, upper: null, lower: null };
+                }
+                const dev = mult * stdev[i];
+                return { basis: basis[i], upper: basis[i] + dev, lower: basis[i] - dev };
+            });
+        }
         function calcRSI(closes, period=14) {
             const result = [];
             for (let i = 0; i < closes.length; i++) {
@@ -10227,6 +10910,177 @@ def index():
             }));
         }
 
+        // ── Smart Money Concepts calculation ──────────────────────────────────
+        function calcSMC(candles, params) {
+            const swingLen = Math.max(2, Math.min(20, parseInt(params.swing_len) || 5));
+            const n = candles.length;
+            const EQ_THRESH = 0.0015; // 0.15% tolerance for equal highs/lows
+
+            // ── 1. Pivot detection ──────────────────────────────────────────
+            const swingHighs = [], swingLows = [];
+            for (let i = swingLen; i < n - swingLen; i++) {
+                const h = candles[i].high, l = candles[i].low;
+                let isH = true, isL = true;
+                for (let j = i - swingLen; j <= i + swingLen; j++) {
+                    if (j === i) continue;
+                    if (candles[j].high >= h) isH = false;
+                    if (candles[j].low  <= l) isL = false;
+                    if (!isH && !isL) break;
+                }
+                if (isH) swingHighs.push({ index: i, time: candles[i].time, price: h });
+                if (isL) swingLows.push({ index: i, time: candles[i].time, price: l });
+            }
+
+            // ── 2. HH/LH and HL/LL classification → Strong/Weak ───────────
+            // Strong High = Higher High (HH), Weak High = Lower High (LH)
+            // Strong Low  = Higher Low  (HL), Weak Low  = Lower Low  (LL)
+            for (let i = 0; i < swingHighs.length; i++) {
+                const prev = swingHighs[i - 1];
+                const isHH = !prev || swingHighs[i].price > prev.price;
+                swingHighs[i].label  = isHH ? 'HH' : 'LH';
+                swingHighs[i].strong = isHH;
+            }
+            for (let i = 0; i < swingLows.length; i++) {
+                const prev = swingLows[i - 1];
+                const isHL = !prev || swingLows[i].price > prev.price;
+                swingLows[i].label  = isHL ? 'HL' : 'LL';
+                swingLows[i].strong = isHL;
+            }
+
+            // ── 3. Equal Highs / Equal Lows ─────────────────────────────────
+            const eqHighs = [], eqLows = [];
+            if (params.show_eqhl !== false) {
+                for (let i = 1; i < swingHighs.length; i++) {
+                    const a = swingHighs[i - 1], b = swingHighs[i];
+                    if (Math.abs(a.price - b.price) / Math.max(a.price, b.price) <= EQ_THRESH)
+                        eqHighs.push({ price: (a.price + b.price) / 2, startTime: a.time, endTime: b.time });
+                }
+                for (let i = 1; i < swingLows.length; i++) {
+                    const a = swingLows[i - 1], b = swingLows[i];
+                    if (Math.abs(a.price - b.price) / Math.max(a.price, b.price) <= EQ_THRESH)
+                        eqLows.push({ price: (a.price + b.price) / 2, startTime: a.time, endTime: b.time });
+                }
+            }
+
+            // ── 4. BOS / CHoCH (sliding confirmed-swing window) ─────────────
+            const structures = [];
+            if (params.show_bos !== false) {
+                // Build confirm-index lookup for O(1) insertion
+                const shByConfirm = new Map(), slByConfirm = new Map();
+                swingHighs.forEach(sh => {
+                    const ci = sh.index + swingLen + 1;
+                    if (!shByConfirm.has(ci)) shByConfirm.set(ci, []);
+                    shByConfirm.get(ci).push(sh);
+                });
+                swingLows.forEach(sl => {
+                    const ci = sl.index + swingLen + 1;
+                    if (!slByConfirm.has(ci)) slByConfirm.set(ci, []);
+                    slByConfirm.get(ci).push(sl);
+                });
+
+                let trend = null;
+                let watchH = [], watchL = []; // pending structural levels
+
+                for (let i = swingLen + 1; i < n; i++) {
+                    // Add newly confirmed swings to watch lists
+                    if (shByConfirm.has(i)) shByConfirm.get(i).forEach(sh => watchH.push(sh));
+                    if (slByConfirm.has(i)) slByConfirm.get(i).forEach(sl => watchL.push(sl));
+
+                    const close = candles[i].close, time = candles[i].time;
+
+                    // Bullish break: scan from newest → oldest high
+                    for (let k = watchH.length - 1; k >= 0; k--) {
+                        const sh = watchH[k];
+                        if (close > sh.price) {
+                            structures.push({ type: trend === 'up' ? 'bos' : 'choch', dir: 'bull',
+                                              price: sh.price, startTime: sh.time, breakTime: time });
+                            trend = 'up';
+                            watchH = watchH.slice(k + 1); // remove broken + older
+                            break;
+                        }
+                    }
+                    // Bearish break: scan from newest → oldest low
+                    for (let k = watchL.length - 1; k >= 0; k--) {
+                        const sl = watchL[k];
+                        if (close < sl.price) {
+                            structures.push({ type: trend === 'down' ? 'bos' : 'choch', dir: 'bear',
+                                              price: sl.price, startTime: sl.time, breakTime: time });
+                            trend = 'down';
+                            watchL = watchL.slice(k + 1);
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // ── 5. Fair Value Gaps ───────────────────────────────────────────
+            const fvgs = [];
+            if (params.show_fvg !== false) {
+                for (let i = 2; i < n; i++) {
+                    const c0 = candles[i - 2], c2 = candles[i];
+                    if (c0.high < c2.low) {
+                        const fvg = { type:'bull', top:c2.low, bottom:c0.high, startTime:c0.time, endTime:null, filled:false };
+                        for (let k = i + 1; k < n; k++) {
+                            if (candles[k].low <= fvg.top) { fvg.filled = true; fvg.endTime = candles[k].time; break; }
+                        }
+                        fvgs.push(fvg);
+                    }
+                    if (c0.low > c2.high) {
+                        const fvg = { type:'bear', top:c0.low, bottom:c2.high, startTime:c0.time, endTime:null, filled:false };
+                        for (let k = i + 1; k < n; k++) {
+                            if (candles[k].high >= fvg.bottom) { fvg.filled = true; fvg.endTime = candles[k].time; break; }
+                        }
+                        fvgs.push(fvg);
+                    }
+                }
+            }
+
+            // ── 6. Order Blocks ──────────────────────────────────────────────
+            const obs = [];
+            if (params.show_ob !== false) {
+                // Bull OB: last bearish candle before price breaks a swing high
+                swingHighs.forEach(sh => {
+                    for (let i = sh.index + 1; i < n; i++) {
+                        if (candles[i].close > sh.price) {
+                            const limit = Math.max(sh.index, i - 30);
+                            for (let j = i - 1; j > limit; j--) {
+                                const c = candles[j];
+                                if (c.close < c.open) {
+                                    const ob = { type:'bull', top:c.high, bottom:Math.min(c.open, c.close), startTime:c.time, endTime:null, mitigated:false };
+                                    for (let k = i + 1; k < n; k++) {
+                                        if (candles[k].low <= ob.bottom) { ob.mitigated = true; ob.endTime = candles[k].time; break; }
+                                    }
+                                    obs.push(ob); break;
+                                }
+                            }
+                            break;
+                        }
+                    }
+                });
+                // Bear OB: last bullish candle before price breaks a swing low
+                swingLows.forEach(sl => {
+                    for (let i = sl.index + 1; i < n; i++) {
+                        if (candles[i].close < sl.price) {
+                            const limit = Math.max(sl.index, i - 30);
+                            for (let j = i - 1; j > limit; j--) {
+                                const c = candles[j];
+                                if (c.close > c.open) {
+                                    const ob = { type:'bear', top:Math.max(c.open, c.close), bottom:c.low, startTime:c.time, endTime:null, mitigated:false };
+                                    for (let k = i + 1; k < n; k++) {
+                                        if (candles[k].high >= ob.top) { ob.mitigated = true; ob.endTime = candles[k].time; break; }
+                                    }
+                                    obs.push(ob); break;
+                                }
+                            }
+                            break;
+                        }
+                    }
+                });
+            }
+
+            return { swingHighs, swingLows, fvgs, obs, structures, eqHighs, eqLows };
+        }
+
         // ── Apply/remove indicators on existing chart ─────────────────────────
         function applyIndicators(candles, activeInds) {
             if (!tvPriceChart || !tvCandleSeries) return;
@@ -10256,53 +11110,57 @@ def index():
                 return pairs.filter(p => p !== null && p.time >= dayStart);
             }
 
-            if (activeInds.has('sma20')) {
-                if (!tvIndicatorSeries['sma20']) tvIndicatorSeries['sma20'] = mkLineSeries('#f0c040', 1, 'right', 'SMA20');
-                tvIndicatorSeries['sma20'].setData(todayOnly(calcSMA(closes, 20).map((v,i) => v!==null ? {time:times[i], value:v} : null)));
-            }
+            // Helper to get param with fallback default
+            function p(key, field, def) { return (tvIndicatorParams[key]||{})[field] ?? def; }
+            function mapTA(vals) { return vals.map((v,i) => v!==null ? {time:times[i], value:v} : null); }
+
             if (activeInds.has('sma9')) {
                 if (!tvIndicatorSeries['sma9']) tvIndicatorSeries['sma9'] = mkLineSeries('#ffe082', 1, 'right', 'SMA9');
-                tvIndicatorSeries['sma9'].setData(todayOnly(calcSMA(closes, 9).map((v,i) => v!==null ? {time:times[i], value:v} : null)));
+                tvIndicatorSeries['sma9'].setData(todayOnly(mapTA(calcSMA(closes, p('sma9','period',9)))));
+            }
+            if (activeInds.has('sma20')) {
+                if (!tvIndicatorSeries['sma20']) tvIndicatorSeries['sma20'] = mkLineSeries('#f0c040', 1, 'right', 'SMA20');
+                tvIndicatorSeries['sma20'].setData(todayOnly(mapTA(calcSMA(closes, p('sma20','period',20)))));
             }
             if (activeInds.has('sma50')) {
                 if (!tvIndicatorSeries['sma50']) tvIndicatorSeries['sma50'] = mkLineSeries('#40a0f0', 1, 'right', 'SMA50');
-                tvIndicatorSeries['sma50'].setData(todayOnly(calcSMA(closes, 50).map((v,i) => v!==null ? {time:times[i], value:v} : null)));
+                tvIndicatorSeries['sma50'].setData(todayOnly(mapTA(calcSMA(closes, p('sma50','period',50)))));
             }
             if (activeInds.has('sma100')) {
                 if (!tvIndicatorSeries['sma100']) tvIndicatorSeries['sma100'] = mkLineSeries('#7fd1ff', 1, 'right', 'SMA100');
-                tvIndicatorSeries['sma100'].setData(todayOnly(calcSMA(closes, 100).map((v,i) => v!==null ? {time:times[i], value:v} : null)));
+                tvIndicatorSeries['sma100'].setData(todayOnly(mapTA(calcSMA(closes, p('sma100','period',100)))));
             }
             if (activeInds.has('sma200')) {
                 if (!tvIndicatorSeries['sma200']) tvIndicatorSeries['sma200'] = mkLineSeries('#e040fb', 1, 'right', 'SMA200');
-                tvIndicatorSeries['sma200'].setData(todayOnly(calcSMA(closes, 200).map((v,i) => v!==null ? {time:times[i], value:v} : null)));
+                tvIndicatorSeries['sma200'].setData(todayOnly(mapTA(calcSMA(closes, p('sma200','period',200)))));
             }
             if (activeInds.has('ema9')) {
                 if (!tvIndicatorSeries['ema9']) tvIndicatorSeries['ema9'] = mkLineSeries('#ff9900', 1, 'right', 'EMA9');
-                tvIndicatorSeries['ema9'].setData(todayOnly(calcEMA(closes, 9).map((v,i) => v!==null ? {time:times[i], value:v} : null)));
+                tvIndicatorSeries['ema9'].setData(todayOnly(mapTA(calcEMA(closes, p('ema9','period',9)))));
             }
             if (activeInds.has('ema21')) {
                 if (!tvIndicatorSeries['ema21']) tvIndicatorSeries['ema21'] = mkLineSeries('#00e5ff', 1, 'right', 'EMA21');
-                tvIndicatorSeries['ema21'].setData(todayOnly(calcEMA(closes, 21).map((v,i) => v!==null ? {time:times[i], value:v} : null)));
+                tvIndicatorSeries['ema21'].setData(todayOnly(mapTA(calcEMA(closes, p('ema21','period',21)))));
             }
             if (activeInds.has('ema50')) {
                 if (!tvIndicatorSeries['ema50']) tvIndicatorSeries['ema50'] = mkLineSeries('#ff7096', 1, 'right', 'EMA50');
-                tvIndicatorSeries['ema50'].setData(todayOnly(calcEMA(closes, 50).map((v,i) => v!==null ? {time:times[i], value:v} : null)));
+                tvIndicatorSeries['ema50'].setData(todayOnly(mapTA(calcEMA(closes, p('ema50','period',50)))));
             }
             if (activeInds.has('ema100')) {
                 if (!tvIndicatorSeries['ema100']) tvIndicatorSeries['ema100'] = mkLineSeries('#b388ff', 1, 'right', 'EMA100');
-                tvIndicatorSeries['ema100'].setData(todayOnly(calcEMA(closes, 100).map((v,i) => v!==null ? {time:times[i], value:v} : null)));
+                tvIndicatorSeries['ema100'].setData(todayOnly(mapTA(calcEMA(closes, p('ema100','period',100)))));
             }
             if (activeInds.has('ema200')) {
                 if (!tvIndicatorSeries['ema200']) tvIndicatorSeries['ema200'] = mkLineSeries('#00c853', 1, 'right', 'EMA200');
-                tvIndicatorSeries['ema200'].setData(todayOnly(calcEMA(closes, 200).map((v,i) => v!==null ? {time:times[i], value:v} : null)));
+                tvIndicatorSeries['ema200'].setData(todayOnly(mapTA(calcEMA(closes, p('ema200','period',200)))));
             }
             if (activeInds.has('wma20')) {
                 if (!tvIndicatorSeries['wma20']) tvIndicatorSeries['wma20'] = mkLineSeries('#ffd166', 1, 'right', 'WMA20');
-                tvIndicatorSeries['wma20'].setData(todayOnly(calcWMA(closes, 20).map((v,i) => v!==null ? {time:times[i], value:v} : null)));
+                tvIndicatorSeries['wma20'].setData(todayOnly(mapTA(calcWMA(closes, p('wma20','period',20)))));
             }
             if (activeInds.has('wma50')) {
                 if (!tvIndicatorSeries['wma50']) tvIndicatorSeries['wma50'] = mkLineSeries('#8ecae6', 1, 'right', 'WMA50');
-                tvIndicatorSeries['wma50'].setData(todayOnly(calcWMA(closes, 50).map((v,i) => v!==null ? {time:times[i], value:v} : null)));
+                tvIndicatorSeries['wma50'].setData(todayOnly(mapTA(calcWMA(closes, p('wma50','period',50)))));
             }
             if (activeInds.has('vwap')) {
                 // VWAP resets daily — always compute from today's candles only
@@ -10314,7 +11172,7 @@ def index():
                 tvIndicatorSeries['vwap'].setData(vwapVals.map((v, i) => ({time: todayCandles[i].time, value: v})));
             }
             if (activeInds.has('bb')) {
-                const bb = calcBB(closes);
+                const bb = calcBB(closes, p('bb','period',20), p('bb','mult',2));
                 if (!tvIndicatorSeries['bb']) {
                     tvIndicatorSeries['bb'] = [
                         mkLineSeries('rgba(100,180,255,0.8)', 1, 'right', 'BB Upper'),
@@ -10327,8 +11185,25 @@ def index():
                 midS.setData(  todayOnly(bb.map((v,i) => v.mid  !==null ? {time:times[i],value:v.mid}   : null)));
                 lowerS.setData(todayOnly(bb.map((v,i) => v.lower!==null ? {time:times[i],value:v.lower}  : null)));
             }
+            if (activeInds.has('fbb')) {
+                const fbb = calcFBB(candles, p('fbb','length',200), p('fbb','mult',3));
+                if (!tvIndicatorSeries['fbb'] || tvIndicatorSeries['fbb'].length !== 3) {
+                    if (tvIndicatorSeries['fbb']) {
+                        tvIndicatorSeries['fbb'].forEach(s => { try { tvPriceChart.removeSeries(s); } catch(e){} });
+                    }
+                    tvIndicatorSeries['fbb'] = [
+                        mkLineSeries('#e040fb', 2, 'right', 'FBB Basis'),
+                        mkLineSeries('#ef5350', 2, 'right', 'FBB Upper'),
+                        mkLineSeries('#66bb6a', 2, 'right', 'FBB Lower'),
+                    ];
+                }
+                const [fbbBasis, fbbUpper, fbbLower] = tvIndicatorSeries['fbb'];
+                fbbBasis.setData(todayOnly(fbb.map((v, i) => v.basis !== null ? { time: times[i], value: v.basis } : null)));
+                fbbUpper.setData(todayOnly(fbb.map((v, i) => v.upper !== null ? { time: times[i], value: v.upper } : null)));
+                fbbLower.setData(todayOnly(fbb.map((v, i) => v.lower !== null ? { time: times[i], value: v.lower } : null)));
+            }
             if (activeInds.has('atr')) {
-                const atrVals = calcATR(candles);
+                const atrVals = calcATR(candles, p('atr','period',14));
                 const ema20   = calcEMA(closes, 20);
                 const mult    = 1.5;
                 if (!tvIndicatorSeries['atr']) {
@@ -10358,12 +11233,22 @@ def index():
 
             // RSI and MACD sub-panes: compute with full history but display today only
             const todayCandles = dayStart > 0 ? candles.filter(c => c.time >= dayStart) : candles;
-            if (activeInds.has('rsi')) applyRsiPane(candles, todayCandles);
+            if (activeInds.has('rsi')) applyRsiPane(candles, todayCandles, p('rsi','period',14));
             else                       destroyRsiPane();
-            if (activeInds.has('macd')) applyMacdPane(candles, todayCandles);
+            if (activeInds.has('macd')) applyMacdPane(candles, todayCandles, p('macd','fast',12), p('macd','slow',26), p('macd','signal',9));
             else                        destroyMacdPane();
             if (activeInds.has('arv')) applyArvPane(candles, todayCandles);
             else                       destroyArvPane();
+
+            // SMC — canvas-based overlay
+            if (activeInds.has('smc')) {
+                tvSmcData = calcSMC(candles, tvIndicatorParams.smc || {});
+                scheduleSmcDraw();
+            } else {
+                tvSmcData = null;
+                const smcOverlay = document.getElementById('price-chart')?.querySelector('.tv-smc-overlay');
+                if (smcOverlay) smcOverlay.style.display = 'none';
+            }
 
             // Update legend overlay
             updateIndicatorLegend();
@@ -10379,25 +11264,241 @@ def index():
                 legend.className = 'tv-indicator-legend';
                 container.appendChild(legend);
             }
+            function pLabel(key, field, def) { return (tvIndicatorParams[key]||{})[field] ?? def; }
             const items = {
-                sma9:'SMA9',sma20:'SMA20',sma50:'SMA50',sma100:'SMA100',sma200:'SMA200',
-                ema9:'EMA9',ema21:'EMA21',ema50:'EMA50',ema100:'EMA100',ema200:'EMA200',
-                wma20:'WMA20',wma50:'WMA50',
-                vwap:'VWAP',bb:'BB(20,2)',auto_trend:'Auto Trend',
-                rsi:'RSI14',macd:'MACD',atr:'ATR Bands'
+                sma9:`SMA${pLabel('sma9','period',9)}`,sma20:`SMA${pLabel('sma20','period',20)}`,
+                sma50:`SMA${pLabel('sma50','period',50)}`,sma100:`SMA${pLabel('sma100','period',100)}`,sma200:`SMA${pLabel('sma200','period',200)}`,
+                ema9:`EMA${pLabel('ema9','period',9)}`,ema21:`EMA${pLabel('ema21','period',21)}`,
+                ema50:`EMA${pLabel('ema50','period',50)}`,ema100:`EMA${pLabel('ema100','period',100)}`,ema200:`EMA${pLabel('ema200','period',200)}`,
+                wma20:`WMA${pLabel('wma20','period',20)}`,wma50:`WMA${pLabel('wma50','period',50)}`,
+                vwap:'VWAP',bb:`BB(${pLabel('bb','period',20)},${pLabel('bb','mult',2)})`,
+                fbb:`FBB(${pLabel('fbb','length',200)},${pLabel('fbb','mult',3)})`,auto_trend:'Auto Trend',
+                rsi:`RSI${pLabel('rsi','period',14)}`,macd:'MACD',atr:'ATR Bands',smc:'SMC'
             };
             const colors = {
                 sma9:'#ffe082',sma20:'#f0c040',sma50:'#40a0f0',sma100:'#7fd1ff',sma200:'#e040fb',
                 ema9:'#ff9900',ema21:'#00e5ff',ema50:'#ff7096',ema100:'#b388ff',ema200:'#00c853',
                 wma20:'#ffd166',wma50:'#8ecae6',
-                vwap:'#ffffff',bb:'rgba(100,180,255,0.8)',auto_trend:'#ffca28',
-                rsi:'#e91e63',macd:'#2196f3',atr:'rgba(255,152,0,0.8)'
+                vwap:'#ffffff',bb:'rgba(100,180,255,0.8)',fbb:'#e040fb',auto_trend:'#ffca28',
+                rsi:'#e91e63',macd:'#2196f3',atr:'rgba(255,152,0,0.8)',smc:'#26a69a'
             };
-            legend.innerHTML = Object.keys(tvIndicatorSeries).map(k => `
+            const allActive = [...Object.keys(tvIndicatorSeries), ...(tvSmcData ? ['smc'] : [])];
+            legend.innerHTML = allActive.map(k => `
                 <div class="tv-legend-item">
                     <div class="tv-legend-swatch" style="background:${colors[k]||'#888'}"></div>
                     ${items[k]||k}
                 </div>`).join('');
+        }
+
+        // ── SMC Canvas Overlay ────────────────────────────────────────────────
+        function ensureSmcOverlay() {
+            const c = document.getElementById('price-chart');
+            if (!c) return null;
+            let o = c.querySelector('.tv-smc-overlay');
+            if (!o) {
+                o = document.createElement('div');
+                o.className = 'tv-smc-overlay';
+                c.appendChild(o);
+            }
+            return o;
+        }
+
+        function drawSmcCanvas() {
+            const overlay = ensureSmcOverlay();
+            if (!overlay || !tvPriceChart || !tvCandleSeries || !tvSmcData) {
+                if (overlay) overlay.style.display = 'none';
+                return;
+            }
+            // Show before measuring — display:none gives clientWidth/Height = 0
+            overlay.style.display = 'block';
+            let canvas = overlay.querySelector('canvas');
+            if (!canvas) {
+                canvas = document.createElement('canvas');
+                overlay.appendChild(canvas);
+            }
+            const dpr = window.devicePixelRatio || 1;
+            const w = Math.max(1, overlay.clientWidth  || overlay.parentElement?.clientWidth  || 800);
+            const h = Math.max(1, overlay.clientHeight || overlay.parentElement?.clientHeight || 600);
+            canvas.width  = Math.round(w * dpr);
+            canvas.height = Math.round(h * dpr);
+            canvas.style.width  = w + 'px';
+            canvas.style.height = h + 'px';
+
+            const ctx = canvas.getContext('2d');
+            ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+            ctx.clearRect(0, 0, w, h);
+
+            const ts = tvPriceChart.timeScale();
+            const toX = t => { const x = ts.timeToCoordinate(t); return (x == null || isNaN(x)) ? null : x; };
+            const toY = p => { const y = tvCandleSeries.priceToCoordinate(p); return (y == null || isNaN(y)) ? null : y; };
+            const lastTime = tvLastCandles.length ? tvLastCandles[tvLastCandles.length - 1].time : null;
+            const params = tvIndicatorParams.smc || {};
+            const { obs, fvgs, structures, swingHighs, swingLows, eqHighs = [], eqLows = [] } = tvSmcData;
+
+            const BULL = '#26a69a', BEAR = '#ef5350';
+
+            // Helper: draw a filled+stroked box, clamping start to left edge if off-screen
+            function drawBox(x1, x2end, topPrice, botPrice, fill, stroke, fillA, strokeA) {
+                let lx = toX(x1);
+                const rx = x2end ? toX(x2end) : (lastTime ? toX(lastTime) : null);
+                const ty = toY(topPrice), by = toY(botPrice);
+                if (ty == null || by == null) return;
+                if (lx == null) lx = 0;
+                const rx2 = rx != null ? rx : w;
+                if (rx2 < 0) return;
+                const bx = Math.min(lx, rx2), bw = Math.abs(rx2 - lx);
+                const by2 = Math.min(ty, by), bh = Math.abs(by - ty);
+                if (bh < 0.5) return;
+                ctx.save();
+                ctx.globalAlpha = fillA; ctx.fillStyle = fill;
+                ctx.fillRect(bx, by2, bw, bh);
+                ctx.globalAlpha = strokeA; ctx.strokeStyle = stroke; ctx.lineWidth = 1.5;
+                ctx.strokeRect(bx + 0.5, by2 + 0.5, bw - 1, bh - 1);
+                ctx.restore();
+            }
+
+            // Helper: small pill label
+            function drawLabel(text, cx, cy, col, bgAlpha) {
+                ctx.save();
+                ctx.font = 'bold 9px sans-serif';
+                const tw = ctx.measureText(text).width;
+                ctx.globalAlpha = bgAlpha ?? 0.72;
+                ctx.fillStyle = '#111';
+                ctx.beginPath();
+                ctx.roundRect(cx - tw / 2 - 4, cy - 7, tw + 8, 14, 3);
+                ctx.fill();
+                ctx.globalAlpha = 1;
+                ctx.fillStyle = col;
+                ctx.textBaseline = 'middle';
+                ctx.textAlign = 'center';
+                ctx.fillText(text, cx, cy);
+                ctx.restore();
+            }
+
+            // ── FVGs ─────────────────────────────────────────────────────────
+            if (params.show_fvg !== false) {
+                fvgs.forEach(fvg => {
+                    const col = fvg.type === 'bull' ? BULL : BEAR;
+                    drawBox(fvg.startTime, fvg.endTime, fvg.top, fvg.bottom, col, col,
+                            fvg.filled ? 0.06 : 0.18, fvg.filled ? 0.18 : 0.55);
+                    // Label on unfilled FVGs only
+                    if (!fvg.filled) {
+                        let lx = toX(fvg.startTime); if (lx == null) lx = 0;
+                        const rx2 = fvg.endTime ? toX(fvg.endTime) : (lastTime ? toX(lastTime) : null);
+                        const ty = toY(fvg.top), by = toY(fvg.bottom);
+                        if (ty != null && by != null) {
+                            const midX = lx + (rx2 != null ? (rx2 - lx) * 0.15 : 30);
+                            const midY = (ty + by) / 2;
+                            ctx.save(); ctx.font = 'bold 8px sans-serif';
+                            ctx.globalAlpha = 0.8; ctx.fillStyle = col;
+                            ctx.textBaseline = 'middle';
+                            ctx.fillText('FVG', midX, midY);
+                            ctx.restore();
+                        }
+                    }
+                });
+            }
+
+            // ── Order Blocks ──────────────────────────────────────────────────
+            if (params.show_ob !== false) {
+                obs.forEach(ob => {
+                    const col = ob.type === 'bull' ? BULL : BEAR;
+                    drawBox(ob.startTime, ob.endTime, ob.top, ob.bottom, col, col,
+                            ob.mitigated ? 0.07 : 0.22, ob.mitigated ? 0.22 : 0.85);
+                    if (!ob.mitigated) {
+                        let lx = toX(ob.startTime); if (lx == null) lx = 4;
+                        const ty = toY(ob.top);
+                        if (ty != null) {
+                            const tag = ob.type === 'bull' ? 'OB ▲' : 'OB ▼';
+                            ctx.save(); ctx.font = 'bold 9px sans-serif';
+                            ctx.globalAlpha = 0.9; ctx.fillStyle = col;
+                            ctx.textBaseline = 'top';
+                            ctx.fillText(tag, lx + 4, ty + 3);
+                            ctx.restore();
+                        }
+                    }
+                });
+            }
+
+            // ── BOS / CHoCH ───────────────────────────────────────────────────
+            if (params.show_bos !== false) {
+                structures.forEach(st => {
+                    let x1 = toX(st.startTime), x2 = toX(st.breakTime), y = toY(st.price);
+                    if (y == null || x2 == null) return;
+                    if (x1 == null) x1 = 0;
+                    const col = st.dir === 'bull' ? BULL : BEAR;
+                    const label = st.type === 'choch' ? 'CHoCH' : 'BOS';
+                    ctx.save();
+                    ctx.strokeStyle = col; ctx.lineWidth = 1.5;
+                    ctx.setLineDash(st.type === 'choch' ? [5, 3] : []);
+                    ctx.globalAlpha = 0.85;
+                    ctx.beginPath(); ctx.moveTo(x1, y); ctx.lineTo(x2, y); ctx.stroke();
+                    ctx.setLineDash([]);
+                    ctx.restore();
+                    drawLabel(label, (x1 + x2) / 2, y - 9, col);
+                });
+            }
+
+            // ── Equal Highs / Equal Lows ──────────────────────────────────────
+            if (params.show_eqhl !== false) {
+                const drawEQ = (eq, col, labelText) => {
+                    let x1 = toX(eq.startTime); if (x1 == null) x1 = 0;
+                    const x2 = toX(eq.endTime); if (x2 == null) return;
+                    const y = toY(eq.price); if (y == null) return;
+                    ctx.save();
+                    ctx.strokeStyle = col; ctx.lineWidth = 1;
+                    ctx.setLineDash([4, 3]); ctx.globalAlpha = 0.75;
+                    ctx.beginPath(); ctx.moveTo(x1, y); ctx.lineTo(x2, y); ctx.stroke();
+                    ctx.setLineDash([]);
+                    ctx.restore();
+                    drawLabel(labelText, x2 + 20, y, col, 0.65);
+                };
+                eqHighs.forEach(eq => drawEQ(eq, BEAR, 'EQH'));
+                eqLows.forEach(eq => drawEQ(eq, BULL, 'EQL'));
+            }
+
+            // ── Swing Points with Strong / Weak labels ────────────────────────
+            if (params.show_swings !== false) {
+                const drawSwing = (sw, isHigh) => {
+                    const x = toX(sw.time), y = toY(sw.price);
+                    if (x == null || y == null) return;
+                    const col = isHigh ? BEAR : BULL;
+                    const size = 5;
+                    // Triangle marker
+                    ctx.save(); ctx.fillStyle = col; ctx.globalAlpha = 0.9;
+                    ctx.beginPath();
+                    if (isHigh) {
+                        // pointing down above the high
+                        ctx.moveTo(x, y - 4);
+                        ctx.lineTo(x - size, y - 4 - size);
+                        ctx.lineTo(x + size, y - 4 - size);
+                    } else {
+                        // pointing up below the low
+                        ctx.moveTo(x, y + 4);
+                        ctx.lineTo(x - size, y + 4 + size);
+                        ctx.lineTo(x + size, y + 4 + size);
+                    }
+                    ctx.closePath(); ctx.fill(); ctx.restore();
+                    // HH/LH/HL/LL label
+                    const labelY = isHigh ? y - 4 - size - 10 : y + 4 + size + 10;
+                    drawLabel(sw.label, x, labelY, col, 0.6);
+                    // Strong / Weak sub-label
+                    const swText = sw.strong ? 'Strong' : 'Weak';
+                    ctx.save(); ctx.font = '8px sans-serif'; ctx.globalAlpha = 0.55;
+                    ctx.fillStyle = col; ctx.textBaseline = 'middle'; ctx.textAlign = 'center';
+                    const subY = isHigh ? labelY - 12 : labelY + 12;
+                    ctx.fillText(swText, x, subY);
+                    ctx.restore();
+                };
+                swingHighs.forEach(sh => drawSwing(sh, true));
+                swingLows.forEach(sl => drawSwing(sl, false));
+            }
+        }
+
+        function scheduleSmcDraw() {
+            if (tvSmcDrawPending) return;
+            tvSmcDrawPending = true;
+            requestAnimationFrame(() => { tvSmcDrawPending = false; drawSmcCanvas(); });
         }
 
         // ── Sub-pane chart helper functions ──────────────────────────────────
@@ -10464,13 +11565,13 @@ def index():
             }
         }
 
-        function applyRsiPane(allCandles, todayCandles) {
+        function applyRsiPane(allCandles, todayCandles, rsiPeriod=14) {
             const pane = document.getElementById('rsi-pane');
             if (!pane) return;
             pane.style.display = 'block';
             // Compute RSI using full history for warmup, then filter to today for display
             const allTimes   = allCandles.map(c => c.time);
-            const rsiVals    = calcRSI(allCandles.map(c => c.close));
+            const rsiVals    = calcRSI(allCandles.map(c => c.close), rsiPeriod);
             const dayStart   = tvCurrentDayStartTime || 0;
             const rsiData    = rsiVals
                 .map((v,i) => v!==null ? {time:allTimes[i],value:v} : null)
@@ -10501,13 +11602,13 @@ def index():
             }
         }
 
-        function applyMacdPane(allCandles, todayCandles) {
+        function applyMacdPane(allCandles, todayCandles, macdFast=12, macdSlow=26, macdSignal=9) {
             const pane = document.getElementById('macd-pane');
             if (!pane) return;
             pane.style.display = 'block';
             // Compute MACD using full history for warmup, then filter to today for display
             const allTimes = allCandles.map(c => c.time);
-            const macdData = calcMACD(allCandles.map(c => c.close));
+            const macdData = calcMACD(allCandles.map(c => c.close), macdFast, macdSlow, macdSignal);
             const dayStart = tvCurrentDayStartTime || 0;
             function todayOnly(pairs) { return pairs.filter(p => p !== null && p.time >= dayStart); }
             const histData = todayOnly(macdData.histogram.map((v,i) => v!==null ? {time:allTimes[i],value:v,color:v>=0?'rgba(76,175,80,0.8)':'rgba(244,67,54,0.8)'} : null));
@@ -10818,11 +11919,13 @@ def index():
                 { key:'wma50',  label:'WMA50',  title:'Weighted Moving Average (50)' },
                 { key:'vwap',   label:'VWAP',   title:'Volume Weighted Average Price' },
                 { key:'bb',     label:'BB',     title:'Bollinger Bands (20, 2)' },
+                { key:'fbb',    label:'FBB',    title:'Fibonacci Bollinger Bands (200, 3)' },
                 { key:'auto_trend', label:'Auto Trend', title:'Automatic linear-regression trend line for the current session' },
                 { key:'rsi',    label:'RSI',    title:'Relative Strength Index (14) — sub-pane' },
                 { key:'macd',   label:'MACD',   title:'MACD (12, 26, 9) — sub-pane' },
                 { key:'arv',    label:'ARV',    title:'Annualized Realized Volatility (20) — sub-pane' },
                 { key:'atr',    label:'ATR',    title:'Average True Range (14) — sub-pane' },
+                { key:'smc',    label:'SMC',    title:'Smart Money Concepts — Order Blocks, FVGs, BOS/CHoCH' },
             ];
             const indicatorPicker = document.createElement('details');
             indicatorPicker.className = 'tv-indicator-picker';
@@ -10847,15 +11950,28 @@ def index():
             const indicatorOptions = document.createElement('div');
             indicatorOptions.className = 'tv-indicator-options';
 
+            // Ensure the warn badge element exists on the summary
+            let indicatorWarnBadge = indicatorSummary.querySelector('.tv-indicator-warn-badge');
+            if (!indicatorWarnBadge) {
+                indicatorWarnBadge = document.createElement('span');
+                indicatorWarnBadge.className = 'tv-indicator-warn-badge';
+                indicatorWarnBadge.title = 'Some indicators may not have enough history from Schwab API for full warmup at this timeframe';
+                indicatorWarnBadge.textContent = '⚠';
+                indicatorSummary.appendChild(indicatorWarnBadge);
+            }
+
             function syncIndicatorSummary() {
                 const count = tvActiveInds.size;
                 indicatorBadge.textContent = String(count);
                 indicatorBadge.style.display = count ? 'inline-flex' : 'none';
+                const warned = getUnderwarnedIndicators();
+                indicatorWarnBadge.style.display = warned.length ? 'inline' : 'none';
             }
 
             function renderIndicatorOptions() {
                 const query = (indicatorSearch.value || '').trim().toLowerCase();
                 indicatorOptions.innerHTML = '';
+                const warnedSet = new Set(getUnderwarnedIndicators());
                 const matches = indicatorDefs.filter(def =>
                     def.label.toLowerCase().includes(query) || def.title.toLowerCase().includes(query)
                 );
@@ -10868,7 +11984,15 @@ def index():
                     return;
                 }
 
+                const HAS_SETTINGS = new Set(['smc','bb','fbb','rsi','macd','atr',
+                    'sma9','sma20','sma50','sma100','sma200',
+                    'ema9','ema21','ema50','ema100','ema200','wma20','wma50']);
+
                 matches.forEach(def => {
+                    const isWarned = tvActiveInds.has(def.key) && warnedSet.has(def.key);
+                    const row = document.createElement('div');
+                    row.className = 'tv-indicator-option-row' + (isWarned ? ' warmup-warn' : '');
+
                     const option = document.createElement('button');
                     option.type = 'button';
                     option.className = 'tv-indicator-option';
@@ -10884,14 +12008,36 @@ def index():
                     option.appendChild(name);
                     option.appendChild(desc);
                     option.addEventListener('click', () => {
-                        if (tvActiveInds.has(def.key)) tvActiveInds.delete(def.key);
-                        else                           tvActiveInds.add(def.key);
+                        const wasActive = tvActiveInds.has(def.key);
+                        const prevWarmup = computeRequiredWarmup();
+                        if (wasActive) tvActiveInds.delete(def.key);
+                        else           tvActiveInds.add(def.key);
                         syncIndicatorSummary();
                         renderIndicatorOptions();
-                        applyIndicators(tvIndicatorCandles, tvActiveInds);
+                        if (!wasActive && computeRequiredWarmup() > prevWarmup) {
+                            // Newly enabled indicator needs more history — re-fetch
+                            fetchPriceHistory(true);
+                        } else {
+                            applyIndicators(tvIndicatorCandles, tvActiveInds);
+                        }
                     });
 
-                    indicatorOptions.appendChild(option);
+                    row.appendChild(option);
+
+                    if (HAS_SETTINGS.has(def.key)) {
+                        const gear = document.createElement('button');
+                        gear.type = 'button';
+                        gear.className = 'tv-indicator-settings-btn';
+                        gear.textContent = '⚙';
+                        gear.title = 'Settings for ' + def.label;
+                        gear.addEventListener('click', (e) => {
+                            e.stopPropagation();
+                            openIndicatorSettings(def.key, def.label, gear);
+                        });
+                        row.appendChild(gear);
+                    }
+
+                    indicatorOptions.appendChild(row);
                 });
             }
 
@@ -11225,6 +12371,152 @@ def index():
             if (tvPriceChart) {
                 tvPriceChart.subscribeClick(tvHandleChartClick);
             }
+        }
+
+        // ── Indicator Settings Panel ──────────────────────────────────────────────
+        function getIndicatorParamDefs(key) {
+            const map = {
+                smc:    [
+                    { key:'swing_len',  label:'Swing Length',       type:'number',   default:5,    min:2, max:20 },
+                    { key:'show_ob',    label:'Order Blocks',        type:'checkbox', default:true  },
+                    { key:'show_fvg',   label:'Fair Value Gaps',     type:'checkbox', default:true  },
+                    { key:'show_bos',   label:'BOS / CHoCH',         type:'checkbox', default:true  },
+                    { key:'show_swings',label:'Swing Points',        type:'checkbox', default:true  },
+                    { key:'show_eqhl',  label:'Equal Highs/Lows',    type:'checkbox', default:true  },
+                ],
+                bb:     [{ key:'period', label:'Period', type:'number', default:20, min:2,  max:500 },
+                         { key:'mult',   label:'Std Dev', type:'number', default:2,  min:0.1,max:10, step:0.1 }],
+                fbb:    [{ key:'length', label:'Length',  type:'number', default:200,min:10, max:500 },
+                         { key:'mult',   label:'Mult',    type:'number', default:3,  min:0.1,max:10, step:0.1 }],
+                rsi:    [{ key:'period', label:'Period', type:'number', default:14, min:2,  max:100 }],
+                macd:   [{ key:'fast',   label:'Fast',   type:'number', default:12, min:2,  max:200 },
+                         { key:'slow',   label:'Slow',   type:'number', default:26, min:2,  max:500 },
+                         { key:'signal', label:'Signal', type:'number', default:9,  min:2,  max:100 }],
+                atr:    [{ key:'period', label:'Period', type:'number', default:14, min:2,  max:200 }],
+                sma9:   [{ key:'period', label:'Period', type:'number', default:9,   min:1, max:500 }],
+                sma20:  [{ key:'period', label:'Period', type:'number', default:20,  min:1, max:500 }],
+                sma50:  [{ key:'period', label:'Period', type:'number', default:50,  min:1, max:500 }],
+                sma100: [{ key:'period', label:'Period', type:'number', default:100, min:1, max:500 }],
+                sma200: [{ key:'period', label:'Period', type:'number', default:200, min:1, max:500 }],
+                ema9:   [{ key:'period', label:'Period', type:'number', default:9,   min:1, max:500 }],
+                ema21:  [{ key:'period', label:'Period', type:'number', default:21,  min:1, max:500 }],
+                ema50:  [{ key:'period', label:'Period', type:'number', default:50,  min:1, max:500 }],
+                ema100: [{ key:'period', label:'Period', type:'number', default:100, min:1, max:500 }],
+                ema200: [{ key:'period', label:'Period', type:'number', default:200, min:1, max:500 }],
+                wma20:  [{ key:'period', label:'Period', type:'number', default:20,  min:1, max:500 }],
+                wma50:  [{ key:'period', label:'Period', type:'number', default:50,  min:1, max:500 }],
+            };
+            return map[key] || [];
+        }
+
+        function openIndicatorSettings(key, label, triggerEl) {
+            // Toggle off if same key panel already open
+            const existingPanel = document.querySelector('.tv-ind-settings-panel');
+            if (existingPanel) {
+                const wasThisKey = existingPanel.dataset.key === key;
+                existingPanel.remove();
+                if (wasThisKey) return;
+            }
+
+            const params = tvIndicatorParams[key] || {};
+            const panel = document.createElement('div');
+            panel.className = 'tv-ind-settings-panel';
+            panel.dataset.key = key;
+
+            const header = document.createElement('div');
+            header.className = 'tv-ind-settings-header';
+            const title = document.createElement('span');
+            title.textContent = label + ' Settings';
+            const closeBtn = document.createElement('button');
+            closeBtn.className = 'tv-ind-settings-close';
+            closeBtn.textContent = '✕';
+            closeBtn.addEventListener('click', () => panel.remove());
+            header.appendChild(title);
+            header.appendChild(closeBtn);
+            panel.appendChild(header);
+
+            const body = document.createElement('div');
+            body.className = 'tv-ind-settings-body';
+
+            const apiNote = document.createElement('div');
+            apiNote.style.cssText = 'font-size:10px;color:var(--text-muted);padding:2px 2px 6px;border-bottom:1px solid var(--border-color);margin-bottom:4px;';
+            apiNote.textContent = `Schwab API: up to ${tvMaxIndicatorBars} bars available at current timeframe (10 trading days).`;
+            body.appendChild(apiNote);
+
+            getIndicatorParamDefs(key).forEach(pd => {
+                const row = document.createElement('div');
+                row.className = 'tv-ind-param-row';
+                const lbl = document.createElement('label');
+                lbl.className = 'tv-ind-param-label';
+                lbl.textContent = pd.label;
+
+                let input;
+                if (pd.type === 'checkbox') {
+                    input = document.createElement('input');
+                    input.type = 'checkbox';
+                    input.checked = params[pd.key] !== undefined ? !!params[pd.key] : pd.default !== false;
+                } else if (pd.type === 'color') {
+                    input = document.createElement('input');
+                    input.type = 'color';
+                    input.value = params[pd.key] || pd.default;
+                } else {
+                    input = document.createElement('input');
+                    input.type = 'number';
+                    input.min = pd.min || 1;
+                    input.max = pd.max || 999;
+                    input.step = pd.step || 1;
+                    input.value = params[pd.key] !== undefined ? params[pd.key] : pd.default;
+                }
+
+                input.addEventListener('change', () => {
+                    if (!tvIndicatorParams[key]) tvIndicatorParams[key] = {};
+                    const prevWarmup = computeRequiredWarmup();
+                    if (pd.type === 'checkbox')  tvIndicatorParams[key][pd.key] = input.checked;
+                    else if (pd.type === 'color') tvIndicatorParams[key][pd.key] = input.value;
+                    else                          tvIndicatorParams[key][pd.key] = Number(input.value);
+                    if (tvActiveInds.has(key)) {
+                        const newWarmup = computeRequiredWarmup();
+                        if (newWarmup > prevWarmup) {
+                            fetchPriceHistory(true);
+                        } else {
+                            applyIndicators(tvIndicatorCandles, tvActiveInds);
+                        }
+                    }
+                });
+
+                row.appendChild(lbl);
+                row.appendChild(input);
+                body.appendChild(row);
+            });
+
+            panel.appendChild(body);
+            document.body.appendChild(panel);
+
+            // Position the panel near the trigger element (gear button), clamped to viewport
+            const PANEL_W = 300;
+            if (triggerEl) {
+                const r = triggerEl.getBoundingClientRect();
+                let left = r.left;
+                let top = r.bottom + 6;
+                // Clamp so panel stays within viewport
+                if (left + PANEL_W > window.innerWidth - 8) left = window.innerWidth - PANEL_W - 8;
+                if (left < 8) left = 8;
+                if (top + 200 > window.innerHeight) top = r.top - 10; // flip above if near bottom
+                panel.style.left = left + 'px';
+                panel.style.top = top + 'px';
+            } else {
+                panel.style.left = Math.max(8, (window.innerWidth - PANEL_W) / 2) + 'px';
+                panel.style.top = '80px';
+            }
+
+            // Close when clicking outside
+            function onOutsideClick(e) {
+                if (!panel.contains(e.target) && e.target !== triggerEl) {
+                    panel.remove();
+                    document.removeEventListener('mousedown', onOutsideClick, true);
+                }
+            }
+            setTimeout(() => document.addEventListener('mousedown', onOutsideClick, true), 0);
         }
 
         function ensureTVHistoricalOverlay() {
@@ -11945,12 +13237,25 @@ def index():
                 // Toolbar + title (only built once)
                 buildTVToolbar(container, candles, upColor, downColor);
                 ensureTVHistoricalOverlay();
-                tvPriceChart.timeScale().subscribeVisibleLogicalRangeChange(() => scheduleTVHistoricalOverlayDraw());
+                ensureSmcOverlay();
+                tvPriceChart.timeScale().subscribeVisibleLogicalRangeChange(() => {
+                    scheduleTVHistoricalOverlayDraw();
+                    if (tvSmcData) scheduleSmcDraw();
+                });
                 if (!tvHistoricalOverlayDomEventsBound) {
                     tvHistoricalOverlayDomEventsBound = true;
-                    container.addEventListener('wheel', () => scheduleTVHistoricalOverlayDraw(), { passive: true });
-                    container.addEventListener('mouseup', () => scheduleTVHistoricalOverlayDraw());
-                    container.addEventListener('touchend', () => scheduleTVHistoricalOverlayDraw(), { passive: true });
+                    container.addEventListener('wheel', () => {
+                        scheduleTVHistoricalOverlayDraw();
+                        if (tvSmcData) scheduleSmcDraw();
+                    }, { passive: true });
+                    container.addEventListener('mouseup', () => {
+                        scheduleTVHistoricalOverlayDraw();
+                        if (tvSmcData) scheduleSmcDraw();
+                    });
+                    container.addEventListener('touchend', () => {
+                        scheduleTVHistoricalOverlayDraw();
+                        if (tvSmcData) scheduleSmcDraw();
+                    }, { passive: true });
                     container.addEventListener('mousemove', (event) => updateTVHistoricalTooltip(event));
                     container.addEventListener('mouseleave', () => {
                         const tooltip = ensureTVHistoricalTooltip();
@@ -12018,6 +13323,7 @@ def index():
             tvIndicatorCandles = (priceData.indicator_candles && priceData.indicator_candles.length > 0)
                 ? priceData.indicator_candles : candles;
             tvCurrentDayStartTime = priceData.current_day_start_time || 0;
+            tvMaxIndicatorBars = priceData.max_indicator_bars || 3900;
 
             // Start/maintain real-time streaming for the current ticker
             const streamTicker = (document.getElementById('ticker').value || '').trim();
@@ -12111,6 +13417,69 @@ def index():
         let _priceHistoryPendingRefresh = false;
         let _priceHistoryDesiredKey = '';
 
+        function computeRequiredWarmup() {
+            // Determine the minimum number of historical bars needed for all active indicators.
+            // The backend uses this to fetch enough multi-day history for proper warmup,
+            // but is always capped at what Schwab's API can actually deliver (10 trading days).
+            function p(key, field, def) { return (tvIndicatorParams[key]||{})[field] ?? def; }
+            let bars = 220; // hard floor — always enough for SMA200 / FBB200
+            const active = tvActiveInds;
+            if (active.has('sma9'))   bars = Math.max(bars, p('sma9','period',9)   + 20);
+            if (active.has('sma20'))  bars = Math.max(bars, p('sma20','period',20) + 20);
+            if (active.has('sma50'))  bars = Math.max(bars, p('sma50','period',50) + 20);
+            if (active.has('sma100')) bars = Math.max(bars, p('sma100','period',100) + 20);
+            if (active.has('sma200')) bars = Math.max(bars, p('sma200','period',200) + 20);
+            if (active.has('ema9'))   bars = Math.max(bars, p('ema9','period',9)   * 5);
+            if (active.has('ema21'))  bars = Math.max(bars, p('ema21','period',21) * 5);
+            if (active.has('ema50'))  bars = Math.max(bars, p('ema50','period',50) * 5);
+            if (active.has('ema100')) bars = Math.max(bars, p('ema100','period',100) * 5);
+            if (active.has('ema200')) bars = Math.max(bars, p('ema200','period',200) * 5);
+            if (active.has('wma20'))  bars = Math.max(bars, p('wma20','period',20)  + 20);
+            if (active.has('wma50'))  bars = Math.max(bars, p('wma50','period',50)  + 20);
+            if (active.has('bb'))     bars = Math.max(bars, p('bb','period',20)     + 20);
+            if (active.has('fbb'))    bars = Math.max(bars, p('fbb','length',200)   + 20);
+            if (active.has('rsi'))    bars = Math.max(bars, p('rsi','period',14)    * 5);
+            if (active.has('macd'))   bars = Math.max(bars, (p('macd','slow',26) + p('macd','signal',9)) * 3);
+            if (active.has('atr'))    bars = Math.max(bars, p('atr','period',14)    + 20);
+            if (active.has('smc')) {
+                const swingLen = p('smc','swing_len',5);
+                bars = Math.max(bars, swingLen * 40, 300);
+            }
+            // Never request more than the Schwab API can deliver for this timeframe
+            return Math.min(tvMaxIndicatorBars, Math.ceil(bars));
+        }
+
+        function getUnderwarnedIndicators() {
+            // Returns labels of active indicators whose warmup need exceeds what the API provides.
+            const available = tvIndicatorCandles.length || tvMaxIndicatorBars;
+            function p(key, field, def) { return (tvIndicatorParams[key]||{})[field] ?? def; }
+            const warnings = [];
+            const checks = {
+                sma9:   k => p(k,'period',9)   + 20,
+                sma20:  k => p(k,'period',20)  + 20,
+                sma50:  k => p(k,'period',50)  + 20,
+                sma100: k => p(k,'period',100) + 20,
+                sma200: k => p(k,'period',200) + 20,
+                ema9:   k => p(k,'period',9)   * 5,
+                ema21:  k => p(k,'period',21)  * 5,
+                ema50:  k => p(k,'period',50)  * 5,
+                ema100: k => p(k,'period',100) * 5,
+                ema200: k => p(k,'period',200) * 5,
+                wma20:  k => p(k,'period',20)  + 20,
+                wma50:  k => p(k,'period',50)  + 20,
+                bb:     k => p(k,'period',20)  + 20,
+                fbb:    k => p(k,'length',200) + 20,
+                rsi:    k => p(k,'period',14)  * 5,
+                macd:   k => (p(k,'slow',26) + p(k,'signal',9)) * 3,
+                atr:    k => p(k,'period',14)  + 20,
+                smc:    k => Math.max(p(k,'swing_len',5) * 40, 300),
+            };
+            tvActiveInds.forEach(key => {
+                if (checks[key] && checks[key](key) > available) warnings.push(key);
+            });
+            return warnings;
+        }
+
         function buildPricePayload() {
             const expiry = Array.from(document.querySelectorAll('.expiry-option input[type="checkbox"]:checked')).map(cb => cb.value);
             return {
@@ -12130,6 +13499,7 @@ def index():
                 exposure_metric: document.getElementById('exposure_metric').value,
                 delta_adjusted: document.getElementById('delta_adjusted_exposures').checked,
                 calculate_in_notional: document.getElementById('calculate_in_notional').checked,
+                indicator_warmup: computeRequiredWarmup(),
             };
         }
 
@@ -12200,7 +13570,11 @@ def index():
                         const chartElement = getPlotlyChartElement(chartKey);
                         if (!chartElement || chartKey === 'large_trades') return;
                         try {
-                            Plotly.Plots.resize(chartElement);
+                            if (chartKey === 'heatmap') {
+                                resizeHeatmapPlot();
+                            } else {
+                                Plotly.Plots.resize(chartElement);
+                            }
                         } catch (error) {
                             console.error(`Error resizing ${chartKey} chart:`, error);
                         }
@@ -12375,12 +13749,8 @@ def index():
             pushAllPopouts();
 
             // If a chart is currently fullscreen, ensure it resizes to fill viewport
-            const fsChart = document.querySelector('.chart-container.fullscreen');
-            if (fsChart) {
-                requestAnimationFrame(() => {
-                    const plot = fsChart.querySelector('.js-plotly-plot');
-                    if (plot) { try { Plotly.Plots.resize(plot); } catch(e) {} }
-                });
+            if (queryFullscreenCharts().length) {
+                resizeChartsAfterFullscreen();
             }
 
             // Restore scroll position after DOM updates
@@ -12473,25 +13843,17 @@ def index():
             };
         }
 
-        function buildEmUsedStatHtml(info, displayPrice) {
-            if (!info || !Number.isFinite(displayPrice)) return '';
-            const em = info.expected_move_range;
-            const high = Number(info.high);
-            const low = Number(info.low);
-            const range = high - low;
-            if (!em || em.lower == null || em.upper == null || range <= 0 || displayPrice <= 0) {
-                return '';
-            }
+        function formatIvPct(value) {
+            if (value == null || !Number.isFinite(Number(value))) return '—';
+            return `${Number(value).toFixed(1)}%`;
+        }
 
-            const emMove = Number(em.move) || ((Number(em.upper) - Number(em.lower)) / 2);
-            const emWidthPct = ((emMove * 2) / displayPrice) * 100;
-            const dayRangePct = (range / displayPrice) * 100;
-            if (emWidthPct <= 0) return '';
+        function buildIvStatsHtml(info) {
+            const iv = info && info.iv_stats;
+            if (!iv || (iv.call_vw_iv == null && iv.put_vw_iv == null)) return '';
 
-            const usedPct = (dayRangePct / emWidthPct) * 100;
-            const tip = `Today\u2019s ${dayRangePct.toFixed(2)}% range ($${low.toFixed(2)}\u2013$${high.toFixed(2)}) has used ${usedPct.toFixed(0)}% of the ATM straddle implied move (\u00b1${emWidthPct.toFixed(2)}%). Under 100% = quieter than options priced; over 100% = range already exceeded implied move.`;
-
-            return `<div class="price-info-item" data-em-used title="${escapeAttr(tip)}"><strong>EM Used</strong><span>${usedPct.toFixed(0)}%</span></div>`;
+            const tip = `Volume-weighted IV across the selected chain. Calls ${formatIvPct(iv.call_vw_iv)}, Puts ${formatIvPct(iv.put_vw_iv)}. Contracts with more volume count more.`;
+            return `<div class="price-info-item" title="${escapeAttr(tip)}"><strong>VW IV</strong><span><span style="color:${callColor}">${formatIvPct(iv.call_vw_iv)}</span>/<span style="color:${putColor}">${formatIvPct(iv.put_vw_iv)}</span></span></div>`;
         }
 
         function buildMarketContextItemsHtml() {
@@ -12556,7 +13918,7 @@ def index():
             // Use the live streamer price if available, otherwise use the fetched price
             const displayPrice = (livePrice !== null) ? livePrice : info.current_price;
             const marketContextHtml = buildMarketContextItemsHtml();
-            const emUsedHtml = buildEmUsedStatHtml(info, displayPrice);
+            const ivStatsHtml = buildIvStatsHtml(info);
             const volTip = `Share of today\u2019s options volume: ${info.call_percentage.toFixed(1)}% calls / ${info.put_percentage.toFixed(1)}% puts.`;
             const expiryTip = 'Selected option expiration date(s) driving exposure and expected-move calculations.';
             priceInfo.innerHTML = `
@@ -12581,8 +13943,8 @@ def index():
                         <strong>Vol Ratio</strong>
                         <span><span style="color: ${callColor}">${info.call_percentage.toFixed(2)}%</span>/<span style="color: ${putColor}">${info.put_percentage.toFixed(2)}%</span></span>
                     </div>
+                    ${ivStatsHtml}
                     ${expectedMoveHtml}
-                    ${emUsedHtml}
                     <div class="price-info-item" title="${escapeAttr(expiryTip)}">
                         <strong>Expiries</strong>
                         <span>${expiryText}</span>
@@ -12917,6 +14279,9 @@ def index():
                 max_level_color: document.getElementById('max_level_color').value,
                 max_level_mode: document.getElementById('max_level_mode').value,
                 em_range_locked: emRangeLocked,
+                // Indicator state
+                active_indicators: Array.from(tvActiveInds),
+                indicator_params: JSON.parse(JSON.stringify(tvIndicatorParams)),
                 // Chart visibility
                 charts: {
                     price: document.getElementById('price').checked,
@@ -13007,6 +14372,17 @@ def index():
                     const checkbox = document.getElementById(chartId);
                     if (checkbox) checkbox.checked = settings.charts[chartId];
                 });
+            }
+            // Restore indicator parameters
+            if (settings.indicator_params && typeof settings.indicator_params === 'object') {
+                Object.keys(settings.indicator_params).forEach(key => {
+                    tvIndicatorParams[key] = Object.assign(tvIndicatorParams[key] || {}, settings.indicator_params[key]);
+                });
+            }
+            // Restore active indicators
+            if (Array.isArray(settings.active_indicators) && settings.active_indicators.length > 0) {
+                tvActiveInds.clear();
+                settings.active_indicators.forEach(k => tvActiveInds.add(k));
             }
             syncMobilePanelButtons();
         }
@@ -13228,9 +14604,15 @@ def update():
         
         if calls.empty and puts.empty:
             return jsonify({'error': 'No options data found'})
-            
-        # Get current price
-        S = get_current_price(ticker)
+
+        # Reuse the spot price cached by fetch_options_for_date (from the chain response)
+        # to avoid a redundant separate quote API call.  Fall back to a live quote only if
+        # the cache is missing or unexpectedly stale (>30 s).
+        _cached_spot = _chain_spot_cache.get(ticker)
+        if _cached_spot and (time.time() - _cached_spot[1]) < 30:
+            S = _cached_spot[0]
+        else:
+            S = get_current_price(ticker)
         if S is None:
             return jsonify({'error': 'Could not fetch current price'})
 
@@ -13256,7 +14638,7 @@ def update():
                 today = current_time_est.strftime('%Y-%m-%d')
                 market_open_timestamp = int(current_time_est.replace(hour=9, minute=30, second=0, microsecond=0).timestamp())
                 
-                with closing(sqlite3.connect('options_data.db')) as conn:
+                with _db_write_lock, closing(get_options_db_connection()) as conn:
                     with closing(conn.cursor()) as cursor:
                         cursor.execute('''
                             SELECT COUNT(*) FROM centroid_data 
@@ -13402,6 +14784,8 @@ def update():
             'selected_expiries': expiry_dates  # Add this to show which expiries are selected
         })
         
+        iv_stats = compute_iv_stats(calls, puts, S)
+
         # Get fresh quote data
         try:
             # Use appropriate base ticker for market tickers
@@ -13477,7 +14861,8 @@ def update():
                     'total_volume': total_volume,
                     'call_percentage': call_percentage,
                     'put_percentage': put_percentage,
-                    'expected_move_range': expected_move_range
+                    'expected_move_range': expected_move_range,
+                    'iv_stats': iv_stats,
                 }
         except Exception as e:
             print(f"Error fetching quote data: {e}")
@@ -13496,7 +14881,8 @@ def update():
                 'total_volume': total_volume,
                 'call_percentage': call_percentage,
                 'put_percentage': put_percentage,
-                'expected_move_range': None
+                'expected_move_range': None,
+                'iv_stats': iv_stats,
             }
         
         return jsonify(response)
@@ -13593,8 +14979,9 @@ def update_price():
             calculate_in_notional = cin_val.lower() == 'true'
         else:
             calculate_in_notional = bool(cin_val)
+        indicator_warmup = int(data.get('indicator_warmup', 220))
 
-        price_data = get_price_history(ticker, timeframe=timeframe)
+        price_data = get_price_history(ticker, timeframe=timeframe, lookback_bars=indicator_warmup)
 
         # Use the most recently cached options data for exposure overlays.
         # If no cache exists yet the chart renders without overlays and
@@ -13645,6 +15032,7 @@ def update_price():
             ticker=ticker,
             selected_expiries=expiry_dates,
             show_latest_level_lines=show_latest_level_lines,
+            timeframe=timeframe,
         )
         # Inject timeframe so the popout candle-close timer knows the selected interval
         try:
@@ -13665,7 +15053,7 @@ def update_price():
 def save_settings():
     try:
         settings = request.get_json()
-        with open('settings.json', 'w') as f:
+        with open(SETTINGS_PATH, 'w') as f:
             json.dump(settings, f, indent=2)
         return jsonify({'success': True})
     except Exception as e:
@@ -13674,8 +15062,8 @@ def save_settings():
 @app.route('/load_settings')
 def load_settings():
     try:
-        if os.path.exists('settings.json'):
-            with open('settings.json', 'r') as f:
+        if os.path.exists(SETTINGS_PATH):
+            with open(SETTINGS_PATH, 'r') as f:
                 settings = json.load(f)
             return jsonify(settings)
         else:
