@@ -4,5 +4,4 @@ plotly
 python-dotenv
 pytz
 scipy
-schwabdev 
-kaleido
+schwabdev

@@ -147,6 +147,14 @@ The application uses SQLite to store historical bubble levels data:
 - Automatic database initialization
 - Stores minute-by-minute exposure data
 - Automatic cleanup of old data
+- Only regular-session data is recorded (holidays and half-days come from Schwab's market-hours API)
+- While the server is running, a background collector keeps recording the selections viewed that day about once a minute, even with no browser open
+- A page left open overnight reloads its expiry list on the new day. Selections made with the quick buttons (Today / This Wk / +1 Wk / +2 Wks / +1 Mo / All) are rules and re-apply each day and on ticker changes — Today always shows the nearest (0DTE) expiry, This Wk the rest of the current week. Hand-picked dates stay as picked; once they expire the selection is left empty until you pick again (hand-picking only today's expiry counts as 0DTE)
+- If updates keep failing (e.g. Schwab maintenance), auto-update backs off and retries on its own instead of pausing
+
+### Optional environment variables
+- `EZOPTIONS_BACKGROUND_COLLECT=0` — turn off the background history collector
+- `EZOPTIONS_DEBUG=1` — run Flask in debug mode (debugger + auto-reloader)
 
 #
 
