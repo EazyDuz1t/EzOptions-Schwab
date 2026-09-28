@@ -31,6 +31,7 @@ A real-time options trading dashboard that integrates with the Schwab API to pro
 
 ### ⚙️ Flexible Configuration
 - Multiple ticker support (SPY, SPX, etc.)
+- Index futures (/ES, /MES, /NQ, /MNQ, /RTY, /M2K, /YM, /MYM): exposures come from the cash index's options (SPX, NDX, RUT, DJX), with strikes scaled onto the futures price by the measured futures/index ratio (carry).
 - Adjustable strike range percentages
 - Customizable chart colors
 - Toggle between different chart types

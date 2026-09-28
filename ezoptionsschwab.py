@@ -14,6 +14,7 @@ import sqlite3
 from contextlib import closing
 from scipy.stats import norm
 import json
+import re
 import threading
 import queue
 
@@ -239,6 +240,68 @@ def is_market_hours():
     return bounds[0] <= now <= bounds[1]
 
 
+# Futures trade the CME Globex day: 18:00 ET to 17:00 ET the next day, Sunday evening
+# through Friday. A session is named for the day it closes, so Monday's session starts
+# Sunday 18:00. Everything else uses the regular equity session named by its ET date.
+FUTURES_SESSION_OPEN_HOUR = 18
+FUTURES_SESSION_CLOSE_HOUR = 17
+
+
+def is_futures_symbol(ticker):
+    return bool(ticker) and ticker.startswith('/')
+
+
+def session_date_for(ticker, dt=None):
+    """ET date (a date) of the trading session `dt` (default: now) belongs to for `ticker`."""
+    est = pytz.timezone('US/Eastern')
+    dt = datetime.now(est) if dt is None else dt.astimezone(est)
+    if is_futures_symbol(ticker) and dt.hour >= FUTURES_SESSION_OPEN_HOUR:
+        return (dt + timedelta(days=1)).date()
+    return dt.date()
+
+
+def session_bounds(ticker, day):
+    """(open_dt, close_dt) in ET of `ticker`'s session named `day` (a date), or None when closed."""
+    if not is_futures_symbol(ticker):
+        return get_regular_session_bounds(day)
+    if day.weekday() >= 5:
+        return None
+    est = pytz.timezone('US/Eastern')
+    base = datetime(day.year, day.month, day.day)
+    return (est.localize(base - timedelta(days=1) + timedelta(hours=FUTURES_SESSION_OPEN_HOUR)),
+            est.localize(base + timedelta(hours=FUTURES_SESSION_CLOSE_HOUR)))
+
+
+def session_bounds_ts(ticker, date_str):
+    """(open_ts, close_ts) Unix seconds of the session named `date_str`, for history queries."""
+    day = datetime.strptime(date_str, '%Y-%m-%d').date()
+    bounds = session_bounds(ticker, day)
+    if bounds is None:
+        return 0, 0  # closed that day, so nothing was recorded
+    return int(bounds[0].timestamp()), int(bounds[1].timestamp())
+
+
+def is_session_open(ticker):
+    """True while `ticker`'s trading session is live (Globex hours for futures)."""
+    if not is_futures_symbol(ticker):
+        return is_market_hours()
+    now = datetime.now(pytz.timezone('US/Eastern'))
+    bounds = session_bounds(ticker, session_date_for(ticker, now))
+    return bool(bounds) and bounds[0] <= now < bounds[1]
+
+
+def is_session_candle(ticker, ts_ms):
+    """Whether a price-history candle opening at `ts_ms` belongs on `ticker`'s chart."""
+    et = datetime.fromtimestamp(ts_ms / 1000, pytz.timezone('US/Eastern'))
+    if is_futures_symbol(ticker):
+        bounds = session_bounds(ticker, session_date_for(ticker, et))
+        return bool(bounds) and bounds[0] <= et < bounds[1]
+    if et.weekday() >= 5:
+        return False
+    # Candle times are bar-open times, so the 16:00 bar is after-hours trading
+    return (9, 30) <= (et.hour, et.minute) < (16, 0)
+
+
 INTERVAL_LEVEL_DISPLAY_NAMES = {
     'GEX': 'GEX',
     'AbsGEX': 'Abs GEX',
@@ -361,12 +424,12 @@ def store_centroid_data(ticker, price, calls, puts, expiry_key=''):
     est = pytz.timezone('US/Eastern')
     current_time_est = datetime.now(est)
     
-    # Only during today's regular session (skips holidays and half-day afternoons)
-    if not is_market_hours():
+    # Only during the ticker's live session (skips holidays and half-day afternoons)
+    if not is_session_open(ticker):
         return
     
     current_time = int(current_time_est.timestamp())
-    current_date = current_time_est.strftime('%Y-%m-%d')
+    current_date = session_date_for(ticker, current_time_est).strftime('%Y-%m-%d')
     
     # Round to nearest 5-minute interval (300 seconds)
     interval_timestamp = (current_time // 300) * 300
@@ -422,22 +485,13 @@ def store_centroid_data(ticker, price, calls, puts, expiry_key=''):
                     ))
                 conn.commit()
 
-def _market_hours_bounds(date_str):
-    """Return (open_ts, close_ts) Unix timestamps for 9:30–16:00 ET on the given date string."""
-    est = pytz.timezone('US/Eastern')
-    day = datetime.strptime(date_str, '%Y-%m-%d')
-    open_dt = est.localize(day.replace(hour=9, minute=30, second=0, microsecond=0))
-    close_dt = est.localize(day.replace(hour=16, minute=0, second=0, microsecond=0))
-    return int(open_dt.timestamp()), int(close_dt.timestamp())
-
-
 # Function to get centroid data
 def get_centroid_data(ticker, date=None, expiry_key=None):
-    """Get centroid data for current trading session only (market hours)"""
+    """Get centroid data for one trading session (the current one by default)"""
     if date is None:
-        date = datetime.now(pytz.timezone('US/Eastern')).strftime('%Y-%m-%d')
+        date = session_date_for(ticker).strftime('%Y-%m-%d')
 
-    open_ts, close_ts = _market_hours_bounds(date)
+    open_ts, close_ts = session_bounds_ts(ticker, date)
 
     with closing(get_options_db_connection()) as conn:
         with closing(conn.cursor()) as cursor:
@@ -461,12 +515,12 @@ def get_centroid_data(ticker, date=None, expiry_key=None):
 
 # Function to store interval data
 def store_interval_data(ticker, price, strike_range, calls, puts, expiry_key=''):
-    if not is_market_hours():
+    if not is_session_open(ticker):
         return
     est = pytz.timezone('US/Eastern')
     current_time_est = datetime.now(est)
     current_time = int(current_time_est.timestamp())
-    current_date = current_time_est.strftime('%Y-%m-%d')
+    current_date = session_date_for(ticker, current_time_est).strftime('%Y-%m-%d')
     
     # Store interval overlays at 1-minute resolution so they can be aggregated
     # to whatever candle timeframe the chart is using.
@@ -583,9 +637,9 @@ def store_interval_data(ticker, price, strike_range, calls, puts, expiry_key='')
 # Function to get interval data
 def get_interval_data(ticker, date=None, expiry_key=None):
     if date is None:
-        date = datetime.now(pytz.timezone('US/Eastern')).strftime('%Y-%m-%d')
+        date = session_date_for(ticker).strftime('%Y-%m-%d')
 
-    open_ts, close_ts = _market_hours_bounds(date)
+    open_ts, close_ts = session_bounds_ts(ticker, date)
 
     with closing(get_options_db_connection()) as conn:
         with closing(conn.cursor()) as cursor:
@@ -612,9 +666,9 @@ def get_interval_data(ticker, date=None, expiry_key=None):
 
 def get_interval_session_data(ticker, date=None, expiry_key=None):
     if date is None:
-        date = datetime.now(pytz.timezone('US/Eastern')).strftime('%Y-%m-%d')
+        date = session_date_for(ticker).strftime('%Y-%m-%d')
 
-    open_ts, close_ts = _market_hours_bounds(date)
+    open_ts, close_ts = session_bounds_ts(ticker, date)
 
     with closing(get_options_db_connection()) as conn:
         with closing(conn.cursor()) as cursor:
@@ -780,7 +834,7 @@ class PriceStreamer:
                         self._push(ticker, self._candle_payload(chart_time_ms, ohlcv))
                 elif service == 'CHART_FUTURES':
                     for item in msg.get('content', []):
-                        ticker = item.get('key', '').upper()
+                        ticker = self._futures_queue_key(item.get('key', ''))
                         # CHART_FUTURES fields: key, time, O, H, L, C, V
                         chart_time_ms = item.get('1')
                         if not ticker or chart_time_ms is None:
@@ -799,7 +853,7 @@ class PriceStreamer:
                         self._push(ticker, payload)
                 elif service == 'LEVELONE_FUTURES':
                     for item in msg.get('content', []):
-                        ticker = item.get('key', '').upper()
+                        ticker = self._futures_queue_key(item.get('key', ''))
                         last = item.get('3')  # field 3 = last price
                         if not ticker or last is None:
                             continue
@@ -807,6 +861,17 @@ class PriceStreamer:
                         self._push(ticker, payload)
         except Exception as e:
             print(f"[PriceStreamer] handler error: {e}")
+
+    def _futures_queue_key(self, key):
+        """Queue key for a futures stream message. A root subscription (/ES) can be answered
+        under its front-month contract (/ESZ26); route those to the root's listeners."""
+        key = key.upper()
+        parts = split_futures_symbol(key)
+        with self._lock:
+            if key in self._queues or not parts:
+                return key
+            root_symbol = '/' + parts[0]
+            return root_symbol if root_symbol in self._queues else key
 
     @staticmethod
     def _is_valid_bar(ohlcv):
@@ -910,7 +975,46 @@ def format_ticker(ticker):
         return '$NDX'  # Return $NDX for API calls
     elif ticker in ['VIX', '$VIX']:
         return '$VIX'  # Return $VIX for API calls
+    elif ticker in ['RUT', '$RUT']:
+        return '$RUT'
+    elif ticker in ['DJX', '$DJX']:
+        return '$DJX'
     return ticker
+
+
+# Schwab has no option chains for futures, so an equity-index future borrows the chain
+# of its cash index: root -> (index, index-to-futures point multiplier). DJX is 1/100
+# of the Dow, hence the 100x for YM.
+FUTURES_INDEX_PROXIES = {
+    'ES': ('$SPX', 1), 'MES': ('$SPX', 1),
+    'NQ': ('$NDX', 1), 'MNQ': ('$NDX', 1),
+    'RTY': ('$RUT', 1), 'M2K': ('$RUT', 1),
+    'YM': ('$DJX', 100), 'MYM': ('$DJX', 100),
+}
+_FUTURES_CONTRACT_SUFFIX = re.compile(r'^([FGHJKMNQUVXZ]\d{1,2})?$')  # e.g. Z26 in /ESZ26
+
+
+def split_futures_symbol(symbol):
+    """Return (root, contract_suffix) for a proxied futures symbol like /ES or /ESZ26, else None."""
+    if not symbol or not symbol.startswith('/'):
+        return None
+    body = symbol[1:].upper()
+    for root in sorted(FUTURES_INDEX_PROXIES, key=len, reverse=True):
+        if body.startswith(root) and _FUTURES_CONTRACT_SUFFIX.match(body[len(root):]):
+            return root, body[len(root):]
+    return None
+
+
+def get_futures_proxy(ticker):
+    """Return (index_ticker, multiplier) whose option chain stands in for futures `ticker`, else None."""
+    parts = split_futures_symbol(ticker)
+    return FUTURES_INDEX_PROXIES[parts[0]] if parts else None
+
+
+def option_underlying(ticker):
+    """The ticker whose option chain describes `ticker` (the cash index for proxied futures)."""
+    proxy = get_futures_proxy(ticker)
+    return proxy[0] if proxy else ticker
 
 def format_display_ticker(ticker):
     """Helper function to format tickers for display and data filtering"""
@@ -928,6 +1032,12 @@ def format_display_ticker(ticker):
     elif ticker in ['$VIX', 'VIX']:
         # For VIX, return VIX for options symbols and $VIX for underlying
         return ['VIX', '$VIX']
+    elif ticker in ['$RUT', 'RUT']:
+        # PM-settled RUTW, like SPXW for SPX
+        return ['RUTW', '$RUT']
+    elif ticker in ['$DJX', 'DJX']:
+        # PM-settled DJXW, like SPXW for SPX
+        return ['DJXW', '$DJX']
     elif ticker == 'MARKET2':
         return ['SPY']
     return [ticker]
@@ -979,19 +1089,34 @@ def get_strike_interval(strikes):
     interval_counts = Counter([round(i, 2) for i in intervals])
     return interval_counts.most_common(1)[0][0]
 
-def round_to_strike(value, strike_interval):
-    """Round a value to the nearest strike interval"""
+def get_strike_grid(strikes):
+    """(interval, anchor) of the grid most strikes sit on: the most common spacing and the
+    grid's offset from zero. Listed strikes sit on multiples of their spacing (anchor 0);
+    index strikes mapped onto a futures price sit on a shifted grid (7661.79, 7666.83, ...)."""
+    interval = get_strike_interval(strikes)
+    if not strikes:
+        return interval, 0.0
+    from collections import Counter
+    offsets = Counter()
+    for strike in strikes:
+        offset = round(strike % interval, 2)
+        offsets[0.0 if offset >= round(interval, 2) else offset] += 1
+    return interval, offsets.most_common(1)[0][0]
+
+def round_to_strike(value, strike_interval, anchor=0.0):
+    """Round a value to the nearest point of the strike grid anchor + n * strike_interval"""
     # Round half up; Python's round() uses banker's rounding, which sends half strikes
     # to alternating neighbours (212.5 -> 210 but 217.5 -> 220).
-    return math.floor(value / strike_interval + 0.5) * strike_interval
+    return anchor + math.floor((value - anchor) / strike_interval + 0.5) * strike_interval
 
-def aggregate_by_strike(df, value_columns, strike_interval):
-    """Aggregate dataframe by rounded strike prices"""
+def aggregate_by_strike(df, value_columns, strike_grid):
+    """Aggregate dataframe by strike rounded onto `strike_grid` (from get_strike_grid)"""
     if df.empty:
         return df
-    
+
+    strike_interval, anchor = strike_grid
     df = df.copy()
-    df['rounded_strike'] = df['strike'].apply(lambda x: round_to_strike(x, strike_interval))
+    df['rounded_strike'] = df['strike'].apply(lambda x: round_to_strike(x, strike_interval, anchor))
     
     # Build aggregation dict for value columns
     agg_dict = {}
@@ -1064,6 +1189,8 @@ _INDEX_OPTION_SYMBOL_CANDIDATES = {
     '$SPX': ['$SPX', 'SPX', '$SPX.X'],
     '$NDX': ['$NDX', 'NDX', '$NDX.X'],
     '$VIX': ['$VIX', 'VIX', '$VIX.X'],
+    '$RUT': ['$RUT', 'RUT', '$RUT.X'],
+    '$DJX': ['$DJX', 'DJX', '$DJX.X'],
 }
 _resolved_option_symbols = {}  # ticker -> symbol Schwab accepts for option endpoints
 
@@ -1093,6 +1220,7 @@ def resolve_option_symbol(ticker):
 
 def _fetch_chain_json(ticker, from_date, to_date):
     """Fetch (or reuse a very recent) raw Schwab option chain for [from_date, to_date]."""
+    ticker = option_underlying(ticker)
     key = (ticker, from_date, to_date)
     with _chain_cache_lock:
         cached = _chain_cache.get(key)
@@ -1130,7 +1258,19 @@ def fetch_options_for_date(ticker, date, exposure_metric="Open Interest", delta_
     chain response; only the contracts expiring on `date` are used."""
     if client is None:
         raise Exception("Schwab API client not initialized. Check your environment variables.")
-    
+
+    futures_proxy = get_futures_proxy(ticker)
+    if futures_proxy:
+        index_ticker, multiplier = futures_proxy
+        futures_price = get_futures_price(ticker)
+        ratio = get_futures_index_ratio(ticker)
+        # Price the index options off the futures-implied index level: it keeps moving
+        # through the Globex session while the index's own quote is frozen at the close.
+        calls, puts = fetch_options_for_date(
+            index_ticker, date, exposure_metric, delta_adjusted, calculate_in_notional,
+            S=futures_price / (ratio * multiplier), chain=chain)
+        return map_index_options_to_futures(ticker, calls, puts, futures_price, ratio)
+
     if ticker == "MARKET" or ticker == "MARKET2":
         # MARKET: synthetic SPX-centered view blending $SPX + SPY exposures.
         # Raw dollar-notional exposures are mapped onto the SPX strike grid via moneyness.
@@ -1250,14 +1390,15 @@ def fetch_options_for_date(ticker, date, exposure_metric="Open Interest", delta_
         expiry = datetime.strptime(date, '%Y-%m-%d').date()
         if chain is None:
             chain = _fetch_chain_json(ticker, expiry.strftime('%Y-%m-%d'), expiry.strftime('%Y-%m-%d'))
-        S = float(chain.get('underlyingPrice', 0))
-        if S == 0:
-            S = get_current_price(ticker)
         if S is None:
-            return pd.DataFrame(), pd.DataFrame()
+            S = float(chain.get('underlyingPrice', 0))
+            if S == 0:
+                S = get_current_price(ticker)
+            if S is None:
+                return pd.DataFrame(), pd.DataFrame()
 
-        # Cache spot price so /update can skip a redundant quote API call
-        _chain_spot_cache[ticker] = (S, time.time())
+            # Cache spot price so /update can skip a redundant quote API call
+            _chain_spot_cache[ticker] = (S, time.time())
 
         # Calculate time to expiration in years (60-min CBOE floor applied inside)
         t = calculate_time_to_expiration(expiry)
@@ -1478,14 +1619,139 @@ def get_current_price(ticker):
         quote_response = client.quotes(ticker)
         if not quote_response.ok:
             raise Exception(f"Failed to fetch quote: {quote_response.status_code} {quote_response.reason}")
-        quote = quote_response.json()
-        if quote and ticker in quote:
-            return quote[ticker]['quote']['lastPrice']
+        entry = quote_entry(quote_response.json(), ticker)
+        if entry:
+            return entry['quote']['lastPrice']
         raise Exception("Malformed quote data returned from Schwab API")
     except Exception as e:
         msg = f"Error fetching price from Schwab API: {e}"
         print(msg)
         raise Exception(msg)
+
+
+def quote_entry(quote_json, symbol):
+    """Return `symbol`'s entry from a Schwab quotes payload. A futures root (/ES) may come
+    back keyed by its front-month contract (/ESZ26), so fall back to a lone entry."""
+    if not quote_json:
+        return None
+    if symbol in quote_json:
+        return quote_json[symbol]
+    entries = [v for v in quote_json.values() if isinstance(v, dict) and 'quote' in v]
+    return entries[0] if len(entries) == 1 else None
+
+
+def get_quote_json(symbol, max_age=_QUOTE_CACHE_TTL_SEC):
+    """Full Schwab quote payload for `symbol`, reused from _quote_cache when younger than max_age."""
+    cached = _quote_cache.get(symbol)
+    if cached and (time.time() - cached[1]) < max_age:
+        return cached[0]
+    # quotes() sends the symbol as a query parameter; quote() puts it in the URL path,
+    # where the slash of a futures symbol doesn't survive.
+    quote_response = client.quotes(symbol)
+    if not quote_response.ok:
+        raise Exception(f"Failed to fetch quote for {symbol}: {quote_response.status_code} {quote_response.reason}")
+    quote_json = quote_response.json()
+    _quote_cache[symbol] = (quote_json, time.time())
+    return quote_json
+
+
+def get_futures_quote(ticker):
+    """Quote entry for a futures symbol; /update polls every second, so share a short-lived quote.
+    A root like /ES is answered by its current front-month contract (entry['symbol'] = /ESZ26)."""
+    entry = quote_entry(get_quote_json(ticker, max_age=_CHAIN_CACHE_TTL_SEC), ticker)
+    if not entry:
+        raise Exception(f"Malformed futures quote for {ticker}")
+    return entry
+
+
+def get_futures_price(ticker):
+    return float(get_futures_quote(ticker)['quote']['lastPrice'])
+
+
+# Futures trade at a carry premium to their cash index: F = S * e^((r - q) * T). The premium
+# is proportional to the index level, so a price K on the index corresponds to K * F / S on
+# the future. Index strikes are mapped with that ratio, measured as the median F / S over
+# the latest minute bars both traded. Measured from the market, it already reflects the
+# rates and dividends traders are pricing. It drifts slowly, so it is re-measured every 15
+# minutes; one measured at the cash close stays right overnight while the index is frozen.
+# A contract roll (/ESZ26 -> /ESH27) changes it at once, so a new contract re-measures now.
+_FUTURES_RATIO_TTL_SEC = 900
+_FUTURES_RATIO_SAMPLE_BARS = 30
+_futures_ratio_cache = {}  # futures ticker -> (ratio, computed_at_unix_ts, contract)
+_futures_ratio_lock = threading.Lock()
+
+
+def _minute_closes(symbol):
+    # Without an explicit endDate Schwab leaves today's bars out of index history
+    response = client.price_history(
+        symbol=symbol, periodType='day', period=2, frequencyType='minute', frequency=1,
+        endDate=int(time.time() * 1000), needExtendedHoursData=True,
+    )
+    if not response.ok:
+        raise Exception(f"price history for {symbol}: {response.status_code} {response.reason}")
+    return {c['datetime']: c['close'] for c in (response.json() or {}).get('candles') or []}
+
+
+def _ratio_from_history(contract, index_ticker, multiplier):
+    futures_closes = _minute_closes(contract)
+    index_closes = _minute_closes(index_ticker)
+    shared_bars = sorted(set(futures_closes) & set(index_closes))[-_FUTURES_RATIO_SAMPLE_BARS:]
+    if len(shared_bars) < 5:
+        return None
+    return float(np.median([futures_closes[t] / (index_closes[t] * multiplier) for t in shared_bars]))
+
+
+def get_futures_index_ratio(ticker):
+    """Futures price per point of (index * multiplier) for `ticker`'s current contract."""
+    index_ticker, multiplier = get_futures_proxy(ticker)
+    # Measure against the exact contract so bars from before a roll can't mix in
+    contract = get_futures_quote(ticker).get('symbol') or ticker
+    with _futures_ratio_lock:
+        cached = _futures_ratio_cache.get(ticker)
+        if cached and cached[2] != contract:
+            cached = None  # rolled to a new contract
+        if cached and (time.time() - cached[1]) < _FUTURES_RATIO_TTL_SEC:
+            return cached[0]
+        ratio = None
+        try:
+            ratio = _ratio_from_history(contract, index_ticker, multiplier)
+        except Exception as e:
+            print(f"Futures/index ratio from price history failed for {contract}: {e}")
+        if ratio is None:
+            if cached:
+                return cached[0]
+            if not is_market_hours():
+                # Outside the cash session the index quote is stale while futures move,
+                # so a live quote ratio would include the overnight move.
+                raise Exception(f"Could not measure {contract} against {index_ticker}")
+            ratio = get_futures_price(ticker) / (float(get_current_price(index_ticker)) * multiplier)
+        _futures_ratio_cache[ticker] = (ratio, time.time(), contract)
+        print(f"{contract} vs {index_ticker}: ratio {ratio:.6f}")
+        return ratio
+
+
+def map_index_options_to_futures(ticker, calls, puts, futures_price, ratio):
+    """Re-express index option frames on the futures price scale: strikes and option prices
+    (so expected moves come out in futures points) scale by multiplier * ratio. The real
+    contract strike stays in index_strike and the scale in index_price_scale, so the options
+    chain can show the actual index contracts. Greeks and exposures stay as computed against
+    the index, whose options are what dealers are actually hedging. Strikes are left
+    unrounded so they keep the index's even spacing (5 SPX points become ~5.04 ES points);
+    rounding them to the futures tick would make that spacing uneven."""
+    _, multiplier = get_futures_proxy(ticker)
+    scale = multiplier * ratio
+    mapped = []
+    for df in (calls, puts):
+        if not df.empty:
+            df = df.copy()
+            df['index_strike'] = df['strike']
+            df['index_price_scale'] = scale
+            df['strike'] = df['strike'] * scale
+            for col in ('lastPrice', 'bid', 'ask'):
+                df[col] = df[col] * scale
+        mapped.append(df)
+    _chain_spot_cache[ticker] = (futures_price, time.time())
+    return mapped[0], mapped[1]
 
 def get_option_expirations(ticker):
     if client is None:
@@ -1495,6 +1761,8 @@ def get_option_expirations(ticker):
         ticker = "$SPX"
     elif ticker == "MARKET2":
         ticker = "SPY"
+    first_live = first_live_expiry_date(ticker)
+    ticker = option_underlying(ticker)
     try:
         expiration_dates = []
         expiration_chain_error = None
@@ -1528,8 +1796,7 @@ def get_option_expirations(ticker):
         # SPX lists some dates under both the SPX and SPXW roots; selecting a duplicate
         # would double-count that expiry's exposure. Schwab can keep listing yesterday's
         # expiry for a while after midnight; it has no chain anymore, so drop it.
-        today = _today_et_str()
-        return sorted(d for d in set(expiration_dates) if d >= today)
+        return sorted(d for d in set(expiration_dates) if d >= first_live)
     except Exception as e:
         msg = f"Error fetching option expirations: {e}"
         print(msg)
@@ -1540,27 +1807,33 @@ _EXPIRATIONS_CACHE_TTL_SEC = 600
 _expirations_cache = {}  # ticker -> (dates, fetched_at_unix_ts)
 
 
-def _today_et_str():
-    return datetime.now(pytz.timezone('US/Eastern')).strftime('%Y-%m-%d')
+def first_live_expiry_date(ticker=None):
+    """Earliest expiry date (YYYY-MM-DD) still worth showing for `ticker`. Futures trade on
+    past the 16:00 ET options close, so for them today's expiry is over at 16:00; other
+    tickers keep it until midnight ET."""
+    now = datetime.now(pytz.timezone('US/Eastern'))
+    if is_futures_symbol(ticker) and now.hour >= 16:
+        now += timedelta(days=1)
+    return now.strftime('%Y-%m-%d')
 
 
 def get_cached_option_expirations(ticker):
     cached = _expirations_cache.get(ticker)
     if cached and (time.time() - cached[1]) < _EXPIRATIONS_CACHE_TTL_SEC:
-        # A list cached just before midnight must not hand out yesterday's expiry
-        today = _today_et_str()
-        return [d for d in cached[0] if d >= today]
+        # A list cached just before the cutoff must not hand out an expired expiry
+        first_live = first_live_expiry_date(ticker)
+        return [d for d in cached[0] if d >= first_live]
     dates = get_option_expirations(ticker)
     _expirations_cache[ticker] = (dates, time.time())
     return dates
 
 
-def split_expired_expiries(expiry_dates):
-    """Split a selection into (live, expired) by ET date. What replaces an expired
+def split_expired_expiries(expiry_dates, ticker=None):
+    """Split a selection into (live, expired) by first_live_expiry_date. What replaces an expired
     selection is the page's call (its 0DTE / week rules roll forward, hand-picked dates don't)."""
-    today = _today_et_str()
-    live = [d for d in expiry_dates if str(d)[:10] >= today]
-    expired = [d for d in expiry_dates if str(d)[:10] < today]
+    first_live = first_live_expiry_date(ticker)
+    live = [d for d in expiry_dates if str(d)[:10] >= first_live]
+    expired = [d for d in expiry_dates if str(d)[:10] < first_live]
     return live, expired
 
 
@@ -1878,14 +2151,14 @@ def create_exposure_heatmap(calls, puts, S, strike_range=0.02, show_calls=True, 
     puts_df = puts_df[(puts_df['strike'] >= min_strike) & (puts_df['strike'] <= max_strike)]
 
     all_strikes = list(calls_df['strike']) + list(puts_df['strike'])
-    strike_interval = get_strike_interval(all_strikes) if all_strikes else 1.0
+    strike_interval, strike_anchor = get_strike_grid(all_strikes) if all_strikes else (1.0, 0.0)
 
     def aggregate_heatmap_frame(df):
         if df.empty:
             return pd.DataFrame(columns=['expiration_label', 'strike', value_column])
 
         working = df.copy()
-        working['strike'] = working['strike'].apply(lambda value: round_to_strike(value, strike_interval))
+        working['strike'] = working['strike'].apply(lambda value: round_to_strike(value, strike_interval, strike_anchor))
         working['expiration_label'] = working['expiration'].astype(str)
         return working.groupby(['expiration_label', 'strike'], as_index=False)[value_column].sum()
 
@@ -2198,9 +2471,10 @@ def create_exposure_chart(calls, puts, exposure_type, title, S, strike_range=0.0
     # Determine strike interval and aggregate by rounded strikes
     all_strikes = list(calls_df['strike']) + list(puts_df['strike'])
     if all_strikes:
-        strike_interval = get_strike_interval(all_strikes)
-        calls_df = aggregate_by_strike(calls_df, [exposure_type], strike_interval)
-        puts_df = aggregate_by_strike(puts_df, [exposure_type], strike_interval)
+        strike_grid = get_strike_grid(all_strikes)
+        strike_interval = strike_grid[0]
+        calls_df = aggregate_by_strike(calls_df, [exposure_type], strike_grid)
+        puts_df = aggregate_by_strike(puts_df, [exposure_type], strike_grid)
     
     # Calculate total net exposure from the entire chain (not just strike range)
     total_call_exposure = calls[exposure_type].sum() if not calls.empty and exposure_type in calls.columns else 0
@@ -2607,9 +2881,10 @@ def create_options_volume_chart(calls, puts, S, strike_range=0.02, call_color='#
     # Determine strike interval and aggregate by rounded strikes
     all_strikes = list(calls['strike']) + list(puts['strike'])
     if all_strikes:
-        strike_interval = get_strike_interval(all_strikes)
-        calls = aggregate_by_strike(calls, ['volume'], strike_interval)
-        puts = aggregate_by_strike(puts, ['volume'], strike_interval)
+        strike_grid = get_strike_grid(all_strikes)
+        strike_interval = strike_grid[0]
+        calls = aggregate_by_strike(calls, ['volume'], strike_grid)
+        puts = aggregate_by_strike(puts, ['volume'], strike_grid)
     
     # Create figure
     fig = go.Figure()
@@ -2909,17 +3184,23 @@ def aggregate_to_hourly(candles):
 # Requesting a wider date range via startDate/endDate simply returns no extra candles.
 SCHWAB_MAX_MINUTE_TRADING_DAYS = 10
 
-# Realistic bars per trading day for each supported timeframe (390 min market session).
+# Realistic bars per trading day for each supported timeframe (390 min market session,
+# 1380 min Globex day for futures).
 _BARS_PER_DAY = {1: 390, 5: 78, 10: 39, 15: 26, 30: 13, 60: 7}
+_FUTURES_BARS_PER_DAY = {1: 1380, 5: 276, 10: 138, 15: 92, 30: 46, 60: 23}
 
 
-def schwab_max_bars(timeframe):
+def bars_per_day(timeframe, ticker=None):
+    table = _FUTURES_BARS_PER_DAY if is_futures_symbol(ticker) else _BARS_PER_DAY
+    return table.get(int(timeframe), table[5])
+
+
+def schwab_max_bars(timeframe, ticker=None):
     """Return the absolute maximum indicator-warmup bars the Schwab API can deliver."""
-    bpd = _BARS_PER_DAY.get(int(timeframe), 78)
-    return SCHWAB_MAX_MINUTE_TRADING_DAYS * bpd
+    return SCHWAB_MAX_MINUTE_TRADING_DAYS * bars_per_day(timeframe, ticker)
 
 
-def _price_history_params(timeframe, lookback_bars=220):
+def _price_history_params(timeframe, lookback_bars=220, ticker=None):
     """
     Return (period_type, period, calendar_span_days) for the Schwab price-history call.
 
@@ -2927,7 +3208,7 @@ def _price_history_params(timeframe, lookback_bars=220):
     We always request that full window so indicators have the most context possible,
     but we never ask for more than the API can deliver.
     """
-    bpd = _BARS_PER_DAY.get(int(timeframe), 78)
+    bpd = bars_per_day(timeframe, ticker)
     max_bars = SCHWAB_MAX_MINUTE_TRADING_DAYS * bpd
 
     # Clamp the caller's request to what the API can actually return
@@ -2954,7 +3235,7 @@ def get_price_history(ticker, timeframe=1, lookback_bars=220):
         # Schwab API only supports minute frequencies: 1, 5, 10, 15, 30.
         # For 60-min (hourly), fetch 30-min candles and aggregate after.
         api_frequency = 30 if timeframe == 60 else timeframe
-        period_type, period, calendar_span_days = _price_history_params(timeframe, lookback_bars=lookback_bars)
+        period_type, period, calendar_span_days = _price_history_params(timeframe, lookback_bars=lookback_bars, ticker=ticker)
         start_date = datetime.combine(current_date - timedelta(days=calendar_span_days), datetime.min.time())
         end_date = datetime.combine(current_date + timedelta(days=1), datetime.min.time())
 
@@ -2977,8 +3258,8 @@ def get_price_history(ticker, timeframe=1, lookback_bars=220):
         if not data or 'candles' not in data:
             raise Exception("Malformed price history data from Schwab API")
 
-        # Filter for market hours
-        candles = filter_market_hours(data['candles'])
+        # Keep the ticker's session (regular hours; the full Globex day for futures)
+        candles = filter_market_hours(data['candles'], ticker)
         if not candles:
             raise Exception("No market-hour candles returned from Schwab API")
 
@@ -2989,42 +3270,28 @@ def get_price_history(ticker, timeframe=1, lookback_bars=220):
         if timeframe == 60:
             candles = aggregate_to_hourly(candles)
 
-        # Get previous trading day's close
-        prev_day_candles = []
-        for candle in reversed(candles):
-            candle_time = datetime.fromtimestamp(candle['datetime']/1000, pytz.timezone('US/Eastern'))
-            if candle_time.date() < current_date:
-                prev_day_candles.append(candle)
-                if len(prev_day_candles) >= 30:  # Get at least 30 minutes of data
-                    break
+        if is_futures_symbol(ticker):
+            # Globex days are 3.5x longer than cash sessions; send the latest session plus only
+            # the earlier bars indicator warmup needs, not every day of the request window.
+            latest_session = candle_session_date(ticker, candles[-1])
+            session_start = next(i for i, c in enumerate(candles)
+                                 if candle_session_date(ticker, c) == latest_session)
+            candles = candles[max(0, session_start - int(lookback_bars)):]
 
-        # Get the last candle of the previous trading day (first one found iterating backwards)
-        prev_day_close = prev_day_candles[0]['close'] if prev_day_candles else None
-
-        return {
-            'candles': candles,
-            'prev_day_close': prev_day_close
-        }
+        return {'candles': candles}
     except Exception as e:
         msg = f"[DEBUG] Error fetching price history: {e}"
         print(msg)
         raise Exception(msg)
 
-def filter_market_hours(candles):
-    """Filter candles to only include regular market hours (9:30 AM - 4:00 PM ET)"""
-    filtered_candles = []
-    for candle in candles:
-        dt = datetime.fromtimestamp(candle['datetime']/1000)
-        # Convert to Eastern Time
-        et = dt.astimezone(pytz.timezone('US/Eastern'))
-        # Check if it's a weekday and within market hours
-        if et.weekday() < 5:  # 0-4 is Monday-Friday
-            market_open = et.replace(hour=9, minute=30, second=0, microsecond=0)
-            market_close = et.replace(hour=16, minute=0, second=0, microsecond=0)
-            # Candle times are bar-open times, so the 16:00 bar is after-hours trading
-            if market_open <= et < market_close:
-                filtered_candles.append(candle)
-    return filtered_candles
+def filter_market_hours(candles, ticker=None):
+    """Keep candles inside `ticker`'s session: 9:30 AM - 4:00 PM ET, or Globex hours for futures."""
+    return [c for c in candles if is_session_candle(ticker, c['datetime'])]
+
+
+def candle_session_date(ticker, candle):
+    """Session date (a date) a price-history candle belongs to."""
+    return session_date_for(ticker, datetime.fromtimestamp(candle['datetime'] / 1000, pytz.timezone('US/Eastern')))
 
 def convert_to_heikin_ashi(candles):
     """Convert regular OHLC candles to Heikin-Ashi candles"""
@@ -3309,30 +3576,22 @@ def prepare_price_chart_data(price_data, calls=None, puts=None, exposure_levels_
     if not price_data or 'candles' not in price_data or not price_data['candles']:
         return _json.dumps({'error': 'No price data'})
 
-    candles = filter_market_hours(price_data['candles'])
+    candles = filter_market_hours(price_data['candles'], ticker)
     if not candles:
         return _json.dumps({'error': 'No market-hour candles'})
 
-    est = pytz.timezone('US/Eastern')
-    current_date = datetime.now(est).date()
+    # "Day" means the ticker's trading session: the ET date for stocks and indexes, the
+    # Globex day (18:00 ET the evening before to 17:00 ET) for futures.
+    current_date = session_date_for(ticker)
 
     # Deduplicate and sort
-    unique_candles = {}
-    for c in candles:
-        t = datetime.fromtimestamp(c['datetime'] / 1000, est)
-        unique_candles[t] = c
-    sorted_candles = [c for _, c in sorted(unique_candles.items(), key=lambda x: x[0])]
+    unique_candles = {c['datetime']: c for c in candles}
+    sorted_candles = [unique_candles[ts] for ts in sorted(unique_candles)]
+    session_dates = [candle_session_date(ticker, c) for c in sorted_candles]
 
-    # Filter to current day
-    current_day_candles = [c for c in sorted_candles
-                           if datetime.fromtimestamp(c['datetime'] / 1000, est).date() == current_date]
-    display_date = current_date
-    if not current_day_candles:
-        most_recent_date = max(
-            datetime.fromtimestamp(c['datetime'] / 1000, est).date() for c in sorted_candles)
-        display_date = most_recent_date
-        current_day_candles = [c for c in sorted_candles
-                               if datetime.fromtimestamp(c['datetime'] / 1000, est).date() == most_recent_date]
+    # Filter to current session, else the most recent one (weekends, before the open)
+    display_date = current_date if current_date in session_dates else max(session_dates)
+    current_day_candles = [c for c, day in zip(sorted_candles, session_dates) if day == display_date]
 
     # Apply Heikin-Ashi using all candles as seed, then slice to current day
     if use_heikin_ashi:
@@ -3342,13 +3601,11 @@ def prepare_price_chart_data(price_data, calls=None, puts=None, exposure_levels_
     else:
         display_candles = current_day_candles
 
-    # Previous day close
-    previous_day_close = None
-    for c in reversed(sorted_candles):
-        t = datetime.fromtimestamp(c['datetime'] / 1000, est)
-        if t.date() < current_date:
-            previous_day_close = c['close']
-            break
+    # Previous session's close
+    previous_day_close = next(
+        (c['close'] for c, day in zip(reversed(sorted_candles), reversed(session_dates)) if day < display_date),
+        None,
+    )
 
     # Build Lightweight Charts candle data (time in seconds UTC)
     lc_candles = []
@@ -3523,7 +3780,7 @@ def prepare_price_chart_data(price_data, calls=None, puts=None, exposure_levels_
         'historical_expected_moves': historical_expected_moves,
         'indicator_candles': lc_indicator_candles,
         'indicator_candles_count': len(lc_indicator_candles),
-        'max_indicator_bars': schwab_max_bars(timeframe),
+        'max_indicator_bars': schwab_max_bars(timeframe, ticker),
         'current_day_start_time': current_day_start_time,
     })
 
@@ -3601,12 +3858,18 @@ OPTIONS_CHAIN_CSS = '''
 .oc-stats .oc-em-stat { color: var(--oc-em); font-weight: 600; }
 .oc-stats .oc-em-stat small { font-size: 10px; font-weight: 400; color: var(--text-muted, #888); margin-left: 4px; }
 .oc-empty { padding: 30px; text-align: center; color: var(--text-muted, #888); font-size: 12px; }
+.oc-note { margin: 0 auto; max-width: 720px; padding: 6px 10px; border: 1px solid var(--oc-em-edge, #d4a017); border-radius: 6px; font-size: 11px; line-height: 1.45; color: var(--text-secondary, #ccc); text-align: center; }
+.oc-note b { color: var(--text-primary, #fff); }
+.oc-table td.k small.oc-fut { display: block; font-size: 9.5px; font-weight: 400; color: var(--text-muted, #888); }
 </style>
 '''
 
 
-def _build_chain_section(calls, puts, S, strike_range):
-    """Render one expiry's chain: its stats header and the calls | strike | puts table."""
+def _build_chain_section(calls, puts, S, strike_range, proxy=None):
+    """Render one expiry's chain: its stats header and the calls | strike | puts table.
+    `proxy` = {'future', 'index', 'scale'} when the chain is a cash index's options standing
+    in for a future: rows are then the index contracts (their real strikes and prices) with
+    the equivalent futures level shown under each strike."""
     expected_move = calculate_expected_move_snapshot(calls, puts, S)
 
     min_strike = S * (1 - strike_range)
@@ -3615,14 +3878,20 @@ def _build_chain_section(calls, puts, S, strike_range):
     calls = calls[(calls['strike'] >= min_strike) & (calls['strike'] <= max_strike)]
     puts = puts[(puts['strike'] >= min_strike) & (puts['strike'] <= max_strike)]
 
+    index_strikes = {}  # futures-scale strike -> real index contract strike
+
     def collect(df):
         quotes = {}
         for _, row in df.iterrows():
             strike = float(row['strike'])
+            # Futures-scale premiums back to the index contract's own quote
+            price_scale = float(row['index_price_scale']) if proxy else 1.0
+            if proxy:
+                index_strikes[strike] = float(row['index_strike'])
             quote = {
-                'bid': float(row['bid']),
-                'ask': float(row['ask']),
-                'last': float(row['lastPrice']),
+                'bid': float(row['bid']) / price_scale,
+                'ask': float(row['ask']) / price_scale,
+                'last': float(row['lastPrice']) / price_scale,
                 'volume': int(row['volume']),
                 'openInterest': int(row['openInterest']),
                 'iv': float(row['impliedVolatility']),
@@ -3682,7 +3951,7 @@ def _build_chain_section(calls, puts, S, strike_range):
                 f'{label}<span class="oc-sort">▼▲</span></th>')
 
     col_headers = ''.join(header_cell(label, i, 'c') for i, (label, _) in enumerate(call_cols))
-    col_headers += header_cell('Strike', strike_col, 'k')
+    col_headers += header_cell(f"{proxy['index']} Strike" if proxy else 'Strike', strike_col, 'k')
     col_headers += ''.join(header_cell(label, strike_col + 1 + i, 'p') for i, (label, _) in enumerate(put_cols))
 
     def data_cell(quote, field, side, itm, peak_oi, peak_vol):
@@ -3732,7 +4001,7 @@ def _build_chain_section(calls, puts, S, strike_range):
                        f'<td class="mk{em_cls}"><span class="oc-pill">{label}</span></td>'
                        f'<td colspan="{len(put_cols)}"></td></tr>')
 
-    markers = [marker_row(S, 'oc-spot', f'{S:,.2f}')]
+    markers = [marker_row(S, 'oc-spot', f"{proxy['future']} {S:,.2f}" if proxy else f'{S:,.2f}')]
 
     rows = []
     for strike in strikes:
@@ -3743,7 +4012,12 @@ def _build_chain_section(calls, puts, S, strike_range):
         cells = [data_cell(call_q, field, 'c', strike < S, peak_call_oi, peak_call_vol) for _, field in call_cols]
         atm_cls = ' atm' if strike == atm_strike else ''
         em_cls = ' in-em' if in_em(strike) else ''
-        cells.append(f'<td class="k{atm_cls}{em_cls}" data-sort="{strike}">{fmt_strike(strike)}</td>')
+        if proxy:
+            strike_text = (f'{fmt_strike(index_strikes[strike])}'
+                           f'<small class="oc-fut" title="Equivalent {proxy["future"]} level">≈ {strike:,.2f}</small>')
+        else:
+            strike_text = fmt_strike(strike)
+        cells.append(f'<td class="k{atm_cls}{em_cls}" data-sort="{strike}">{strike_text}</td>')
         cells += [data_cell(put_q, field, 'p', strike > S, peak_put_oi, peak_put_vol) for _, field in put_cols]
         rows.append(f'<tr>{"".join(cells)}</tr>')
     if strikes:
@@ -3759,8 +4033,15 @@ def _build_chain_section(calls, puts, S, strike_range):
         em_header = f'<th class="k">{S:,.2f}</th>'
         em_stat = ''
 
+    if proxy:
+        spot_stats = (f'<span><em>{proxy["future"]}</em>{S:,.2f}</span>'
+                      f'<span><em>{proxy["index"]} equiv</em>{S / proxy["scale"]:,.2f}</span>')
+    else:
+        spot_stats = f'<span><em>Spot</em>{S:,.2f}</span>'
+
     if strikes:
-        colgroup = '<col>' * len(call_cols) + '<col style="width: 11%">' + '<col>' * len(put_cols)
+        strike_width = '15%' if proxy else '11%'
+        colgroup = '<col>' * len(call_cols) + f'<col style="width: {strike_width}">' + '<col>' * len(put_cols)
         body = f'''
         <div class="oc-scroll">
             <table class="oc-table">
@@ -3778,7 +4059,7 @@ def _build_chain_section(calls, puts, S, strike_range):
     return f'''
             <div class="oc-section-head">
                 <div class="oc-stats">
-                    <span><em>Spot</em>{S:,.2f}</span>
+                    {spot_stats}
                     <span><em>P/C Vol</em>{pc_vol}</span>
                     <span><em>P/C OI</em>{pc_oi}</span>
                     {em_stat}
@@ -3794,11 +4075,28 @@ def _build_chain_section(calls, puts, S, strike_range):
             {body}'''
 
 
-def create_large_trades_table(calls, puts, S, strike_range, call_color='#00FF00', put_color='#FF0000', selected_expiries=None):
+def create_large_trades_table(calls, puts, S, strike_range, call_color='#00FF00', put_color='#FF0000', selected_expiries=None, ticker=None):
     """Create a T-style options chain: calls on the left, strikes down the middle, puts on the right.
 
     Each expiry gets its own chain; with several expiries selected, tabs switch between them.
+    For a future the chain is its cash index's options, and the table says so.
     """
+    proxy = None
+    proxy_note = ''
+    futures_proxy = get_futures_proxy(ticker) if ticker else None
+    frames = [df for df in (calls, puts) if not df.empty and 'index_price_scale' in df.columns]
+    if futures_proxy and frames:
+        index_name = futures_proxy[0].lstrip('$')
+        scale = float(frames[0]['index_price_scale'].iloc[0])
+        roots = sorted({str(symbol).split()[0] for df in frames for symbol in df['contractSymbol'].dropna()})
+        proxy = {'future': ticker, 'index': index_name, 'scale': scale}
+        proxy_note = (
+            f'<div class="oc-note"><b>{index_name} index options ({", ".join(roots) or index_name})'
+            f' &mdash; not {ticker} futures options.</b> Schwab has no {ticker} option chain, so {ticker}'
+            f' levels come from {index_name}. {index_name} Strike, Bid/Ask/Last, IV, Vol and OI are the'
+            f' {index_name} contracts\'; &asymp; levels, spot and expected move are in {ticker} points'
+            f' (1 {index_name} pt = {scale:,.4f} {ticker} pts).</div>'
+        )
     # Split into one chain per expiry rather than mixing expiries in one table
     sections = []
     if 'expiration' in calls.columns and 'expiration' in puts.columns:
@@ -3823,7 +4121,7 @@ def create_large_trades_table(calls, puts, S, strike_range, call_color='#00FF00'
                         f'<small>{(expiry - today).days}d</small></button>')
         hidden = ' hidden' if index > 0 else ''
         section_html.append(f'<div class="oc-section" data-expiry="{key}"{hidden}>'
-                            f'{_build_chain_section(exp_calls, exp_puts, S, strike_range)}</div>')
+                            f'{_build_chain_section(exp_calls, exp_puts, S, strike_range, proxy)}</div>')
 
     if len(sections) > 1:
         head_extra = f'<div class="oc-tabs">{"".join(tabs)}</div>'
@@ -3843,6 +4141,7 @@ def create_large_trades_table(calls, puts, S, strike_range, call_color='#00FF00'
     <div class="oc-wrap" style="{wrap_style}">
         <div class="oc-head">
             <div class="oc-title">Options Chain<span class="oc-sub">{subtitle}</span></div>
+            {proxy_note}
             {head_extra}
         </div>
         {"".join(section_html)}
@@ -3866,9 +4165,10 @@ def create_open_interest_chart(calls, puts, S, strike_range=0.02, call_color='#0
     # Determine strike interval and aggregate by rounded strikes
     all_strikes = list(calls['strike']) + list(puts['strike'])
     if all_strikes:
-        strike_interval = get_strike_interval(all_strikes)
-        calls = aggregate_by_strike(calls, ['openInterest'], strike_interval)
-        puts = aggregate_by_strike(puts, ['openInterest'], strike_interval)
+        strike_grid = get_strike_grid(all_strikes)
+        strike_interval = strike_grid[0]
+        calls = aggregate_by_strike(calls, ['openInterest'], strike_grid)
+        puts = aggregate_by_strike(puts, ['openInterest'], strike_grid)
     
     # Create figure
     fig = go.Figure()
@@ -4170,6 +4470,9 @@ def create_centroid_chart(ticker, call_color='#00FF00', put_color='#FF0000', sel
             showing_last_session = True
 
     if not centroid_data:
+        if is_futures_symbol(ticker):
+            status = 'No Data' if is_session_open(ticker) else 'Market Closed'
+            return _empty_centroid_chart(f'Call vs Put Centroid Map ({status})')
         if current_time_est.weekday() >= 5:
             return _empty_centroid_chart('Call vs Put Centroid Map (Market Closed - Weekend)')
         elif get_regular_session_bounds(current_time_est.date()) is None:
@@ -4446,7 +4749,7 @@ def register_collector_selection(ticker, expiry_dates, strike_range, exposure_me
             'delta_adjusted': delta_adjusted,
             'calculate_in_notional': calculate_in_notional,
             'last_seen': now,
-            'seen_date': datetime.now(pytz.timezone('US/Eastern')).strftime('%Y-%m-%d'),
+            'seen_date': session_date_for(ticker).strftime('%Y-%m-%d'),
         })
         if stored:
             entry['last_stored'] = now
@@ -4485,19 +4788,21 @@ def _collector_loop():
     while True:
         time.sleep(15)
         try:
-            if client is None or not is_market_hours():
+            if client is None:
                 continue
-            today = datetime.now(pytz.timezone('US/Eastern')).strftime('%Y-%m-%d')
             now = time.time()
             with _collector_lock:
-                due = [
-                    dict(entry) for entry in _collector_selections.values()
-                    if entry['seen_date'] == today
-                    and now - entry['last_stored'] >= BACKGROUND_COLLECT_INTERVAL_SEC
-                    # an expired expiry has no chain, so the snapshot would be partial;
-                    # the page rolls the selection forward and re-registers it
-                    and all(d >= today for d in entry['expiry_dates'])
-                ]
+                entries = [dict(entry) for entry in _collector_selections.values()]
+            # Each ticker records during its own session (Globex hours for futures)
+            due = [
+                entry for entry in entries
+                if now - entry['last_stored'] >= BACKGROUND_COLLECT_INTERVAL_SEC
+                and entry['seen_date'] == session_date_for(entry['ticker']).strftime('%Y-%m-%d')
+                # an expired expiry has no chain, so the snapshot would be partial;
+                # the page rolls the selection forward and re-registers it
+                and not split_expired_expiries(entry['expiry_dates'], entry['ticker'])[1]
+                and is_session_open(entry['ticker'])
+            ]
             for entry in due:
                 try:
                     _collect_selection(entry)
@@ -6669,7 +6974,7 @@ def index():
                 <div class="controls">
                     <div class="control-group">
                         <label for="ticker">Ticker:</label>
-                        <input type="text" id="ticker" placeholder="Enter Ticker" value="SPY" title="Enter a ticker symbol (e.g., SPY, AAPL) or special aggregate tickers: 'MARKET' (SPX grid + SPY exposures) or 'MARKET2' (SPY base)">
+                        <input type="text" id="ticker" placeholder="Enter Ticker" value="SPY" title="Enter a ticker symbol (e.g., SPY, AAPL), an index future (/ES, /MES, /NQ, /MNQ, /RTY, /M2K, /YM, /MYM - uses its index's options, scaled onto the futures price) or special aggregate tickers: 'MARKET' (SPX grid + SPY exposures) or 'MARKET2' (SPY base)">
                     </div>
                     <div class="control-group">
                         <label for="timeframe">Timeframe:</label>
@@ -7124,7 +7429,7 @@ def index():
         let tvLastTicker = null;
         // When true, the next render will call fitContent() regardless of tvAutoRange
         let tvForceFit = false;
-        // EventSource for real-time price streaming from /price_stream/<ticker>
+        // EventSource for real-time price streaming from /price_stream?ticker=<ticker>
         let priceEventSource = null;
         let priceStreamTicker = null;
         // Debounce timer for indicator refresh on intra-minute quote ticks
@@ -7981,7 +8286,7 @@ def index():
             // Disconnect any existing connection first
             disconnectPriceStream();
 
-            priceEventSource = new EventSource('/price_stream/' + encodeURIComponent(upperTicker));
+            priceEventSource = new EventSource('/price_stream?ticker=' + encodeURIComponent(upperTicker));
             priceStreamTicker = upperTicker;
 
             priceEventSource.onmessage = function(event) {
@@ -8019,13 +8324,20 @@ def index():
             return bucket < tvLastCandles[0].time ? null : bucket;
         }
 
-        // The chart only shows the regular session (9:30-16:00 ET); ignore pre/post-market
-        // ticks so they don't append candles the history endpoint filters out.
+        // The chart shows the ticker's session: 9:30-16:00 ET, or for futures the Globex day
+        // (Sun-Fri 18:00 ET to 17:00 ET the next day). Ignore ticks outside it so they don't
+        // append candles the history endpoint filters out.
         function isRegularSessionTime(tsSec) {
-            if ((priceStreamTicker || '').startsWith('/')) return true;
             const et = new Date(new Date(tsSec * 1000).toLocaleString('en-US', { timeZone: 'America/New_York' }));
             const day = et.getDay();
             const mins = et.getHours() * 60 + et.getMinutes();
+            if ((priceStreamTicker || '').startsWith('/')) {
+                if (mins >= 17 * 60 && mins < 18 * 60) return false;  // daily maintenance break
+                if (day === 6) return false;
+                if (day === 5) return mins < 17 * 60;
+                if (day === 0) return mins >= 18 * 60;
+                return true;
+            }
             return day >= 1 && day <= 5 && mins >= 9 * 60 + 30 && mins < 16 * 60;
         }
 
@@ -8802,7 +9114,7 @@ ${popoutHelperSource([getThemeValue, calcSMA, calcEMA, calcWMA, calcVWAP, calcBB
   // candle so session-aligned bars (e.g. 60m bars starting at :30) line up.
   function pushLatestLevelPrices(){var mx=0;tvHistoricalPoints.forEach(function(p){if(Number(p.time)>mx)mx=Number(p.time);});tvHistoricalPoints.forEach(function(p){if(Number(p.time)===mx)tvAllLevelPrices.push(p.price);});}
   function popBucketStart(ts){var tf=(popoutTimeframe||1)*60;var lc=tvLastCandles[tvLastCandles.length-1];if(!lc)return Math.floor(ts/tf)*tf;var b=lc.time+Math.floor((ts-lc.time)/tf)*tf;return b<tvLastCandles[0].time?null:b;}
-  function popIsSessionTime(ts){if((popoutSseTicker||'').charAt(0)==='/')return true;var et=new Date(new Date(ts*1000).toLocaleString('en-US',{timeZone:'America/New_York'}));var day=et.getDay(),mins=et.getHours()*60+et.getMinutes();return day>=1&&day<=5&&mins>=570&&mins<960;}
+  function popIsSessionTime(ts){var et=new Date(new Date(ts*1000).toLocaleString('en-US',{timeZone:'America/New_York'}));var day=et.getDay(),mins=et.getHours()*60+et.getMinutes();if((popoutSseTicker||'').charAt(0)==='/'){if(mins>=1020&&mins<1080)return false;if(day===6)return false;if(day===5)return mins<1020;if(day===0)return mins>=1080;return true;}return day>=1&&day<=5&&mins>=570&&mins<960;}
   var popStreamBucketState=null,popoutUseHA=false;
   // Live data is merged into raw bars (tvIndicatorCandles); the displayed candle is derived
   // from them so Heikin-Ashi stays Heikin-Ashi and volume bars follow along.
@@ -8861,7 +9173,7 @@ ${popoutHelperSource([getThemeValue, calcSMA, calcEMA, calcWMA, calcVWAP, calcBB
     var upper=ticker.toUpperCase();
     if(popoutEvtSource&&popoutSseTicker===upper&&popoutEvtSource.readyState!==2)return;
     if(popoutEvtSource){try{popoutEvtSource.close();}catch(e){}}
-    popoutEvtSource=new EventSource('/price_stream/'+encodeURIComponent(upper));
+    popoutEvtSource=new EventSource('/price_stream?ticker='+encodeURIComponent(upper));
     popoutSseTicker=upper;
     popoutEvtSource.onmessage=function(ev){
       try{
@@ -13828,7 +14140,7 @@ ${popoutHelperSource([getThemeValue, escapeTooltipHtml, stripTooltipHtml, format
             expirationsLoading = true;
             document.getElementById('expiry-text').textContent = 'Loading expiries...';
             lastExpirationsAttemptMs = Date.now();
-            fetch(`/expirations/${encodeURIComponent(ticker)}`)
+            fetch(`/expirations?ticker=${encodeURIComponent(ticker)}`)
                 .then(async response => {
                     const payload = await response.json().catch(() => null);
                     if (!response.ok) {
@@ -14445,10 +14757,13 @@ ${popoutHelperSource([getThemeValue, escapeTooltipHtml, stripTooltipHtml, format
 def favicon():
     return Response(FAVICON_SVG, mimetype='image/svg+xml')
 
+# Futures symbols start with '/', which Flask folds out of a URL path segment
+# (/expirations//ES -> /expirations/ES), so the page sends the ticker as ?ticker=.
+@app.route('/expirations')
 @app.route('/expirations/<ticker>')
-def get_expirations(ticker):
+def get_expirations(ticker=None):
     try:
-        ticker = format_ticker(ticker)
+        ticker = format_ticker(request.args.get('ticker', ticker))
         expirations = get_option_expirations(ticker)
         return jsonify(expirations)
     except Exception as e:
@@ -14484,7 +14799,7 @@ def update():
     try:
         # A page left open across midnight can still send yesterday's selection; its chain
         # is gone, so drop it and flag the response so the page reloads its expiry list.
-        expiry_dates, expired_expiries = split_expired_expiries(expiry_dates)
+        expiry_dates, expired_expiries = split_expired_expiries(expiry_dates, ticker)
         if not expiry_dates:
             return jsonify({'error': 'The selected expiry has expired - select a new expiration',
                             'expired_expiries': expired_expiries})
@@ -14655,7 +14970,7 @@ def update():
             response['centroid'] = _safe_chart('centroid', create_centroid_chart, ticker, call_color, put_color, expiry_dates)
 
         if data.get('show_large_trades', True):
-            response['large_trades'] = _safe_chart('large_trades', create_large_trades_table, calls, puts, S, strike_range, call_color, put_color, expiry_dates)
+            response['large_trades'] = _safe_chart('large_trades', create_large_trades_table, calls, puts, S, strike_range, call_color, put_color, expiry_dates, ticker=ticker)
 
         
         # Drop charts whose builder failed (logged by _safe_chart)
@@ -14678,15 +14993,7 @@ def update():
             else:
                 quote_ticker = ticker
 
-            cached_quote = _quote_cache.get(quote_ticker)
-            if cached_quote and (time.time() - cached_quote[1]) < _QUOTE_CACHE_TTL_SEC:
-                quote_data = cached_quote[0]
-            else:
-                quote_response = client.quote(quote_ticker)
-                if not quote_response.ok:
-                    raise Exception(f"Failed to fetch quote for display: {quote_response.status_code} {quote_response.reason}")
-                quote_data = quote_response.json()
-                _quote_cache[quote_ticker] = (quote_data, time.time())
+            quote_data = get_quote_json(quote_ticker)
 
             # --- Always Calculate Expected Move Range (same as chart logic) ---
             expected_move_range = None
@@ -14716,8 +15023,13 @@ def update():
                     expected_move_range = {'lower': round(lower, 2), 'upper': round(upper, 2), 'move': round(expected_move, 2)}
 
             if quote_data:
-                ticker_data = quote_data.get(quote_ticker, {})
+                ticker_data = quote_entry(quote_data, quote_ticker) or {}
                 quote = ticker_data.get('quote', {})
+                net_percent = quote.get('netPercentChange')
+                if net_percent is None:
+                    # Futures quotes have no netPercentChange; derive it from the prior settle
+                    prior = (quote.get('lastPrice') or 0) - (quote.get('netChange') or 0)
+                    net_percent = round((quote.get('netChange') or 0) / prior * 100, 2) if prior else 0
 
                 # compute high/low diffs relative to current price
                 high_price = quote.get('highPrice', S)
@@ -14741,7 +15053,7 @@ def update():
                     'low_diff': round(low_diff, 2),
                     'low_diff_pct': round(low_diff_pct, 2),
                     'net_change': quote.get('netChange', 0),
-                    'net_percent': quote.get('netPercentChange', 0),
+                    'net_percent': net_percent,
                     'call_percentage': call_percentage,
                     'put_percentage': put_percentage,
                     'expected_move_range': expected_move_range,
@@ -14958,15 +15270,18 @@ def load_settings():
         return jsonify({'error': str(e)})
 
 
+@app.route('/price_stream')
 @app.route('/price_stream/<path:ticker>')
-def price_stream(ticker):
+def price_stream(ticker=None):
     """Server-Sent Events endpoint for real-time price candle/quote updates.
 
     The frontend connects here via EventSource; the backend pushes CHART_EQUITY
     (completed 1-min candles) and LEVELONE_EQUITIES (real-time last price) data
     from the schwabdev websocket stream.
     """
-    ticker = format_ticker(ticker)
+    ticker = format_ticker(request.args.get('ticker', ticker))
+    if not ticker:
+        return jsonify({'error': 'Missing ticker'}), 400
     # Composite tickers aren't real stream symbols; stream their base instrument instead
     # (same mapping as the quote lookups in /update).
     ticker = {'MARKET': '$SPX', 'MARKET2': 'SPY'}.get(ticker, ticker)
