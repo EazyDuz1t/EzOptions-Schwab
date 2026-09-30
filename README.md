@@ -117,11 +117,15 @@ Requires Python 3 (developed on Python 3.11) and a Schwab brokerage account.
 - Top exposure levels (GEX, DEX, vanna, charm and more) and expected move as price lines
 - Historical level bubbles for the session, plus technical indicators and drawing tools
 
+![Price chart with vanna levels and historical level bubbles](https://i.imgur.com/8qGUMjr.png)
+
 ### Exposure Charts
 - **Gamma Exposure**: where market maker hedging dampens or amplifies moves
 - **Delta Exposure**: directional exposure by strike
 - **Vanna Exposure**: volatility-price cross-sensitivity
 - **Charm, Speed, Vomma and Color**: higher-order Greek exposures
+
+![Delta, vanna, charm and color exposure by strike](https://i.imgur.com/1mjIyGH.png)
 
 ### Exposure Heatmap
 - Exposure by strike and expiration, with the largest cell of each expiry highlighted
@@ -130,6 +134,8 @@ Requires Python 3 (developed on Python 3.11) and a Schwab brokerage account.
 - Today's positions re-priced across a grid of prices and times through the session close, so you can see where exposure builds or flips as price moves and time passes
 - Peak, trough and zero-flip lines, with live candles on top
 - Past columns come from what was recorded at the time, not repainted with hindsight
+
+![Charm exposure surface with zero-flip, peak and trough lines and live candles](https://i.imgur.com/ck3OKDq.png)
 
 ### Historical Bubble Levels
 - Exposure levels recorded about once a minute through the session
@@ -145,6 +151,8 @@ Requires Python 3 (developed on Python 3.11) and a Schwab brokerage account.
 - One sortable table per expiry
 - Bid/ask/last, volume, open interest and implied volatility
 - Spot-price divider and expected-move edges
+
+![Options chain with volume bars, spot divider and expected-move edges](https://i.imgur.com/NBXG3p3.png)
 
 ## Configuration Options
 
