@@ -17,6 +17,8 @@ import json
 import re
 import threading
 import queue
+import gzip
+import zlib
 
 
 # Load environment variables
@@ -66,6 +68,25 @@ def internal_error(error):
     if request.path.startswith('/api/') or request.path.startswith('/update') or request.path.startswith('/expirations'):
         return jsonify({'error': msg}), 500
     return "500 - Internal Server Error", 500
+
+# Compress page/JSON responses. Chart payloads are repetitive and shrink ~5-10x.
+_GZIP_MIMETYPES = {'text/html', 'application/json', 'text/css', 'application/javascript', 'image/svg+xml'}
+_GZIP_MIN_BYTES = 1024
+
+@app.after_request
+def gzip_response(response):
+    if ('gzip' not in request.headers.get('Accept-Encoding', '').lower()
+            or response.direct_passthrough or response.is_streamed
+            or 'Content-Encoding' in response.headers
+            or response.mimetype not in _GZIP_MIMETYPES):
+        return response
+    body = response.get_data()
+    if len(body) < _GZIP_MIN_BYTES:
+        return response
+    response.set_data(gzip.compress(body, compresslevel=5))
+    response.headers['Content-Encoding'] = 'gzip'
+    response.vary.add('Accept-Encoding')
+    return response
 
 # Initialize SQLite database
 def init_db():
@@ -159,6 +180,26 @@ def init_db():
                 cursor.execute("ALTER TABLE centroid_data ADD COLUMN expiry_key TEXT NOT NULL DEFAULT ''")
             except sqlite3.OperationalError:
                 pass
+
+            # Exposure surface history: once a minute, exposure across a price grid (the "now"
+            # column of the surface), so the chart's past is what was shown then, not re-priced.
+            # `profile` is float32 values on np.linspace(price_lo, price_hi, len(profile)).
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS surface_history (
+                    ticker TEXT NOT NULL,
+                    expiry_key TEXT NOT NULL,
+                    formula TEXT NOT NULL,
+                    exposure_type TEXT NOT NULL,
+                    timestamp INTEGER NOT NULL,
+                    date TEXT NOT NULL,
+                    spot REAL NOT NULL,
+                    price_lo REAL NOT NULL,
+                    price_hi REAL NOT NULL,
+                    profile BLOB NOT NULL,
+                    PRIMARY KEY (ticker, expiry_key, formula, exposure_type, timestamp)
+                )
+            ''')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_surface_history_lookup ON surface_history(ticker, date, expiry_key, formula, exposure_type)')
 
             # Indices for fast lookups by (ticker, date) and (ticker, date, expiry_key)
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_interval_data_td ON interval_data(ticker, date)')
@@ -723,7 +764,7 @@ def get_latest_session_expiry_key(ticker, table):
 # Function to clear old data
 def clear_old_data():
     """Keep only the most recent session dates in each SQLite history table."""
-    tables = ('interval_data', 'centroid_data', 'interval_session_data')
+    tables = ('interval_data', 'centroid_data', 'interval_session_data', 'surface_history')
     deleted_rows = {}
 
     with _db_write_lock:
@@ -772,8 +813,8 @@ _options_cache = {}  # (ticker, expiry_key) -> {'calls': DataFrame, 'puts': Data
 # Spot price populated by fetch_options_for_date so /update can skip a redundant quote call.
 _chain_spot_cache = {}  # ticker -> (price, fetched_at_unix_ts)
 
-# Short-lived cache of full quote payloads for the /update price-info panel. /update is
-# polled every second; re-quoting each time adds ~60 Schwab calls/minute on top of the
+# Short-lived cache of full quote payloads for the price-info panel. The live chart stream
+# rebuilds every second; re-quoting each time adds ~60 Schwab calls/minute on top of the
 # option-chain calls, which pushes against the API rate limit.
 _QUOTE_CACHE_TTL_SEC = 5
 _quote_cache = {}  # symbol -> (quote_json, fetched_at_unix_ts)
@@ -1475,17 +1516,7 @@ def fetch_options_for_date(ticker, date, exposure_metric="Open Interest", delta_
             K_arr = df['strike'].to_numpy(dtype=float)
             sigma_arr = df['impliedVolatility'].to_numpy(dtype=float)
 
-            # Compute exposure weight per selected metric
-            oi_arr = df['openInterest'].to_numpy(dtype=float)
-            vol_arr = df['volume'].to_numpy(dtype=float)
-            if exposure_metric == 'Volume':
-                weight_arr = vol_arr
-            elif exposure_metric == 'Max OI vs Volume':
-                weight_arr = np.maximum(oi_arr, vol_arr)
-            elif exposure_metric == 'OI + Volume':
-                weight_arr = oi_arr + vol_arr
-            else:
-                weight_arr = oi_arr
+            weight_arr = exposure_weights(df, exposure_metric)
 
             results = _compute_all_greeks_and_exposures_vectorized(
                 np.full(len(df), flag_int, dtype=np.int8),
@@ -1508,9 +1539,22 @@ def fetch_options_for_date(ticker, date, exposure_metric="Open Interest", delta_
         # Propagate so callers (API routes) can return the error to clients
         raise Exception(msg)
 
+def exposure_weights(df, exposure_metric):
+    """Per-contract weight used by every exposure formula, from the selected weighting metric."""
+    oi_arr = df['openInterest'].to_numpy(dtype=float)
+    vol_arr = df['volume'].to_numpy(dtype=float)
+    if exposure_metric == 'Volume':
+        return vol_arr
+    if exposure_metric == 'Max OI vs Volume':
+        return np.maximum(oi_arr, vol_arr)
+    if exposure_metric == 'OI + Volume':
+        return oi_arr + vol_arr
+    return oi_arr
+
+
 def _compute_all_greeks_and_exposures_vectorized(
     flags, S, K_arr, t, sigma_arr, weight_arr, r=0.02, q=0,
-    delta_adjusted=False, calculate_in_notional=True,
+    delta_adjusted=False, calculate_in_notional=True, only=None,
 ):
     """
     Vectorized computation of all Greeks and exposures for an array of options.
@@ -1529,82 +1573,98 @@ def _compute_all_greeks_and_exposures_vectorized(
     d1 = (log_SK + (r - q + 0.5 * sigma_arr ** 2) * t) / (sigma_arr * sqrt_t)
     d2 = d1 - sigma_arr * sqrt_t
 
+    # `only` limits the work to the named exposures (e.g. {'GEX'}); None computes everything.
+    def need(*names):
+        return only is None or any(name in only for name in names)
+
     exp_qt = math.exp(-q * t)
     exp_rt = math.exp(-r * t)
     norm_d1 = norm.pdf(d1)
-    cdf_d1 = norm.cdf(d1)
-    cdf_d2 = norm.cdf(d2)
-    cdf_neg_d1 = 1.0 - cdf_d1
-    cdf_neg_d2 = 1.0 - cdf_d2
+    need_delta = need('DEX') or delta_adjusted
+    cdf_d1 = norm.cdf(d1) if (need_delta or need('Charm')) else None
+    cdf_d2 = norm.cdf(d2) if only is None else None
+    cdf_neg_d1 = 1.0 - cdf_d1 if cdf_d1 is not None else None
+    cdf_neg_d2 = 1.0 - cdf_d2 if cdf_d2 is not None else None
 
-    # Delta
-    call_delta = exp_qt * cdf_d1
-    put_delta = exp_qt * (cdf_d1 - 1.0)
-    delta = np.where(flags == 0, call_delta, put_delta)
-
-    # Gamma (same for calls and puts)
-    gamma = exp_qt * norm_d1 / (S * sigma_arr * sqrt_t)
-
-    # Vega (same)
-    vega = S * exp_qt * norm_d1 * sqrt_t
-
-    # Vanna (same)
-    vanna = -exp_qt * norm_d1 * d2 / sigma_arr
-
-    # Theta
-    term1 = -S * exp_qt * norm_d1 * sigma_arr / (2.0 * sqrt_t)
-    call_theta = term1 - r * K_arr * exp_rt * cdf_d2 + q * S * exp_qt * cdf_d1
-    put_theta = term1 + r * K_arr * exp_rt * cdf_neg_d2 - q * S * exp_qt * cdf_neg_d1
-    theta = np.where(flags == 0, call_theta, put_theta)
-
-    # Rho
-    call_rho = K_arr * t * exp_rt * cdf_d2
-    put_rho = -K_arr * t * exp_rt * cdf_neg_d2
-    rho = np.where(flags == 0, call_rho, put_rho)
-
-    # Charm
-    inner_charm = norm_d1 * (2.0 * (r - q) * t - d2 * sigma_arr * sqrt_t) / (2.0 * t * sigma_arr * sqrt_t)
-    call_charm = -exp_qt * (inner_charm - q * cdf_d1)
-    put_charm = -exp_qt * (inner_charm + q * cdf_neg_d1)
-    charm = np.where(flags == 0, call_charm, put_charm)
-
-    # Speed
-    speed = -gamma * (d1 / (sigma_arr * sqrt_t) + 1.0) / S
-
-    # Vomma
-    vomma = vega * (d1 * d2) / sigma_arr
-
-    # Color: dGamma/dt in calendar time (same sign convention as charm)
-    color = exp_qt * (norm_d1 / (2.0 * S * t * sigma_arr * sqrt_t)) * \
-            (2.0 * q * t + 1.0 + (2.0 * (r - q) * t - d2 * sigma_arr * sqrt_t) * d1 / (sigma_arr * sqrt_t))
-
-    # --- Exposure calculations ---
     contract_size = 100
     spot_mult = S if calculate_in_notional else 1.0
+    out = {}
 
-    dex = delta * weight_arr * contract_size * spot_mult
-    gex = gamma * weight_arr * contract_size * S * spot_mult * 0.01
-    vex = vanna * weight_arr * contract_size * spot_mult * 0.01
-    charm_exp = charm * weight_arr * contract_size * spot_mult / 365.0
-    speed_exp = speed * weight_arr * contract_size * S * spot_mult * 0.01
-    vomma_exp = vomma * weight_arr * contract_size * 0.01
-    color_exp = color * weight_arr * contract_size * S * spot_mult * 0.01 / 365.0
+    # Delta
+    delta = None
+    if need_delta:
+        call_delta = exp_qt * cdf_d1
+        put_delta = exp_qt * (cdf_d1 - 1.0)
+        delta = np.where(flags == 0, call_delta, put_delta)
+        out['delta'] = delta
+    abs_delta = np.abs(delta) if (delta_adjusted and delta is not None) else None
 
-    if delta_adjusted:
-        abs_delta = np.abs(delta)
-        gex *= abs_delta
-        vex *= abs_delta
-        charm_exp *= abs_delta
-        speed_exp *= abs_delta
-        vomma_exp *= abs_delta
-        color_exp *= abs_delta
+    def adjust(exposure):
+        return exposure * abs_delta if abs_delta is not None else exposure
 
-    return {
-        'delta': delta, 'gamma': gamma, 'vega': vega, 'vanna': vanna,
-        'theta': theta, 'rho': rho,
-        'DEX': dex, 'GEX': gex, 'VEX': vex, 'Charm': charm_exp,
-        'Speed': speed_exp, 'Vomma': vomma_exp, 'Color': color_exp,
-    }
+    if need('DEX'):
+        out['DEX'] = delta * weight_arr * contract_size * spot_mult
+
+    # Gamma (same for calls and puts)
+    gamma = None
+    if need('GEX', 'Speed'):
+        gamma = exp_qt * norm_d1 / (S * sigma_arr * sqrt_t)
+        out['gamma'] = gamma
+    if need('GEX'):
+        out['GEX'] = adjust(gamma * weight_arr * contract_size * S * spot_mult * 0.01)
+
+    # Vega (same)
+    vega = None
+    if need('Vomma'):
+        vega = S * exp_qt * norm_d1 * sqrt_t
+        out['vega'] = vega
+
+    # Vanna (same)
+    if need('VEX'):
+        vanna = -exp_qt * norm_d1 * d2 / sigma_arr
+        out['vanna'] = vanna
+        out['VEX'] = adjust(vanna * weight_arr * contract_size * spot_mult * 0.01)
+
+    if only is None:
+        # Theta
+        term1 = -S * exp_qt * norm_d1 * sigma_arr / (2.0 * sqrt_t)
+        call_theta = term1 - r * K_arr * exp_rt * cdf_d2 + q * S * exp_qt * cdf_d1
+        put_theta = term1 + r * K_arr * exp_rt * cdf_neg_d2 - q * S * exp_qt * cdf_neg_d1
+        out['theta'] = np.where(flags == 0, call_theta, put_theta)
+
+        # Rho
+        call_rho = K_arr * t * exp_rt * cdf_d2
+        put_rho = -K_arr * t * exp_rt * cdf_neg_d2
+        out['rho'] = np.where(flags == 0, call_rho, put_rho)
+
+    # Charm
+    if need('Charm'):
+        inner_charm = norm_d1 * (2.0 * (r - q) * t - d2 * sigma_arr * sqrt_t) / (2.0 * t * sigma_arr * sqrt_t)
+        call_charm = -exp_qt * (inner_charm - q * cdf_d1)
+        put_charm = -exp_qt * (inner_charm + q * cdf_neg_d1)
+        charm = np.where(flags == 0, call_charm, put_charm)
+        out['Charm'] = adjust(charm * weight_arr * contract_size * spot_mult / 365.0)
+
+    # Speed
+    if need('Speed'):
+        speed = -gamma * (d1 / (sigma_arr * sqrt_t) + 1.0) / S
+        out['Speed'] = adjust(speed * weight_arr * contract_size * S * spot_mult * 0.01)
+
+    # Vomma
+    if need('Vomma'):
+        vomma = vega * (d1 * d2) / sigma_arr
+        out['Vomma'] = adjust(vomma * weight_arr * contract_size * 0.01)
+
+    # Color: dGamma/dt in calendar time (same sign convention as charm)
+    if need('Color'):
+        color = exp_qt * (norm_d1 / (2.0 * S * t * sigma_arr * sqrt_t)) *                 (2.0 * q * t + 1.0 + (2.0 * (r - q) * t - d2 * sigma_arr * sqrt_t) * d1 / (sigma_arr * sqrt_t))
+        out['Color'] = adjust(color * weight_arr * contract_size * S * spot_mult * 0.01 / 365.0)
+
+    if only is None:
+        order = ('delta', 'gamma', 'vega', 'vanna', 'theta', 'rho',
+                 'DEX', 'GEX', 'VEX', 'Charm', 'Speed', 'Vomma', 'Color')
+        return {name: out[name] for name in order}
+    return out
 
 
 def get_current_price(ticker):
@@ -2445,6 +2505,573 @@ def create_exposure_heatmap(calls, puts, S, strike_range=0.02, show_calls=True, 
     )
 
     return fig.to_json()
+
+# ── Exposure forecast ────────────────────────────────────────────────────────
+# Re-prices the current option positions over a grid of (time, price) through the session:
+# every contract keeps its strike, IV, expiry and weight, while spot is set to each grid
+# price and time-to-expiry to each grid time. The exposure formulas, weighting metric,
+# delta-adjustment and notional settings are the same ones the live charts use.
+FORECAST_TYPES = ('GEX', 'AbsGEX', 'DEX', 'VEX', 'Charm', 'Speed', 'Vomma', 'Color')
+# What one unit of each exposure means; {$} is '$' with notional on, else 'shares of'
+FORECAST_UNIT_LABELS = {
+    'GEX': '{$} delta per 1% move',
+    'AbsGEX': '{$} delta per 1% move (absolute)',
+    'DEX': '{$} delta',
+    'VEX': '{$} delta per vol point',
+    # Charm and Color are rates per calendar day (divide by 24 for per hour, which is the useful
+    # scale for 0DTE); they overstate the change over the last ~30 minutes of a 0DTE session
+    'Charm': '{$} delta per day (rate; /24 = per hour)',
+    'Speed': '{$} GEX per 1-point move',
+    'Vomma': 'vega change per vol point',
+    'Color': '{$} GEX per day (rate; /24 = per hour)',
+}
+FORECAST_PRICE_POINTS = 90
+FORECAST_MAX_TIME_COLUMNS = 80
+FORECAST_ELEMENT_BUDGET = 150000  # contracts x price rows evaluated per time column
+FORECAST_CACHE_TTL_SEC = 20
+FORECAST_CANDLE_TTL_SEC = 15
+FORECAST_SMOOTH_SIGMA = (1.6, 0.8)  # gaussian sigma in (price rows, time columns)
+_forecast_cache = {}  # key -> {'json', 'at', 'refreshing'}
+_forecast_candle_cache = {}  # (ticker, timeframe) -> (candles, fetched_at)
+_forecast_lock = threading.Lock()
+
+
+def _forecast_session(ticker):
+    """(open_dt, close_dt) of the session to chart: the current one, or the latest that traded."""
+    day = session_date_for(ticker)
+    for _ in range(7):
+        bounds = session_bounds(ticker, day)
+        if bounds:
+            return bounds
+        day -= timedelta(days=1)
+    return None
+
+
+def _forecast_time_to_expiry(expiry_date, when_et):
+    """Years from `when_et` to the 4:00 PM ET expiry; 0 once expired. Only a 2-minute guard keeps
+    the Greeks finite, so 0DTE gamma keeps sharpening into the close (the live charts floor this
+    at 60 minutes instead)."""
+    et_tz = pytz.timezone('US/Eastern')
+    expiry_dt = et_tz.localize(datetime.combine(expiry_date, datetime.min.time()) + timedelta(hours=16))
+    minutes_left = (expiry_dt - when_et).total_seconds() / 60.0
+    if minutes_left <= 0:
+        return 0.0
+    minutes_left = max(minutes_left, 2.0)
+    return minutes_left * 60.0 / SECONDS_PER_YEAR
+
+
+def _forecast_contract_groups(df, flag, exposure_metric, value_column, spot_index, window, delta_adjusted,
+                              calculate_in_notional, abs_values=False):
+    """Split one side of the chain into per-expiry arrays in index space, returning
+    (groups, outside) where `outside` is the live exposure of contracts too far from spot to
+    model (held constant across the grid: far strikes barely move with price). Each contract gets
+    a calibration factor (live exposure / model exposure right now) so the surface matches the
+    live charts exactly, including blended MARKET tickers whose rows were rescaled when combined."""
+    if df is None or df.empty or 'expiration' not in df.columns or value_column not in df.columns:
+        return [], 0.0
+    df = df.copy()
+    strike_col = 'index_strike' if 'index_strike' in df.columns else 'strike'
+    df['_K'] = df[strike_col].astype(float)
+    df['_w'] = exposure_weights(df, exposure_metric)
+    modeled = (df['_w'] > 0) & (df['_K'] > 0) & (np.abs(df['_K'] / spot_index - 1.0) <= window)
+    outside_values = df.loc[~modeled & (df['_w'] > 0), value_column].to_numpy(dtype=float)
+    outside_values = np.nan_to_num(np.abs(outside_values) if abs_values else outside_values)
+    outside = float(outside_values.sum())
+    df = df[modeled]
+    groups = []
+    for expiry, rows in df.groupby('expiration'):
+        expiry_date = expiry if not isinstance(expiry, datetime) else expiry.date()
+        if isinstance(expiry_date, str):
+            expiry_date = datetime.strptime(expiry_date[:10], '%Y-%m-%d').date()
+        K = rows['_K'].to_numpy(dtype=float)
+        sigma = rows['impliedVolatility'].to_numpy(dtype=float)
+        weight = rows['_w'].to_numpy(dtype=float)
+        flags = np.full(len(rows), flag, dtype=np.int8)
+        scale = np.ones(len(rows))
+        live_t = calculate_time_to_expiration(expiry_date)
+        if live_t > 0:
+            model = _compute_all_greeks_and_exposures_vectorized(
+                flags, spot_index, K, live_t, sigma, weight, r=0.02, q=0,
+                delta_adjusted=delta_adjusted, calculate_in_notional=calculate_in_notional,
+                only={value_column},
+            )[value_column]
+            actual = rows[value_column].to_numpy(dtype=float)
+            usable = np.isfinite(model) & (np.abs(model) > 1e-12) & np.isfinite(actual)
+            scale = np.where(usable, actual / np.where(usable, model, 1.0), 1.0)
+            scale = np.clip(scale, 1e-3, 1e3)
+        groups.append({
+            'expiry': expiry_date, 'flags': flags, 'K': K, 'sigma': sigma, 'weight': weight, 'scale': scale,
+        })
+    return groups, outside
+
+
+def compute_exposure_forecast_surface(call_groups, put_groups, spot_grid_index, times, exposure_type,
+                                      value_column, delta_adjusted, calculate_in_notional,
+                                      outside=(0.0, 0.0)):
+    """Net exposure over (price, time); NaN where no selected expiry is still live. `outside` is
+    the (call, put) exposure of contracts left out of the groups, added to every live column."""
+    surface = np.full((len(spot_grid_index), len(times)), np.nan)
+    spot_col = np.asarray(spot_grid_index, dtype=float)[:, None]
+    for j, when in enumerate(times):
+        sums = {}
+        live = False
+        for side, groups in (('call', call_groups), ('put', put_groups)):
+            total = np.zeros(len(spot_grid_index))
+            for group in groups:
+                t = _forecast_time_to_expiry(group['expiry'], when)
+                if t <= 0:
+                    continue
+                live = True
+                values = _compute_all_greeks_and_exposures_vectorized(
+                    group['flags'][None, :], spot_col, group['K'][None, :], t,
+                    group['sigma'][None, :], group['weight'][None, :], r=0.02, q=0,
+                    delta_adjusted=delta_adjusted, calculate_in_notional=calculate_in_notional,
+                    only={value_column},
+                )[value_column] * group['scale'][None, :]
+                if exposure_type == 'AbsGEX':
+                    values = np.abs(values)
+                total += values.sum(axis=1)
+            sums[side] = total + (outside[0] if side == 'call' else outside[1])
+        if live:
+            surface[:, j] = combine_level_values(exposure_type, sums['call'], sums['put'])
+    return surface
+
+
+def _link_column_points(points_by_column, tolerance_rows=3):
+    """Join per-column points (row positions, strongest first) that sit close together in
+    consecutive columns into polylines of (column, row_position). Short lines are dropped."""
+    tracks, active = [], []
+    for j, rows in enumerate(points_by_column):
+        extended = []
+        for row in rows:
+            best = None
+            for track in active:
+                if any(track is other for other in extended):
+                    continue
+                gap = abs(track['rows'][-1] - row)
+                if gap <= tolerance_rows and (best is None or gap < abs(best['rows'][-1] - row)):
+                    best = track
+            if best is None:
+                best = {'cols': [], 'rows': []}
+                tracks.append(best)
+            best['cols'].append(j)
+            best['rows'].append(row)
+            extended.append(best)
+        active = extended
+    return [list(zip(t['cols'], t['rows'])) for t in tracks if len(t['cols']) >= 3]
+
+
+def find_forecast_extrema_tracks(surface, prices, kind, min_prominence, max_per_column=4):
+    """Trace local peaks ('peak') or troughs ('trough') of each time column across time.
+    Returns polylines as a list of [(column, price), ...]."""
+    from scipy.signal import find_peaks
+    points_by_column = []
+    for j in range(surface.shape[1]):
+        column = surface[:, j]
+        if not np.all(np.isfinite(column)):
+            points_by_column.append([])
+            continue
+        signal = column if kind == 'peak' else -column
+        indices, props = find_peaks(signal, prominence=min_prominence)
+        if len(indices) > max_per_column:
+            indices = indices[np.argsort(props['prominences'])[::-1][:max_per_column]]
+        points_by_column.append([int(i) for i in sorted(indices, key=lambda idx: -signal[idx])])
+    return [[(c, float(prices[r])) for c, r in track] for track in _link_column_points(points_by_column)]
+
+
+def find_forecast_zero_tracks(surface, prices):
+    """Where net exposure changes sign along price, traced across time (the flip level)."""
+    row_positions = np.arange(len(prices), dtype=float)
+    points_by_column = []
+    for j in range(surface.shape[1]):
+        column = surface[:, j]
+        if not np.all(np.isfinite(column)):
+            points_by_column.append([])
+            continue
+        crossings = np.where(column[:-1] * column[1:] < 0)[0]
+        points_by_column.append([
+            float(row_positions[i] + column[i] / (column[i] - column[i + 1])) for i in crossings
+        ])
+    tracks = _link_column_points(points_by_column)
+    return [[(c, float(np.interp(r, row_positions, prices))) for c, r in track] for track in tracks]
+
+
+def _forecast_candles(ticker, timeframe, session_open, session_close):
+    """OHLC candles of the charted session (empty when price history is unavailable)."""
+    key = (ticker, timeframe)
+    cached = _forecast_candle_cache.get(key)
+    if cached and time.time() - cached[1] < FORECAST_CANDLE_TTL_SEC:
+        candles = cached[0]
+    else:
+        try:
+            candles = get_price_history(ticker, timeframe=timeframe, lookback_bars=1)['candles']
+        except Exception as e:
+            print(f"Forecast chart: no candles ({e})")
+            candles = []
+        _forecast_candle_cache[key] = (candles, time.time())
+    et_tz = pytz.timezone('US/Eastern')
+    rows = []
+    for candle in candles:
+        opened = datetime.fromtimestamp(candle['datetime'] / 1000, et_tz)
+        if session_open <= opened < session_close:
+            rows.append((opened, candle))
+    return rows
+
+
+def forecast_candles_payload(ticker, timeframe, call_color, put_color):
+    """The surface's candles, sent apart from its figure so they refresh on their own (the page
+    extends the last one with live quotes). Times are epoch ms; the page places them in ET."""
+    session = _forecast_session(ticker)
+    if session is None:
+        return None
+    candles = _forecast_candles(ticker, timeframe, *session)
+    return {
+        'timeframe': timeframe, 'call_color': call_color, 'put_color': put_color,
+        'candles': [[c['datetime'], c['open'], c['high'], c['low'], c['close']] for _, c in candles],
+    }
+
+
+def _surface_inputs(calls, puts, S, exposure_type, exposure_metric, delta_adjusted, calculate_in_notional, window):
+    """(value_column, price_scale, call_groups, put_groups, outside) for re-pricing the chain.
+    Futures options are the index's: the model runs in index space, and chart prices map to it
+    by dividing by `price_scale`."""
+    value_column = resolve_level_value_column(exposure_type)
+    scale = 1.0
+    for frame in (calls, puts):
+        if not frame.empty and 'index_price_scale' in frame.columns:
+            scale = float(frame['index_price_scale'].iloc[0])
+            break
+    spot_index = S / scale
+    abs_values = exposure_type == 'AbsGEX'
+    call_groups, call_outside = _forecast_contract_groups(
+        calls, 0, exposure_metric, value_column, spot_index, window, delta_adjusted, calculate_in_notional, abs_values)
+    put_groups, put_outside = _forecast_contract_groups(
+        puts, 1, exposure_metric, value_column, spot_index, window, delta_adjusted, calculate_in_notional, abs_values)
+    return value_column, scale, call_groups, put_groups, (call_outside, put_outside)
+
+
+# ── Exposure surface history ──
+# Once a minute per viewed selection, the "now" column (exposure across a price grid) of every
+# exposure type is recorded, so the chart can draw the past from what was actually shown at
+# the time. Re-pricing the past with the current chain instead would repaint it with hindsight
+# (later IV and positions, and for Volume weighting, volume that hadn't traded yet).
+SURFACE_HISTORY_RANGE = 0.08  # recorded grid spans spot +/- 8%
+SURFACE_HISTORY_POINTS = 241
+_surface_recording = set()  # (ticker, expiry_key, formula) being recorded right now
+_surface_last_minute = {}  # (ticker, expiry_key, formula) -> minute timestamp last recorded
+
+
+def surface_formula_key(exposure_metric, delta_adjusted, calculate_in_notional):
+    """The weighting settings a recording was made with; history only matches the same ones."""
+    return f"{exposure_metric}|{int(bool(delta_adjusted))}|{int(bool(calculate_in_notional))}"
+
+
+def record_surface_snapshot(ticker, S, calls, puts, expiry_key, exposure_metric, delta_adjusted,
+                            calculate_in_notional):
+    """Record this minute's surface column for every exposure type, at most once a minute per
+    selection. Runs in a background thread so it never slows the request that triggered it."""
+    if not S or calls is None or puts is None or (calls.empty and puts.empty) or not is_session_open(ticker):
+        return
+    now_et = datetime.now(pytz.timezone('US/Eastern'))
+    minute = int(now_et.timestamp()) // 60 * 60
+    key = (ticker, expiry_key, surface_formula_key(exposure_metric, delta_adjusted, calculate_in_notional))
+    with _forecast_lock:
+        if _surface_last_minute.get(key) == minute or key in _surface_recording:
+            return
+        _surface_recording.add(key)
+        _surface_last_minute[key] = minute  # one attempt per minute, even if it fails
+    threading.Thread(
+        target=_record_surface_snapshot, daemon=True,
+        args=(key, minute, now_et, S, calls.copy(), puts.copy(), exposure_metric, delta_adjusted,
+              calculate_in_notional),
+    ).start()
+
+
+def _record_surface_snapshot(key, minute, now_et, S, calls, puts, exposure_metric, delta_adjusted,
+                             calculate_in_notional):
+    ticker, expiry_key, formula = key
+    try:
+        prices = np.linspace(S * (1 - SURFACE_HISTORY_RANGE), S * (1 + SURFACE_HISTORY_RANGE), SURFACE_HISTORY_POINTS)
+        date = session_date_for(ticker, now_et).strftime('%Y-%m-%d')
+        rows = []
+        for exposure_type in FORECAST_TYPES:
+            value_column, scale, call_groups, put_groups, outside = _surface_inputs(
+                calls, puts, S, exposure_type, exposure_metric, delta_adjusted, calculate_in_notional,
+                window=SURFACE_HISTORY_RANGE + 0.02)
+            column = compute_exposure_forecast_surface(
+                call_groups, put_groups, prices / scale, [now_et], exposure_type, value_column,
+                delta_adjusted, calculate_in_notional, outside=outside)[:, 0]
+            if not np.all(np.isfinite(column)):
+                continue  # every selected expiry has expired
+            rows.append((ticker, expiry_key, formula, exposure_type, minute, date, float(S),
+                         float(prices[0]), float(prices[-1]), column.astype(np.float32).tobytes()))
+        if rows:
+            with _db_write_lock, closing(get_options_db_connection()) as conn:
+                conn.executemany('''
+                    INSERT OR REPLACE INTO surface_history (
+                        ticker, expiry_key, formula, exposure_type, timestamp, date, spot,
+                        price_lo, price_hi, profile
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', rows)
+                conn.commit()
+    except Exception:
+        import traceback
+        print(f"Error recording exposure surface for {ticker} {expiry_key}:")
+        traceback.print_exc()
+    finally:
+        with _forecast_lock:
+            _surface_recording.discard(key)
+
+
+def get_surface_history(ticker, date, expiry_key, formula, exposure_type):
+    """Recorded surface columns as [(timestamp, prices, values)], oldest first."""
+    with closing(get_options_db_connection()) as conn:
+        rows = conn.execute('''
+            SELECT timestamp, price_lo, price_hi, profile FROM surface_history
+            WHERE ticker = ? AND date = ? AND expiry_key = ? AND formula = ? AND exposure_type = ?
+            ORDER BY timestamp
+        ''', (ticker, date, expiry_key, formula, exposure_type)).fetchall()
+    history = []
+    for timestamp, price_lo, price_hi, blob in rows:
+        values = np.frombuffer(blob, dtype=np.float32).astype(float)
+        history.append((timestamp, np.linspace(price_lo, price_hi, len(values)), values))
+    return history
+
+
+def create_exposure_forecast_chart(calls, puts, S, ticker, exposure_type='GEX', exposure_metric='Open Interest',
+                                   delta_adjusted=False, calculate_in_notional=True, price_range=0.015,
+                                   timeframe=5, call_color='#00FF00', put_color='#FF0000',
+                                   selected_expiries=None):
+    exposure_type = normalize_level_type(exposure_type)
+    if exposure_type not in FORECAST_TYPES:
+        exposure_type = 'GEX'
+    value_column = resolve_level_value_column(exposure_type)
+    display_name = INTERVAL_LEVEL_DISPLAY_NAMES.get(exposure_type, exposure_type)
+    title_name = HEATMAP_TITLE_DISPLAY_NAMES.get(exposure_type, display_name)
+    text_color, grid_color, background_color = '#CCCCCC', '#333333', '#1E1E1E'
+    weight_label = exposure_metric + (', Δ-adjusted' if delta_adjusted else '')
+    title = build_chart_title_text(f'{title_name} Surface ({weight_label})', selected_expiries=selected_expiries)
+
+    def empty_figure(message):
+        fig = go.Figure()
+        fig.update_layout(
+            title=build_left_aligned_title(title, text_color=text_color),
+            plot_bgcolor=background_color, paper_bgcolor=background_color, font=dict(color=text_color),
+            xaxis=dict(visible=False), yaxis=dict(visible=False),
+            annotations=[dict(text=message, x=0.5, y=0.5, xref='paper', yref='paper', showarrow=False,
+                              font=dict(color=text_color, size=14))],
+        )
+        return fig.to_json()
+
+    if calls is None or puts is None or (calls.empty and puts.empty) or not S:
+        return empty_figure('No options data available')
+    session = _forecast_session(ticker)
+    if session is None:
+        return empty_figure('No trading session available')
+    session_open, session_close = session
+    et_tz = pytz.timezone('US/Eastern')
+    now_et = datetime.now(et_tz)
+
+    candles = _forecast_candles(ticker, timeframe, session_open, session_close)
+    half_width = price_range * S
+    if candles:
+        extreme = max(max(abs(c['high'] - S), abs(c['low'] - S)) for _, c in candles)
+        half_width = max(half_width, extreme * 1.1)
+    half_width = min(half_width, 0.15 * S)
+    prices = np.linspace(S - half_width, S + half_width, FORECAST_PRICE_POINTS)
+
+    # Fewer contracts per time column for big multi-expiry selections keeps refreshes quick, but
+    # every strike the chart's price range reaches (plus a margin) is always re-priced
+    window = 0.15
+    min_window = min(window, max(0.03, half_width / S + 0.01))
+    while True:
+        value_column, scale, call_groups, put_groups, outside = _surface_inputs(
+            calls, puts, S, exposure_type, exposure_metric, delta_adjusted, calculate_in_notional, window)
+        contracts = sum(len(g['K']) for g in call_groups + put_groups)
+        if contracts * FORECAST_PRICE_POINTS <= FORECAST_ELEMENT_BUDGET or window <= min_window:
+            break
+        window = max(window * 0.8, min_window)
+    if not call_groups and not put_groups:
+        return empty_figure('No weighted contracts for the selected expiries')
+
+    session_minutes = (session_close - session_open).total_seconds() / 60.0
+    step = next((m for m in (5, 10, 15, 30, 60) if session_minutes / m <= FORECAST_MAX_TIME_COLUMNS), 60)
+    # Each column is the middle of its time step, so the cells tile open -> close exactly and the
+    # last column (e.g. 15:57:30) is still live instead of sitting on the 16:00 expiry
+    times = [session_open + timedelta(minutes=step * (k + 0.5)) for k in range(math.ceil(session_minutes / step))]
+    times = [t for t in times if t < session_close]
+
+    surface = compute_exposure_forecast_surface(
+        call_groups, put_groups, prices / scale, times, exposure_type, value_column,
+        delta_adjusted, calculate_in_notional, outside=outside,
+    )
+
+    # Columns that are fully in the past come from the recorded history where it exists, so the
+    # past isn't repainted with the current chain; only unrecorded past columns stay re-priced
+    history = get_surface_history(
+        ticker, session_date_for(ticker, session_open).strftime('%Y-%m-%d'),
+        build_expiry_selection_key(selected_expiries),
+        surface_formula_key(exposure_metric, delta_adjusted, calculate_in_notional), exposure_type)
+    history_ts = [entry[0] for entry in history]
+    half_step = timedelta(minutes=step / 2)
+    recorded_cols, repriced_cols = [], []
+    for j, center in enumerate(times):
+        if center + half_step > now_et:
+            continue  # the current and future columns are the projection
+        lo = bisect_left(history_ts, (center - half_step).timestamp())
+        hi = bisect_left(history_ts, (center + half_step).timestamp())
+        if hi > lo:
+            _, recorded_prices, recorded_values = history[hi - 1]  # latest recording in the step
+            recorded = np.interp(prices, recorded_prices, recorded_values, left=np.nan, right=np.nan)
+            # Prices outside the recorded grid (a very wide range or a big move) keep the re-priced value
+            surface[:, j] = np.where(np.isfinite(recorded), recorded, surface[:, j])
+            recorded_cols.append(j)
+        elif np.isfinite(surface[:, j]).any():
+            repriced_cols.append(j)
+    if repriced_cols:
+        if not recorded_cols:
+            note = 'past re-priced (not recorded)'
+        elif max(repriced_cols) < min(recorded_cols):
+            note = f"past re-priced before {(times[min(recorded_cols)] - half_step):%H:%M}"
+        else:
+            note = 'past partly re-priced (recording gaps)'
+        title += f" <span style='font-size:11px;font-weight:normal;color:#999999'>· {note}</span>"
+
+    live_mask = np.isfinite(surface)
+    if not live_mask.any():
+        return empty_figure('Selected expiries are already expired for this session')
+
+    # Smooth only over live cells: dividing by the smoothed mask keeps expired (NaN) columns from
+    # being blended in as zeros, which would drag down the columns next to them
+    from scipy.ndimage import gaussian_filter
+    filled = gaussian_filter(np.where(live_mask, surface, 0.0), sigma=FORECAST_SMOOTH_SIGMA, mode='nearest')
+    weight = gaussian_filter(live_mask.astype(float), sigma=FORECAST_SMOOTH_SIGMA, mode='nearest')
+    smoothed = np.where(live_mask, filled / np.maximum(weight, 1e-9), np.nan)
+
+    peak_abs = float(np.nanmax(np.abs(smoothed)))
+    peak_abs = peak_abs if peak_abs > 0 else 1.0
+    color_max = float(np.nanpercentile(np.abs(smoothed), 99)) or peak_abs
+    one_sided = exposure_type == 'AbsGEX'
+
+    x_labels = [t.strftime('%Y-%m-%d %H:%M:%S') for t in times]
+    # Colors follow a square-root scale of |exposure| so weaker areas still show tint (exposure is
+    # very peaky, and on a linear scale everything but the biggest cells reads as black). The real
+    # values ride along in customdata for hover.
+    color_power = 0.5
+    scaled = np.clip(smoothed / color_max, -1.0, 1.0)
+    color_z = np.round(np.sign(scaled) * np.abs(scaled) ** color_power, 3)
+    # The real (unscaled) values ride along in customdata; the page's tooltip formats them with its
+    # K/M/B/T formatter. ~4 significant digits keeps the payload small.
+    decimals = 3 - int(math.floor(math.log10(color_max))) if color_max > 0 else 0
+    real_z = np.round(smoothed, decimals)
+    fig = go.Figure()
+    fig.add_trace(go.Heatmap(
+        # Plain lists, not numpy arrays: plotly 6 encodes numpy as base64 'bdata', which the page's
+        # Plotly.js may not decode (heatmap renders empty/black while list-based traces still draw)
+        x=x_labels, y=np.round(prices, 2).tolist(), z=color_z.tolist(), customdata=real_z.tolist(),
+        name=display_name, meta='forecast|' + FORECAST_UNIT_LABELS[exposure_type].replace(
+            '{$}', '$' if calculate_in_notional else 'shares of'),
+        colorscale=([[0.0, '#3A3A3A'], [1.0, call_color]] if one_sided
+                    else [[0.0, put_color], [0.5, '#3A3A3A'], [1.0, call_color]]),
+        zmin=0 if one_sided else -1, zmax=1, zmid=None if one_sided else 0,
+        # 'none' hides Plotly's own label but still fires the hover event the page's tooltip uses
+        zsmooth='best', hoverongaps=False, hoverinfo='none', showscale=False,
+    ))
+
+    def add_track_trace(tracks, name, color, width=2, dash=None):
+        xs, ys = [], []
+        for track in tracks:
+            xs.extend(x_labels[c] for c, _ in track)
+            ys.extend(round(p, 2) for _, p in track)
+            xs.append(None)
+            ys.append(None)
+        if not xs:
+            return
+        fig.add_trace(go.Scatter(x=xs, y=ys, mode='lines', name=name, hoverinfo='skip',
+                                 line=dict(color=color, width=width, dash=dash, shape='spline', smoothing=0.8)))
+
+    if not one_sided:
+        add_track_trace(find_forecast_zero_tracks(smoothed, prices), 'Zero', '#F5F5F5', width=1.5, dash='dot')
+    add_track_trace(find_forecast_extrema_tracks(smoothed, prices, 'trough', 0.06 * peak_abs),
+                    f'{display_name} Trough', '#FFD600')
+    add_track_trace(find_forecast_extrema_tracks(smoothed, prices, 'peak', 0.06 * peak_abs),
+                    f'{display_name} Peak', '#00E676')
+    # The candles aren't part of this figure: the page draws them from 'forecast_candles' and
+    # live quotes, so they don't wait on this (slow) build
+
+    y_tick_format = '.2f' if S < 100 else ('.1f' if S < 1000 else '.0f')
+    axis_common = dict(gridcolor=grid_color, linecolor=grid_color, showgrid=False, zeroline=False,
+                       tickfont=dict(color=text_color))
+    fig.update_layout(
+        title=build_left_aligned_title(title, text_color=text_color),
+        xaxis=dict(type='date', range=[session_open.strftime('%Y-%m-%d %H:%M:%S'),
+                                       session_close.strftime('%Y-%m-%d %H:%M:%S')], tickformat='%H:%M',
+                   rangeslider=dict(visible=False), **axis_common),
+        yaxis=dict(range=[float(prices[0]), float(prices[-1])], tickformat=y_tick_format, side='right',
+                   title=dict(text='Price', font=dict(color=text_color)), **axis_common),
+        # Just above the plot's top-left corner (in the header band, on the selectors' row), small
+        # and without a box, so it never sits on the heatmap
+        legend=dict(x=0, y=1, xanchor='left', yanchor='bottom', orientation='h',
+                    bgcolor='rgba(0,0,0,0)', borderwidth=0, font=dict(color=text_color, size=10),
+                    tracegroupgap=0),
+        plot_bgcolor=background_color, paper_bgcolor=background_color, font=dict(color=text_color),
+        margin=dict(l=76, r=52, t=48, b=32),
+        hoverlabel=dict(bgcolor=background_color, font_size=12, font_family='Arial'),
+        uirevision=f"{ticker}|{exposure_type}|{price_range}|{session_open:%Y%m%d}|{timeframe}",
+        transition=dict(duration=0, easing='linear'),
+    )
+    return fig.to_json()
+
+
+def get_exposure_forecast_chart(cache_key, **kwargs):
+    """Forecast chart JSON, or None while its first build is still running. Builds run in a
+    background thread (the first one, then a refresh every FORECAST_CACHE_TTL_SEC), so a slow
+    forecast never holds up the other charts; the last result is served meanwhile."""
+    now = time.time()
+    with _forecast_lock:
+        entry = _forecast_cache.get(cache_key)
+        if entry is None:
+            entry = _forecast_cache[cache_key] = {'json': None, 'at': 0.0, 'refreshing': False, 'used': now}
+            for stale_key in sorted(_forecast_cache, key=lambda k: _forecast_cache[k]['used'])[:-8]:
+                _forecast_cache.pop(stale_key, None)
+        entry['used'] = now
+        if now - entry['at'] >= FORECAST_CACHE_TTL_SEC and not entry['refreshing']:
+            entry['refreshing'] = True
+            snapshot = dict(kwargs, calls=kwargs['calls'].copy(), puts=kwargs['puts'].copy())
+            threading.Thread(target=_refresh_forecast_entry, args=(entry, snapshot), daemon=True).start()
+        return entry['json']
+
+
+def _forecast_error_chart(error):
+    """Show a failed build in the chart instead of letting it silently vanish."""
+    fig = go.Figure()
+    fig.update_layout(
+        title=build_left_aligned_title('Exposure Surface', text_color='#CCCCCC'),
+        plot_bgcolor='#1E1E1E', paper_bgcolor='#1E1E1E', xaxis=dict(visible=False), yaxis=dict(visible=False),
+        annotations=[dict(text=f'Exposure Surface failed: {type(error).__name__}: {error}', x=0.5, y=0.5, xref='paper',
+                          yref='paper', showarrow=False, font=dict(color='#ff8080', size=13))],
+    )
+    return fig.to_json()
+
+
+def _refresh_forecast_entry(entry, kwargs):
+    try:
+        chart_json = create_exposure_forecast_chart(**kwargs)
+        with _forecast_lock:
+            entry['json'] = chart_json
+            entry['at'] = time.time()
+    except Exception as e:
+        import traceback
+        print("Error building forecast chart:")
+        traceback.print_exc()
+        with _forecast_lock:
+            if entry['json'] is None:
+                entry['json'] = _forecast_error_chart(e)
+            entry['at'] = time.time()  # back off a full interval before retrying
+    finally:
+        with _forecast_lock:
+            entry['refreshing'] = False
+
 
 def create_exposure_chart(calls, puts, exposure_type, title, S, strike_range=0.02, show_calls=True, show_puts=True, show_net=True, coloring_mode='Solid', call_color='#00FF00', put_color='#FF0000', selected_expiries=None, horizontal=False, show_abs_gex_area=False, abs_gex_opacity=0.2, highlight_max_level=False, max_level_color='#800080', max_level_mode='Absolute'):
     # Ensure the exposure_type column exists
@@ -3557,97 +4184,58 @@ def build_historical_levels_overlay(ticker, display_date, chart_times, latest_pr
     return historical_points, historical_expected_moves
 
 
-def prepare_price_chart_data(price_data, calls=None, puts=None, exposure_levels_types=[],
-                              exposure_levels_count=3, call_color='#00FF00', put_color='#FF0000',
-                              strike_range=0.1, use_heikin_ashi=False,
-                              highlight_max_level=False, max_level_color='#800080',
-                              coloring_mode='Linear Intensity', ticker=None, selected_expiries=None,
-                              show_latest_level_lines=True, timeframe=1):
-    """Return raw OHLCV + overlay data as JSON for TradingView Lightweight Charts rendering."""
-    import json as _json
+# Candle times of each price chart a page loaded (via /update_price), so the live stream can
+# snap historical level bubbles onto the same candles when it pushes overlay updates.
+_price_chart_times = {}  # (ticker, timeframe) -> (display_date_key, [candle times])
+_price_chart_times_lock = threading.Lock()
 
-    # Handle backward compatibility
+
+def remember_price_chart_times(ticker, timeframe, display_date_key, chart_times):
+    if ticker and chart_times:
+        with _price_chart_times_lock:
+            _price_chart_times[(ticker, int(timeframe))] = (display_date_key, list(chart_times))
+
+
+def live_price_chart_times(ticker, timeframe):
+    """(display date, candle times) of the loaded chart, extended by one bucket per elapsed
+    interval so levels recorded after the load land on the live candles; None if never loaded."""
+    with _price_chart_times_lock:
+        remembered = _price_chart_times.get((ticker, int(timeframe)))
+    if not remembered:
+        return None
+    display_date_key, chart_times = remembered
+    step = max(1, int(timeframe)) * 60
+    now = int(time.time())
+    times = list(chart_times)
+    while times[-1] + step <= now:
+        times.append(times[-1] + step)
+    return display_date_key, times
+
+
+def build_price_overlays(ticker, calls, puts, current_price, display_date_key, chart_times,
+                         exposure_levels_types, exposure_levels_count=3, call_color='#00FF00',
+                         put_color='#FF0000', strike_range=0.1, highlight_max_level=False,
+                         max_level_color='#800080', coloring_mode='Linear Intensity',
+                         selected_expiries=None, show_latest_level_lines=True, seed_history=True):
+    """Price-chart overlays: current exposure levels, expected moves and the session's
+    historical level bubbles snapped onto `chart_times` (the chart's candle times)."""
     if isinstance(exposure_levels_types, str):
-        if exposure_levels_types == 'None':
-            exposure_levels_types = []
-        else:
-            exposure_levels_types = [exposure_levels_types]
-
-    if not price_data or 'candles' not in price_data or not price_data['candles']:
-        return _json.dumps({'error': 'No price data'})
-
-    candles = filter_market_hours(price_data['candles'], ticker)
-    if not candles:
-        return _json.dumps({'error': 'No market-hour candles'})
-
-    # "Day" means the ticker's trading session: the ET date for stocks and indexes, the
-    # Globex day (18:00 ET the evening before to 17:00 ET) for futures.
-    current_date = session_date_for(ticker)
-
-    # Deduplicate and sort
-    unique_candles = {c['datetime']: c for c in candles}
-    sorted_candles = [unique_candles[ts] for ts in sorted(unique_candles)]
-    session_dates = [candle_session_date(ticker, c) for c in sorted_candles]
-
-    # Filter to current session, else the most recent one (weekends, before the open)
-    display_date = current_date if current_date in session_dates else max(session_dates)
-    current_day_candles = [c for c, day in zip(sorted_candles, session_dates) if day == display_date]
-
-    # Apply Heikin-Ashi using all candles as seed, then slice to current day
-    if use_heikin_ashi:
-        all_ha = convert_to_heikin_ashi(sorted_candles)
-        day_start_idx = len(sorted_candles) - len(current_day_candles)
-        display_candles = all_ha[day_start_idx:]
-    else:
-        display_candles = current_day_candles
-
-    # Previous session's close
-    previous_day_close = next(
-        (c['close'] for c, day in zip(reversed(sorted_candles), reversed(session_dates)) if day < display_date),
-        None,
-    )
-
-    # Build Lightweight Charts candle data (time in seconds UTC)
-    lc_candles = []
-    lc_volume = []
-    for i, c in enumerate(display_candles):
-        ts = int(c['datetime'] / 1000)
-        lc_candles.append({'time': ts, 'open': c['open'], 'high': c['high'],
-                           'low': c['low'], 'close': c['close']})
-        is_up = c['close'] >= c['open'] if i == 0 else c['close'] >= display_candles[i - 1]['close']
-        lc_volume.append({'time': ts, 'value': c['volume'],
-                          'color': call_color if is_up else put_color})
-
-    # Multi-day raw candles for indicator warmup (FBB/SMA200 need up to 200 prior bars)
-    lc_indicator_candles = [
-        {'time': int(c['datetime'] / 1000), 'open': c['open'], 'high': c['high'],
-         'low': c['low'], 'close': c['close'], 'volume': c.get('volume', 0)}
-        for c in sorted_candles
-    ]
-    current_day_start_time = int(current_day_candles[0]['datetime'] / 1000) if current_day_candles else 0
-
-    # Use the real last trade, not the Heikin-Ashi averaged close, for strike filtering,
-    # expected move and the stored interval price.
-    current_price = current_day_candles[-1]['close'] if current_day_candles else 0
-    last_candle = display_candles[-1] if display_candles else None
-    last_candle_up = (last_candle['close'] >= last_candle['open']) if last_candle else True
-
-    display_date_key = display_date.strftime('%Y-%m-%d') if hasattr(display_date, 'strftime') else str(display_date)
+        exposure_levels_types = [] if exposure_levels_types == 'None' else [exposure_levels_types]
     requested_level_types = [normalize_level_type(level_type) for level_type in exposure_levels_types if level_type]
     wants_historical_levels = any(level_type in INTERVAL_LEVEL_VALUE_KEYS for level_type in requested_level_types)
     wants_expected_move_history = 'Expected Move' in requested_level_types
     expiry_key = build_expiry_selection_key(selected_expiries)
 
-    if ticker and current_price and calls is not None and puts is not None and (wants_historical_levels or wants_expected_move_history):
+    if seed_history and ticker and current_price and calls is not None and puts is not None and (wants_historical_levels or wants_expected_move_history):
         needs_interval_seed = wants_historical_levels and not get_interval_data(ticker, display_date_key, expiry_key=expiry_key)
         needs_session_seed = wants_expected_move_history and not get_interval_session_data(ticker, display_date_key, expiry_key=expiry_key)
-        if needs_interval_seed or needs_session_seed:
+        if seed_history and (needs_interval_seed or needs_session_seed):
             store_interval_data(ticker, current_price, strike_range, calls, puts, expiry_key=expiry_key)
 
     historical_exposure_levels, historical_expected_moves = build_historical_levels_overlay(
         ticker=ticker,
         display_date=display_date_key,
-        chart_times=[c['time'] for c in lc_candles],
+        chart_times=chart_times,
         latest_price=current_price,
         strike_range=strike_range,
         selected_types=exposure_levels_types,
@@ -3764,6 +4352,101 @@ def prepare_price_chart_data(price_data, calls=None, puts=None, exposure_levels_
                 'label': f"{display_name}: {format_large_number(val)}"
             })
 
+    return {
+        'show_latest_level_lines': bool(show_latest_level_lines),
+        'exposure_levels': exposure_levels,
+        'expected_moves': expected_moves,
+        'historical_exposure_levels': historical_exposure_levels,
+        'historical_expected_moves': historical_expected_moves,
+    }
+
+
+def prepare_price_chart_data(price_data, calls=None, puts=None, exposure_levels_types=[],
+                              exposure_levels_count=3, call_color='#00FF00', put_color='#FF0000',
+                              strike_range=0.1, use_heikin_ashi=False,
+                              highlight_max_level=False, max_level_color='#800080',
+                              coloring_mode='Linear Intensity', ticker=None, selected_expiries=None,
+                              show_latest_level_lines=True, timeframe=1):
+    """Return raw OHLCV + overlay data as JSON for TradingView Lightweight Charts rendering."""
+    import json as _json
+
+    # Handle backward compatibility
+    if isinstance(exposure_levels_types, str):
+        if exposure_levels_types == 'None':
+            exposure_levels_types = []
+        else:
+            exposure_levels_types = [exposure_levels_types]
+
+    if not price_data or 'candles' not in price_data or not price_data['candles']:
+        return _json.dumps({'error': 'No price data'})
+
+    candles = filter_market_hours(price_data['candles'], ticker)
+    if not candles:
+        return _json.dumps({'error': 'No market-hour candles'})
+
+    # "Day" means the ticker's trading session: the ET date for stocks and indexes, the
+    # Globex day (18:00 ET the evening before to 17:00 ET) for futures.
+    current_date = session_date_for(ticker)
+
+    # Deduplicate and sort
+    unique_candles = {c['datetime']: c for c in candles}
+    sorted_candles = [unique_candles[ts] for ts in sorted(unique_candles)]
+    session_dates = [candle_session_date(ticker, c) for c in sorted_candles]
+
+    # Filter to current session, else the most recent one (weekends, before the open)
+    display_date = current_date if current_date in session_dates else max(session_dates)
+    current_day_candles = [c for c, day in zip(sorted_candles, session_dates) if day == display_date]
+
+    # Apply Heikin-Ashi using all candles as seed, then slice to current day
+    if use_heikin_ashi:
+        all_ha = convert_to_heikin_ashi(sorted_candles)
+        day_start_idx = len(sorted_candles) - len(current_day_candles)
+        display_candles = all_ha[day_start_idx:]
+    else:
+        display_candles = current_day_candles
+
+    # Previous session's close
+    previous_day_close = next(
+        (c['close'] for c, day in zip(reversed(sorted_candles), reversed(session_dates)) if day < display_date),
+        None,
+    )
+
+    # Build Lightweight Charts candle data (time in seconds UTC)
+    lc_candles = []
+    lc_volume = []
+    for i, c in enumerate(display_candles):
+        ts = int(c['datetime'] / 1000)
+        lc_candles.append({'time': ts, 'open': c['open'], 'high': c['high'],
+                           'low': c['low'], 'close': c['close']})
+        is_up = c['close'] >= c['open'] if i == 0 else c['close'] >= display_candles[i - 1]['close']
+        lc_volume.append({'time': ts, 'value': c['volume'],
+                          'color': call_color if is_up else put_color})
+
+    # Multi-day raw candles for indicator warmup (FBB/SMA200 need up to 200 prior bars)
+    lc_indicator_candles = [
+        {'time': int(c['datetime'] / 1000), 'open': c['open'], 'high': c['high'],
+         'low': c['low'], 'close': c['close'], 'volume': c.get('volume', 0)}
+        for c in sorted_candles
+    ]
+    current_day_start_time = int(current_day_candles[0]['datetime'] / 1000) if current_day_candles else 0
+
+    # Use the real last trade, not the Heikin-Ashi averaged close, for strike filtering,
+    # expected move and the stored interval price.
+    current_price = current_day_candles[-1]['close'] if current_day_candles else 0
+    last_candle = display_candles[-1] if display_candles else None
+    last_candle_up = (last_candle['close'] >= last_candle['open']) if last_candle else True
+
+    display_date_key = display_date.strftime('%Y-%m-%d') if hasattr(display_date, 'strftime') else str(display_date)
+    chart_times = [c['time'] for c in lc_candles]
+    remember_price_chart_times(ticker, timeframe, display_date_key, chart_times)
+    overlays = build_price_overlays(
+        ticker, calls, puts, current_price, display_date_key, chart_times, exposure_levels_types,
+        exposure_levels_count=exposure_levels_count, call_color=call_color, put_color=put_color,
+        strike_range=strike_range, highlight_max_level=highlight_max_level,
+        max_level_color=max_level_color, coloring_mode=coloring_mode,
+        selected_expiries=selected_expiries, show_latest_level_lines=show_latest_level_lines,
+    )
+
     return _json.dumps({
         'candles': lc_candles,
         'volume': lc_volume,
@@ -3773,11 +4456,7 @@ def prepare_price_chart_data(price_data, calls=None, puts=None, exposure_levels_
         'put_color': put_color,
         'use_heikin_ashi': use_heikin_ashi,
         'last_candle_up': last_candle_up,
-        'show_latest_level_lines': bool(show_latest_level_lines),
-        'exposure_levels': exposure_levels,
-        'expected_moves': expected_moves,
-        'historical_exposure_levels': historical_exposure_levels,
-        'historical_expected_moves': historical_expected_moves,
+        **overlays,
         'indicator_candles': lc_indicator_candles,
         'indicator_candles_count': len(lc_indicator_candles),
         'max_indicator_bars': schwab_max_bars(timeframe, ticker),
@@ -4716,13 +5395,16 @@ def fetch_options_for_multiple_dates(ticker, dates, exposure_metric="Open Intere
     return combined_calls, combined_puts
 
 # ── Background history collector ─────────────────────────────────────────────
-# History (price-chart bubbles, centroid map) used to be recorded only while a browser
-# was polling /update. The collector keeps recording the selections viewed today, once
-# a minute during the regular session, whenever no browser has refreshed them recently.
+# History (price-chart bubbles, centroid map) is recorded by the live chart stream while a
+# page shows a selection. The collector keeps recording the selection(s) on screen once a
+# minute during the session when nothing else has (paused, or the browser closed).
+# Selections the page has switched away from are dropped, never recorded in the background.
 # Disable with EZOPTIONS_BACKGROUND_COLLECT=0.
 BACKGROUND_COLLECT_ENABLED = os.getenv('EZOPTIONS_BACKGROUND_COLLECT', '1') != '0'
 BACKGROUND_COLLECT_INTERVAL_SEC = 60
-BACKGROUND_COLLECT_MAX_SELECTIONS = 6
+# The live stream refreshes an on-screen selection every build; one not refreshed for this
+# long while another one was is no longer on screen
+BACKGROUND_COLLECT_ACTIVE_SEC = 15
 _collector_selections = {}  # (ticker, expiry_key) -> selection dict
 _collector_lock = threading.Lock()
 _collector_thread = None
@@ -4730,7 +5412,7 @@ _collector_thread = None
 
 def register_collector_selection(ticker, expiry_dates, strike_range, exposure_metric,
                                  delta_adjusted, calculate_in_notional, stored=False):
-    """Remember a selection the dashboard is showing so the collector can keep recording it."""
+    """Remember a selection a page is showing so the collector can keep recording it."""
     if not BACKGROUND_COLLECT_ENABLED:
         return
     expiry_key = build_expiry_selection_key(expiry_dates)
@@ -4753,12 +5435,17 @@ def register_collector_selection(ticker, expiry_dates, strike_range, exposure_me
         })
         if stored:
             entry['last_stored'] = now
-        # Keep only the most recently viewed selections
-        if len(_collector_selections) > BACKGROUND_COLLECT_MAX_SELECTIONS:
-            for stale_key, _ in sorted(_collector_selections.items(), key=lambda kv: kv[1]['last_seen'])[
-                    :len(_collector_selections) - BACKGROUND_COLLECT_MAX_SELECTIONS]:
-                _collector_selections.pop(stale_key, None)
+        # Only what is on screen is recorded: drop selections no page has refreshed lately
+        for stale_key in [key for key, other in _collector_selections.items()
+                          if now - other['last_seen'] > BACKGROUND_COLLECT_ACTIVE_SEC]:
+            del _collector_selections[stale_key]
     ensure_collector_started()
+
+
+def drop_collector_selection(ticker, expiry_dates):
+    """Stop recording a selection the page switched away from."""
+    with _collector_lock:
+        _collector_selections.pop((format_ticker(ticker), build_expiry_selection_key(expiry_dates)), None)
 
 
 def _collect_selection(entry):
@@ -4782,6 +5469,8 @@ def _collect_selection(entry):
         return
     store_interval_data(ticker, S, entry['strike_range'], calls, puts, expiry_key=entry['expiry_key'])
     store_centroid_data(ticker, S, calls, puts, expiry_key=entry['expiry_key'])
+    record_surface_snapshot(ticker, S, calls, puts, entry['expiry_key'], entry['exposure_metric'],
+                            entry['delta_adjusted'], entry['calculate_in_notional'])
 
 
 def _collector_loop():
@@ -5198,6 +5887,38 @@ def index():
             display: none;
         }
 
+        .forecast-controls {
+            position: absolute;
+            /* Sits in the chart's header band (the 56px above the plot), on a row under the title */
+            top: 32px;
+            right: 70px;
+            max-width: calc(100% - 140px);
+            bottom: auto;
+            left: auto;
+            width: auto !important;
+            height: auto !important;
+            flex: 0 0 auto !important;
+            align-items: center;
+            z-index: 6;
+            display: flex;
+            flex-wrap: wrap;
+            justify-content: flex-end;
+            gap: 6px;
+        }
+        .forecast-controls select {
+            background: var(--panel-bg-alt, #2D2D2D);
+            color: var(--text-primary, #ccc);
+            border: 1px solid var(--border-color, #444);
+            border-radius: 4px;
+            font-size: 11px !important;
+            width: auto !important;
+            height: auto !important;
+            min-height: 0 !important;
+            padding: 2px 4px !important;
+        }
+        #chart-control-staging .forecast-controls {
+            position: static;
+        }
         .heatmap-chart-shell {
             display: grid;
             grid-template-rows: auto minmax(0, 1fr);
@@ -7171,6 +7892,10 @@ def index():
                 <label for="heatmap">Exposure Heatmap</label>
             </div>
             <div class="chart-checkbox">
+                <input type="checkbox" id="forecast">
+                <label for="forecast">Exposure Surface</label>
+            </div>
+            <div class="chart-checkbox">
                 <input type="checkbox" id="delta" checked>
                 <label for="delta">Delta Exposure</label>
             </div>
@@ -7239,6 +7964,26 @@ def index():
                     <option value="Per Expiration">Per Expiration</option>
                 </select>
             </div>
+            <div class="forecast-controls" id="forecast-controls">
+                <select id="forecast_type" title="Exposure to forecast. It uses the weighting, delta-adjusted and notional settings above.">
+                    <option value="GEX" selected>GEX</option>
+                    <option value="AbsGEX">Abs GEX</option>
+                    <option value="DEX">DEX</option>
+                    <option value="VEX">Vanna</option>
+                    <option value="Charm">Charm</option>
+                    <option value="Speed">Speed</option>
+                    <option value="Vomma">Vomma</option>
+                    <option value="Color">Color</option>
+                </select>
+                <select id="forecast_range" title="Price range shown around the current price (widens to fit the day's candles)">
+                    <option value="0.5">&plusmn;0.5%</option>
+                    <option value="1">&plusmn;1%</option>
+                    <option value="1.5" selected>&plusmn;1.5%</option>
+                    <option value="2">&plusmn;2%</option>
+                    <option value="3">&plusmn;3%</option>
+                    <option value="5">&plusmn;5%</option>
+                </select>
+            </div>
         </div>
         
         <div class="chart-grid" id="chart-grid">
@@ -7269,9 +8014,17 @@ def index():
         let maxLevelColor = '#800080';
         let lastData = {}; // Store last received data
         let lastPriceData = null; // Price chart data stored separately (fetched via /update_price)
-        let updateInProgress = false;
-        let pendingFullUpdate = false;
-        let pendingHeatmapOnlyUpdate = false;
+        // Live chart stream (/live/stream): the page subscribes to its current settings and
+        // the server pushes the charts that changed. A settings change resubscribes.
+        const LIVE_CLIENT_ID = (window.crypto && crypto.randomUUID)
+            ? crypto.randomUUID()
+            : Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 12);
+        const LIVE_TEMPLATE_KEY = '_plotly_template';
+        const LIVE_SUBSCRIBE_RETRY_MS = 2000;
+        let liveSource = null;
+        let liveSub = { version: 0, key: '' };
+        let livePlotlyTemplate = null;
+        let liveDataSelection = '';  // ticker|expiries the charts in lastData are for
         let expirationsLoading = false;
         let expirationsTicker = null;  // ticker whose expirations populate the expiry list
         let lastExpirationsAttemptMs = 0;
@@ -8288,10 +9041,19 @@ def index():
 
             priceEventSource = new EventSource('/price_stream?ticker=' + encodeURIComponent(upperTicker));
             priceStreamTicker = upperTicker;
+            let streamDropped = false;
+            // Candles that closed while the stream was down are only in the history snapshot
+            priceEventSource.onopen = function() {
+                if (streamDropped) {
+                    streamDropped = false;
+                    fetchPriceHistory(true);
+                }
+            };
 
             priceEventSource.onmessage = function(event) {
                 try {
                     const msg = JSON.parse(event.data);
+                    if (msg.type === 'quote' && typeof msg.last === 'number') applyForecastQuote(msg.last);
                     if (!tvCandleSeries || !tvLastCandles.length) return;
                     if (msg.type === 'quote' && typeof msg.last === 'number') {
                         applyRealtimeQuote(msg.last);
@@ -8303,6 +9065,7 @@ def index():
 
             priceEventSource.onerror = function() {
                 // Browser will auto-reconnect on error; just log it quietly
+                streamDropped = true;
                 console.debug('[PriceStream] Connection error – browser will retry.');
             };
         }
@@ -8455,6 +9218,117 @@ def index():
             }
             // The price scale may have moved; keep bubbles/level lines pinned to their prices
             scheduleTVHistoricalOverlayDraw();
+        }
+
+        // ── Exposure surface candles ──
+        // Drawn apart from the surface figure (which takes a while to build) so they stay live:
+        // the server's 'forecast_candles' snapshot is extended with streamed quotes.
+        let forecastCandleState = null;  // { ticker, timeframe, colors, bars: [{t, x, o, h, l, c}] }
+        let forecastCandleDrawTimer = null;
+        let lastForecastCandlePayload = null;
+        const FORECAST_CANDLE_DRAW_MS = 1000;
+        const forecastEtFormat = new Intl.DateTimeFormat('en-CA', {
+            timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit',
+            hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23',
+        });
+
+        // The surface's time axis is ET wall-clock text ('YYYY-MM-DD HH:MM:SS')
+        function forecastEtLabel(ms) {
+            const p = {};
+            forecastEtFormat.formatToParts(new Date(ms)).forEach(part => { p[part.type] = part.value; });
+            return `${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute}:${p.second}`;
+        }
+
+        function forecastBar(t, o, h, l, c) {
+            return { t, x: forecastEtLabel(t), o, h, l, c };
+        }
+
+        function setForecastCandles(payload) {
+            if (!payload || !Array.isArray(payload.candles)) return;
+            const ticker = (document.getElementById('ticker').value || '').trim().toUpperCase();
+            const bars = payload.candles.map(([t, o, h, l, c]) => forecastBar(t, o, h, l, c));
+            const prev = forecastCandleState;
+            // Keep what the quotes built past the snapshot (it only refreshes every few seconds)
+            if (prev && prev.ticker === ticker && prev.timeframe === payload.timeframe && bars.length) {
+                const lastBase = bars[bars.length - 1];
+                prev.bars.forEach(bar => {
+                    if (bar.t > lastBase.t) {
+                        bars.push(bar);
+                    } else if (bar.t === lastBase.t) {
+                        lastBase.h = Math.max(lastBase.h, bar.h);
+                        lastBase.l = Math.min(lastBase.l, bar.l);
+                        lastBase.c = bar.c;
+                    }
+                });
+            }
+            forecastCandleState = {
+                ticker, timeframe: payload.timeframe, bars,
+                colors: { up: payload.call_color || '#00FF00', down: payload.put_color || '#FF0000' },
+            };
+            scheduleForecastCandlesDraw();
+        }
+
+        function applyForecastQuote(last) {
+            const state = forecastCandleState;
+            if (!state || !state.bars.length || state.ticker !== priceStreamTicker) return;
+            const now = Date.now();
+            if (!isRegularSessionTime(Math.floor(now / 1000))) return;
+            const lastBar = state.bars[state.bars.length - 1];
+            const tfMs = (state.timeframe || 1) * 60000;
+            // Buckets follow the snapshot's (session-aligned) bars, like the price chart
+            const bucket = lastBar.t + Math.floor((now - lastBar.t) / tfMs) * tfMs;
+            if (bucket < lastBar.t) return;
+            if (bucket === lastBar.t) {
+                lastBar.h = Math.max(lastBar.h, last);
+                lastBar.l = Math.min(lastBar.l, last);
+                lastBar.c = last;
+            } else {
+                state.bars.push(forecastBar(bucket, last, last, last, last));
+            }
+            scheduleForecastCandlesDraw();
+        }
+
+        function buildForecastCandleTrace() {
+            const state = forecastCandleState;
+            if (!state || !state.bars.length) return null;
+            const { up, down } = state.colors;
+            return {
+                type: 'candlestick', name: 'OHLC', meta: 'forecast-candles', hoverinfo: 'skip',
+                x: state.bars.map(b => b.x), open: state.bars.map(b => b.o), high: state.bars.map(b => b.h),
+                low: state.bars.map(b => b.l), close: state.bars.map(b => b.c),
+                // Same look as the price chart; no separate outline (it swallows 1-minute bodies)
+                increasing: { line: { color: up, width: 1 }, fillcolor: up },
+                decreasing: { line: { color: down, width: 1 }, fillcolor: down },
+                whiskerwidth: 0,
+            };
+        }
+
+        function scheduleForecastCandlesDraw() {
+            if (forecastCandleDrawTimer) return;
+            forecastCandleDrawTimer = setTimeout(() => {
+                forecastCandleDrawTimer = null;
+                drawForecastCandles();
+            }, FORECAST_CANDLE_DRAW_MS);
+        }
+
+        // Update only the candle trace; the surface itself is left alone
+        function drawForecastCandles() {
+            if (popoutWindows['forecast-chart']) pushDataToPopout('forecast-chart');
+            const el = document.getElementById('forecast-chart');
+            if (!el || !el._fullLayout || !Array.isArray(el.data) || !isPlotlyContainerVisible(el)) return;
+            const trace = buildForecastCandleTrace();
+            if (!trace) return;
+            const idx = el.data.findIndex(t => t.meta === 'forecast-candles');
+            try {
+                if (idx < 0) {
+                    Plotly.addTraces(el, trace);
+                } else {
+                    Plotly.restyle(el, {
+                        x: [trace.x], open: [trace.open], high: [trace.high], low: [trace.low], close: [trace.close],
+                        increasing: [trace.increasing], decreasing: [trace.decreasing],
+                    }, [idx]);
+                }
+            } catch (e) {}
         }
 
         // Streamed 1-minute volumes for the current higher-timeframe bucket, so repeated
@@ -9236,39 +10110,11 @@ ${popoutHelperSource([getThemeValue, calcSMA, calcEMA, calcWMA, calcVWAP, calcBB
       loadInitialData();
     }
   }
-  // Refresh exposure levels every 60 s (options cache updated by main /update cycle)
-  function refreshExposureLevels(){
-    if(popoutFetching||!popoutCurrentTicker)return;
-    var settings=getSettingsFromOpener();
-    if(!settings)return;
-        setPriceAboveBubblesSetting(settings.price_above_bubbles);
-    popoutFetching=true;
-    fetch('/update_price',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(settings)})
-      .then(function(r){return r.json();})
-      .then(function(data){
-        if(!data.error&&data.price){
-          var pd=typeof data.price==='string'?JSON.parse(data.price):data.price;
-          // Only refresh price lines (exposure levels + expected moves), not candles
-          if(tvCandle){
-            tvPriceLines.forEach(function(l){try{tvCandle.removePriceLine(l);}catch(e){}});
-            tvPriceLines=[];tvAllLevelPrices=[];
-                                                tvShowLatestLevelLines=pd.show_latest_level_lines!==false;
-                        tvHistoricalPoints=priceLevelBubblePoints(pd);
-                        pushLatestLevelPrices();
-                        scheduleHistoricalBubbleDraw();
-            tvApplyAutoscale();
-          }
-        }
-      })
-      .catch(function(e){console.warn('Popout exposure refresh error:',e);})
-      .finally(function(){popoutFetching=false;});
-  }
-
   // Kick off: initial load then watch for ticker changes every 3 s
   setTimeout(function(){
     loadInitialData();
     setInterval(tickerWatchLoop,3000);
-    setInterval(refreshExposureLevels,60000);
+    // Level overlays arrive with the price data the main window pushes on each update
   },300);
 
   // Entry point kept for compatibility with pushDataToPopout
@@ -9380,7 +10226,7 @@ ${popoutHelperSource([getThemeValue, calcSMA, calcEMA, calcWMA, calcVWAP, calcBB
         }
     }
     // Shared helpers (source injected from the main window)
-${popoutHelperSource([getThemeValue, escapeTooltipHtml, stripTooltipHtml, formatTooltipNumber, formatTooltipMoney,
+${popoutHelperSource([getThemeValue, escapeTooltipHtml, stripTooltipHtml, formatTooltipNumber, formatLargeNumberCompact, formatTooltipMoney,
     formatTooltipDateTime, parseTooltipColor, formatTooltipRgb, interpolateTooltipColor, resolveHeatmapPointColor,
     resolvePlotlyPointColor, buildPlotlyTooltipContext, buildPlotlyTooltipRow, ensurePlotlyTooltip,
     hidePlotlyTooltip, positionPlotlyTooltip, attachPlotlyCustomTooltip])}
@@ -9560,9 +10406,16 @@ ${popoutHelperSource([getThemeValue, escapeTooltipHtml, stripTooltipHtml, format
             // Price data is stored separately since it's fetched via /update_price
             // Price data goes over as JSON so the popout gets its own copy of the candle arrays
             // (it pushes live candles into them, which would corrupt the main chart's state).
-            const chartPayload = (dataKey === 'price')
+            let chartPayload = (dataKey === 'price')
                 ? (lastPriceData ? JSON.stringify(lastPriceData) : null)
                 : lastData[dataKey];
+            // The surface figure has no candles; send the live ones along with it
+            const candleTrace = dataKey === 'forecast' && chartPayload ? buildForecastCandleTrace() : null;
+            if (candleTrace) {
+                const figure = JSON.parse(chartPayload);
+                figure.data.push(candleTrace);
+                chartPayload = JSON.stringify(figure);
+            }
 
             const isHtml = (dataKey === 'large_trades');
             try {
@@ -9684,8 +10537,11 @@ ${popoutHelperSource([getThemeValue, escapeTooltipHtml, stripTooltipHtml, format
         });
         document.getElementById('coloring_mode').addEventListener('change', updateData);
         document.getElementById('exposure_metric').addEventListener('change', updateData);
-        document.getElementById('heatmap_type').addEventListener('change', updateHeatmapOnly);
-        document.getElementById('heatmap_coloring_mode').addEventListener('change', updateHeatmapOnly);
+        document.getElementById('heatmap_type').addEventListener('change', updateData);
+        document.getElementById('heatmap_coloring_mode').addEventListener('change', updateData);
+        ['forecast_type', 'forecast_range'].forEach(id => {
+            document.getElementById(id).addEventListener('change', updateData);
+        });
         document.getElementById('levels_count').addEventListener('input', refreshPriceLevelsOnly);
         document.getElementById('abs_gex_opacity').addEventListener('input', updateData);
 
@@ -9856,6 +10712,9 @@ ${popoutHelperSource([getThemeValue, escapeTooltipHtml, stripTooltipHtml, format
                 const titleText = stripTooltipHtml(plotDiv?._fullLayout?.title?.text || 'Breakdown');
                 return escapeTooltipHtml(titleText || 'Breakdown');
             }
+            if (firstPoint?.fullData?.type === 'heatmap' && String(firstPoint.fullData.meta || '').startsWith('forecast')) {
+                return `${escapeTooltipHtml(formatTooltipDateTime(firstPoint.x))} \\u2022 Price ${escapeTooltipHtml(formatTooltipMoney(firstPoint.y))}`;
+            }
             if (firstPoint?.fullData?.type === 'heatmap') {
                 return `Exp ${escapeTooltipHtml(firstPoint.x)} • Strike ${escapeTooltipHtml(formatTooltipMoney(firstPoint.y))}`;
             }
@@ -9884,6 +10743,7 @@ ${popoutHelperSource([getThemeValue, escapeTooltipHtml, stripTooltipHtml, format
             const chartTitle = stripTooltipHtml(plotDiv?._fullLayout?.title?.text || '');
             let name = traceName && !/^trace\\s+\\d+$/i.test(traceName) ? traceName : 'Value';
             let value = '';
+            let unitNote = '';
 
             if (isPiePoint) {
                 name = point.label || name;
@@ -9896,7 +10756,18 @@ ${popoutHelperSource([getThemeValue, escapeTooltipHtml, stripTooltipHtml, format
                 value = `${formatTooltipMoney(point.customdata[1])}  ${formatTooltipNumber(point.customdata[2])}`;
             } else if (isHeatmapPoint) {
                 name = name === 'Value' ? 'Exposure' : name;
-                value = point.customdata != null ? formatTooltipNumber(point.customdata) : formatTooltipNumber(point.z);
+                const forecastMeta = String(point.fullData.meta || '');
+                if (forecastMeta.startsWith('forecast')) {
+                    // Exposure surface: the real value in K/M/B/T (e.g. -$212.15M) with its unit underneath
+                    const unit = forecastMeta.slice('forecast|'.length);
+                    const real = Number(point.customdata);
+                    value = Number.isFinite(real)
+                        ? (real < 0 ? '-' : '') + (unit.startsWith('$') ? '$' : '') + formatLargeNumberCompact(Math.abs(real))
+                        : '';
+                    unitNote = unit;
+                } else {
+                    value = point.customdata != null ? formatTooltipNumber(point.customdata) : formatTooltipNumber(point.z);
+                }
             } else if (isCentroidPoint) {
                 const centroidValue = formatTooltipMoney(point.y);
                 const volumeValue = point.customdata != null ? `Vol ${formatTooltipNumber(point.customdata, 0)}` : '';
@@ -9928,7 +10799,8 @@ ${popoutHelperSource([getThemeValue, escapeTooltipHtml, stripTooltipHtml, format
                 + `<span class="tt-name">${escapeTooltipHtml(name)}</span>`
                 + `<span class="tt-value">${escapeTooltipHtml(value)}</span>`
                 + '</div>'
-                + '</div>';
+                + '</div>'
+                + (unitNote ? `<div class="tt-more">${escapeTooltipHtml(unitNote)}</div>` : '');
         }
 
         function ensurePlotlyTooltip(plotDiv) {
@@ -10008,7 +10880,22 @@ ${popoutHelperSource([getThemeValue, escapeTooltipHtml, stripTooltipHtml, format
                     target.appendChild(control);
                 }
             });
+
+            // Parking the heatmap controls also rescues the forecast controls before a chart
+            // container is dropped, so they are never destroyed with it.
+            if (!toolbar) {
+                const forecastControls = document.getElementById('forecast-controls');
+                if (forecastControls && forecastControls.parentElement !== staging) {
+                    staging.appendChild(forecastControls);
+                }
+            }
         }
+
+        function mountForecastControls(container) {
+            const forecastControls = document.getElementById('forecast-controls');
+            if (forecastControls && container && forecastControls.parentElement !== container) {
+                container.appendChild(forecastControls);
+            }        }
 
         function ensureHeatmapChartShell(container) {
             if (!container) {
@@ -10082,6 +10969,11 @@ ${popoutHelperSource([getThemeValue, escapeTooltipHtml, stripTooltipHtml, format
             delete container.__pendingChartData;
 
             const chartData = typeof rawChartData === 'string' ? JSON.parse(rawChartData) : rawChartData;
+            if (key === 'forecast') {
+                // Candles aren't in the surface figure; carry the live ones into each new build
+                const candleTrace = buildForecastCandleTrace();
+                if (candleTrace) chartData.data.push(candleTrace);
+            }
             const baseMargins = chartData.layout.margin || {l: 44, r: 28, t: 44, b: 28};
 
             chartData.layout.autosize = true;
@@ -10101,7 +10993,7 @@ ${popoutHelperSource([getThemeValue, escapeTooltipHtml, stripTooltipHtml, format
                 }
             }
 
-            if (key !== 'heatmap') {
+            if (key !== 'heatmap' && key !== 'forecast') {
                 if (chartData.layout.xaxis) {
                     chartData.layout.xaxis.autorange = true;
                 }
@@ -10151,6 +11043,7 @@ ${popoutHelperSource([getThemeValue, escapeTooltipHtml, stripTooltipHtml, format
             plotElement.__livePriceStr = null;
 
             Promise.resolve(plotPromise).then(() => {
+                if (key === 'forecast') mountForecastControls(container);
                 attachPlotlyCustomTooltip(plotElement);
                 if (key === 'heatmap') {
                     scheduleHeatmapPlotResize(containerId);
@@ -10339,81 +11232,6 @@ ${popoutHelperSource([getThemeValue, escapeTooltipHtml, stripTooltipHtml, format
             try { Plotly.relayout(div, relayoutUpdate); } catch(e) {}
         }
 
-        function updateHeatmapOnly() {
-            let fallbackToFullUpdate = false;
-
-            if (!document.getElementById('heatmap').checked) {
-                return;
-            }
-
-            if (updateInProgress) {
-                pendingHeatmapOnlyUpdate = true;
-                return;
-            }
-
-            const expiry = getSelectedExpiryValues();
-            if (expiry.length === 0) {
-                return;
-            }
-
-            updateInProgress = true;
-            pendingHeatmapOnlyUpdate = false;
-
-            fetch('/update_heatmap', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                },
-                body: JSON.stringify({
-                    ticker: document.getElementById('ticker').value,
-                    expiry,
-                    show_calls: document.getElementById('show_calls').checked,
-                    show_puts: document.getElementById('show_puts').checked,
-                    show_net: document.getElementById('show_net').checked,
-                    strike_range: parseFloat(document.getElementById('strike_range').value) / 100,
-                    call_color: callColor,
-                    put_color: putColor,
-                    heatmap_type: document.getElementById('heatmap_type').value,
-                    heatmap_coloring_mode: document.getElementById('heatmap_coloring_mode').value,
-                })
-            })
-            .then(response => response.json())
-            .then(data => {
-                if (data.error || !data.heatmap) {
-                    console.warn('Heatmap-only update fell back to full update:', data.error || 'missing heatmap payload');
-                    fallbackToFullUpdate = true;
-                    return;
-                }
-
-                lastData = {
-                    ...lastData,
-                    heatmap: data.heatmap,
-                    selected_expiries: data.selected_expiries || lastData.selected_expiries,
-                };
-
-                if (!renderPlotlyChart('heatmap', data.heatmap)) {
-                    updateCharts(lastData);
-                } else {
-                    pushAllPopouts();
-                }
-            })
-            .catch(error => {
-                console.error('Heatmap-only update failed:', error);
-                fallbackToFullUpdate = true;
-            })
-            .finally(() => {
-                updateInProgress = false;
-                if (fallbackToFullUpdate) {
-                    updateData();
-                    return;
-                }
-                if (pendingHeatmapOnlyUpdate) {
-                    pendingHeatmapOnlyUpdate = false;
-                    updateHeatmapOnly();
-                }
-            });
-        }
-
         // Levels dropdown handlers
         function updateLevelsDisplay() {
             const checkedBoxes = document.querySelectorAll('.levels-option input[type="checkbox"]:checked');
@@ -10432,7 +11250,6 @@ ${popoutHelperSource([getThemeValue, escapeTooltipHtml, stripTooltipHtml, format
             const rawLevels = notePriceLevelSelectionChanged();
             updateLevelsDisplay();
             syncMobilePanelButtons();
-            const hasLastData = !!(lastData && Object.keys(lastData).length);
             if (!rawLevels.length && isPriceLevelEmptyFallbackActive()) {
                 schedulePriceLevelEmptyRefresh();
                 return;
@@ -10446,9 +11263,8 @@ ${popoutHelperSource([getThemeValue, escapeTooltipHtml, stripTooltipHtml, format
                 _priceHistoryLastKey = '';
                 fetchPriceHistory(true);
             }
-            if (!hasLastData && !updateInProgress) {
-                updateData();
-            }
+            // Resubscribe now so overlay frames for the old levels are dropped
+            updateData();
         }
 
         document.getElementById('levels-display').addEventListener('click', function(e) {
@@ -10465,9 +11281,8 @@ ${popoutHelperSource([getThemeValue, escapeTooltipHtml, stripTooltipHtml, format
         });
         
         function updateData() {
-            if (updateInProgress || expirationsLoading) {
-                pendingFullUpdate = true;
-                return; // Skip if an update is already in progress
+            if (expirationsLoading) {
+                return;  // the next tick picks up the new expiry list
             }
 
             // Don't send a half-typed / uncommitted ticker with the previous ticker's
@@ -10498,8 +11313,6 @@ ${popoutHelperSource([getThemeValue, escapeTooltipHtml, stripTooltipHtml, format
                 if (hasExpiredSelection) return;
             }
 
-            updateInProgress = true;
-
             const ticker = document.getElementById('ticker').value;
             const requestTicker = ticker.toUpperCase();
             const tickerChanged = tvLastTicker !== null && ticker.toUpperCase() !== tvLastTicker.toUpperCase();
@@ -10527,7 +11340,6 @@ ${popoutHelperSource([getThemeValue, escapeTooltipHtml, stripTooltipHtml, format
             
             // Ensure at least one expiry is selected
             if (expiry.length === 0) {
-                updateInProgress = false;
                 // A failed/empty /expirations call (e.g. a transient Schwab error at startup)
                 // used to leave the list empty forever; keep retrying until it loads.
                 const hasExpiryOptions = document.querySelectorAll('.expiry-option input[type="checkbox"]').length > 0;
@@ -10578,142 +11390,223 @@ ${popoutHelperSource([getThemeValue, escapeTooltipHtml, stripTooltipHtml, format
                 show_centroid: document.getElementById('centroid').checked
             };
 
-            // Historical bubble overlays depend on /update populating the interval
+            // Historical bubble overlays depend on the chart build populating the interval
             // store and options cache first. If level overlays are enabled, defer the
-            // price-chart fetch until the /update request completes to avoid rendering
-            // a bubble-less chart that only corrects after a full reload.
+            // price-chart fetch until the first chart frame for this selection arrives to
+            // avoid rendering a bubble-less chart that only corrects after a full reload.
             const deferPriceHistoryUntilUpdate = levelsTypes.length > 0;
 
-            // Fetch price history immediately only when no historical overlays are requested.
-            // Real-time candle ticks come from SSE (connectPriceStream), not from polling.
-            if (visibleCharts.show_price && !deferPriceHistoryUntilUpdate) {
+            syncLiveSubscription({
+                ticker,
+                expiry,
+                show_calls: showCalls,
+                show_puts: showPuts,
+                show_net: showNet,
+                coloring_mode: coloringMode,
+                horizontal_bars: horizontalBars,
+                show_abs_gex: showAbsGex,
+                abs_gex_opacity: absGexOpacity,
+                use_range: useRange,
+                exposure_metric: exposureMetric,
+                heatmap_type: heatmapType,
+                heatmap_coloring_mode: heatmapColoringMode,
+                delta_adjusted: deltaAdjusted,
+                calculate_in_notional: calculateInNotional,
+                strike_range: strikeRange,
+                call_color: callColor,
+                put_color: putColor,
+                highlight_max_level: highlightMaxLevel,
+                max_level_color: maxLevelColor,
+                max_level_mode: maxLevelMode,
+                ...visibleCharts,
+                ...liveForecastSettings(),
+                ...(visibleCharts.show_price ? livePriceOverlaySettings(levelsTypes) : {}),
+            }, {
+                ticker: requestTicker,
+                expiryKey: requestExpiryKey,
+                showPrice: visibleCharts.show_price,
+                forcePrice: deferPriceHistoryUntilUpdate && (tickerChanged || !tvLastCandles.length),
+            });
+
+            // Real-time candle ticks come from SSE (connectPriceStream); this only refreshes
+            // the history/levels payload (fetchPriceHistory throttles itself).
+            if (visibleCharts.show_price && (!deferPriceHistoryUntilUpdate || liveSub.received)) {
                 fetchPriceHistory(tickerChanged || !tvLastCandles.length);
             }
+        }
 
-            function normalizeFetchError(error) {
-                if (!error) {
-                    return 'Unknown update error.';
-                }
-                if (typeof error === 'string') {
-                    return error;
-                }
-                if (error.name === 'AbortError') {
-                    return 'Request was cancelled.';
-                }
-                if (error.name === 'SyntaxError') {
-                    return 'The server returned an unreadable response.';
-                }
-                return error.message || String(error);
+        // Only sent while the forecast is shown, so its settings don't resubscribe otherwise
+        function liveForecastSettings() {
+            if (!document.getElementById('forecast').checked) return {};
+            return {
+                show_forecast: true,
+                forecast_type: document.getElementById('forecast_type').value,
+                forecast_range: parseFloat(document.getElementById('forecast_range').value),
+                timeframe: parseInt(document.getElementById('timeframe').value, 10),
+            };
+        }
+
+        // The stream pushes level overlays for the loaded price chart (its candles come from
+        // /price_stream); only needed while price levels are selected
+        function livePriceOverlaySettings(levelsTypes) {
+            if (!levelsTypes.length) return {};
+            return {
+                levels_types: levelsTypes,
+                levels_count: parseInt(document.getElementById('levels_count').value),
+                timeframe: parseInt(document.getElementById('timeframe').value, 10),
+            };
+        }
+
+        // Point the live stream at these settings. Only a change is sent to the server;
+        // the stream then delivers every rebuild of the charts for them.
+        function syncLiveSubscription(settings, meta) {
+            ensureLiveStream();
+            const key = JSON.stringify(settings);
+            if (key !== liveSub.key) {
+                liveSub = {
+                    ...meta, key, settings,
+                    version: liveSub.version + 1,
+                    received: false, posting: false, posted: false, retryAtMs: 0,
+                };
+                postLiveSubscription();
+            } else if (!liveSub.posted && !liveSub.posting && Date.now() >= liveSub.retryAtMs) {
+                postLiveSubscription();
             }
-            
-            fetch('/update', {
+        }
+
+        function postLiveSubscription() {
+            const sub = liveSub;
+            sub.posting = true;
+            fetch('/live/subscribe', {
                 method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                },
-                body: JSON.stringify({ 
-                    ticker, 
-                    expiry,
-                    show_calls: showCalls,
-                    show_puts: showPuts,
-                    show_net: showNet,
-                    coloring_mode: coloringMode,
-                    horizontal_bars: horizontalBars,
-                    show_abs_gex: showAbsGex,
-                    abs_gex_opacity: absGexOpacity,
-                    use_range: useRange,
-                    exposure_metric: exposureMetric,
-                    heatmap_type: heatmapType,
-                    heatmap_coloring_mode: heatmapColoringMode,
-                    delta_adjusted: deltaAdjusted,
-                    calculate_in_notional: calculateInNotional,
-                    strike_range: strikeRange,
-                    call_color: callColor,
-                    put_color: putColor,
-                    highlight_max_level: highlightMaxLevel,
-                    max_level_color: maxLevelColor,
-                    max_level_mode: maxLevelMode,
-                    ...visibleCharts
-                })
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ client: LIVE_CLIENT_ID, sub: sub.version, settings: sub.settings })
             })
-            .then(async response => {
-                const payload = await response.json().catch(() => {
-                    throw new SyntaxError(`Update request returned non-JSON (HTTP ${response.status})`);
-                });
-
-                if (!response.ok) {
-                    throw new Error(payload?.error || `Update request failed with HTTP ${response.status}`);
-                }
-
-                return payload;
-            })
-            .then(data => {
-                const activeTicker = (document.getElementById('ticker').value || '').toUpperCase();
-                const activeExpiryKey = getSelectedExpiryValues().slice().sort().join('|');
-                if (activeTicker !== requestTicker || activeExpiryKey !== requestExpiryKey) {
-                    return;
-                }
-                // The server dropped expired dates from this selection; reload the list so
-                // the selection rule (or the empty hand-picked selection) is applied to it
-                if (data.expired_expiries && data.expired_expiries.length && !expirationsLoading) {
-                    loadExpirations();
-                }
-                if (data.error) {
-                    showError(data.error);
-                    noteUpdateFailure();
-                    return;
-                }
-                consecutiveUpdateFailures = 0;
-                updateBackoffUntilMs = 0;
-                
-                // Only update if data has changed
-                if (JSON.stringify(data) !== JSON.stringify(lastData)) {
-                    lastData = data;  // Update before rendering so popout windows get fresh data
-                    try {
-                        updateCharts(data);
-                        updatePriceInfo(data.price_info);
-                    } catch (renderError) {
-                        console.error('Error rendering update payload:', renderError);
-                        showError('Render Error: ' + normalizeFetchError(renderError));
-                        return;
-                    }
-                }
+            .then(response => {
+                if (!response.ok) throw new Error(`Subscribe failed with HTTP ${response.status}`);
+                sub.posted = true;
             })
             .catch(error => {
-                // Ignore failures of requests for a ticker/expiry that is no longer selected
-                const activeTicker = (document.getElementById('ticker').value || '').toUpperCase();
-                const activeExpiryKey = getSelectedExpiryValues().slice().sort().join('|');
-                if (activeTicker !== requestTicker || activeExpiryKey !== requestExpiryKey) {
-                    return;
-                }
-                const normalizedMessage = normalizeFetchError(error);
-                const userMessage = /network|failed to fetch/i.test(normalizedMessage)
+                sub.retryAtMs = Date.now() + LIVE_SUBSCRIBE_RETRY_MS;
+                if (sub !== liveSub) return;
+                showError(/network|failed to fetch/i.test(error.message || '')
                     ? 'Network Error: Could not connect to the server.'
-                    : normalizedMessage;
-                showError(userMessage);
+                    : error.message);
                 noteUpdateFailure();
-                console.error('Error fetching data:', error);
+                console.error('Live subscribe failed:', error);
             })
-            .finally(() => {
-                updateInProgress = false;
-                // The options cache is populated now, so the price chart can pick up levels.
-                // Only force a Schwab price-history refetch when the chart needs a fresh
-                // load; otherwise let fetchPriceHistory's throttle apply (it still refetches
-                // immediately whenever the payload changes). Runs on errors too so a failed
-                // /update doesn't leave the deferred price chart empty.
-                if (visibleCharts.show_price) {
-                    fetchPriceHistory(deferPriceHistoryUntilUpdate && (tickerChanged || !tvLastCandles.length));
+            .finally(() => { sub.posting = false; });
+        }
+
+        function ensureLiveStream() {
+            if (liveSource && liveSource.readyState !== EventSource.CLOSED) return;
+            const source = new EventSource('/live/stream?client=' + encodeURIComponent(LIVE_CLIENT_ID));
+            let opened = false;
+            // EventSource reconnects by itself; after a reconnect, resend the subscription
+            // in case the server restarted and no longer knows this page.
+            source.onopen = () => {
+                if (opened && liveSub.key) {
+                    postLiveSubscription();
+                    // It also forgets the price chart's candle times, which a snapshot re-reads
+                    if (document.getElementById('price').checked) fetchPriceHistory(true);
                 }
-                if (pendingFullUpdate) {
-                    pendingFullUpdate = false;
-                    updateData();
+                opened = true;
+            };
+            source.onmessage = event => {
+                let frame;
+                try {
+                    frame = JSON.parse(event.data);
+                } catch (e) {
+                    console.error('Unreadable live frame:', e);
                     return;
                 }
-                if (pendingHeatmapOnlyUpdate) {
-                    pendingHeatmapOnlyUpdate = false;
-                    updateHeatmapOnly();
+                handleLiveFrame(frame);
+            };
+            liveSource = source;
+        }
+
+        function closeLiveStream() {
+            if (liveSource) {
+                liveSource.close();
+                liveSource = null;
+            }
+            liveSub = { version: liveSub.version, key: '' };
+            try {
+                navigator.sendBeacon('/live/unsubscribe',
+                    new Blob([JSON.stringify({ client: LIVE_CLIENT_ID })], { type: 'application/json' }));
+            } catch (e) {}
+        }
+
+        function handleLiveFrame(frame) {
+            const sub = liveSub;
+            if (frame.sub !== sub.version) return;
+            // Ignore frames for a ticker/expiry that is no longer selected (the next tick resubscribes)
+            const activeTicker = (document.getElementById('ticker').value || '').toUpperCase();
+            const activeExpiryKey = getSelectedExpiryValues().slice().sort().join('|');
+            if (activeTicker !== sub.ticker || activeExpiryKey !== sub.expiryKey) return;
+
+            const firstFrame = !sub.received;
+            sub.received = true;
+            if (frame.error) {
+                // The server dropped expired dates from this selection; reload the list so
+                // the selection rule (or the empty hand-picked selection) is applied to it
+                if (frame.expired_expiries && frame.expired_expiries.length && !expirationsLoading) {
+                    loadExpirations();
+                }
+                showError(frame.error);
+                noteUpdateFailure();
+            } else {
+                consecutiveUpdateFailures = 0;
+                updateBackoffUntilMs = 0;
+                applyLiveData(frame, sub);
+            }
+            if (firstFrame && sub.showPrice) {
+                // The options cache is populated now, so the price chart can pick up levels
+                fetchPriceHistory(sub.forcePrice);
+            }
+            // While paused, a settings change still draws once, then the stream closes
+            if (!isStreaming) closeLiveStream();
+        }
+
+        function applyLiveData(frame, sub) {
+            const changes = frame.set || {};
+            if (changes[LIVE_TEMPLATE_KEY]) livePlotlyTemplate = changes[LIVE_TEMPLATE_KEY];
+            const data = frame.full ? {} : { ...lastData };
+            // A new forecast builds in the background; until it arrives keep showing the last
+            // one when it is for the same ticker and expiries (e.g. only its range changed)
+            if (frame.full && !('forecast' in changes) && lastData.forecast
+                    && liveDataSelection === sub.ticker + '|' + sub.expiryKey) {
+                data.forecast = lastData.forecast;
+            }
+            liveDataSelection = sub.ticker + '|' + sub.expiryKey;
+            Object.entries(changes).forEach(([key, value]) => {
+                if (key === LIVE_TEMPLATE_KEY) return;
+                // Charts arrive as figure objects without plotly.py's default template (sent
+                // once per connection); the rest of the page works with figure JSON text.
+                if (value && typeof value === 'object' && value.layout && value.data) {
+                    if (livePlotlyTemplate && !('template' in value.layout)) {
+                        value.layout.template = livePlotlyTemplate;
+                    }
+                    data[key] = JSON.stringify(value);
+                } else {
+                    data[key] = value;
                 }
             });
+            (frame.del || []).forEach(key => { delete data[key]; });
+
+            if (changes.expired_expiries && changes.expired_expiries.length && !expirationsLoading) {
+                loadExpirations();
+            }
+
+            lastData = data;  // Update before rendering so popout windows get fresh data
+            try {
+                updateCharts(data);
+                updatePriceInfo(data.price_info);
+                if (changes.price_overlays) applyPriceOverlays(changes.price_overlays);
+            } catch (renderError) {
+                console.error('Error rendering live update:', renderError);
+                showError('Render Error: ' + (renderError.message || String(renderError)));
+            }
         }
 
         // ── TradingView Lightweight Charts price chart renderer ───────────────
@@ -13398,6 +14291,31 @@ ${popoutHelperSource([getThemeValue, escapeTooltipHtml, stripTooltipHtml, format
                 connectPriceStream(streamTicker);
             }
 
+            applyTVPriceOverlays(priceData);
+            if (tvActiveInds.size > 0) applyIndicators(tvIndicatorCandles, tvActiveInds);
+
+            // fitContent on first render, when auto-range is ON, or when explicitly forced (ticker change)
+            if (tvAutoRange || isFirstRender || tvForceFit) {
+                const _chart = tvPriceChart;
+                setTimeout(() => {
+                    try {
+                        _chart.timeScale().fitContent();
+                        _chart.priceScale('right').applyOptions({ autoScale: true });
+                        tvApplyAutoscale();
+                        if (tvRsiChart)  tvRsiChart.priceScale('right').applyOptions({ autoScale: true });
+                        if (tvMacdChart) tvMacdChart.priceScale('right').applyOptions({ autoScale: true });
+                        if (tvArvChart)  tvArvChart.priceScale('right').applyOptions({ autoScale: true });
+                        scheduleTVHistoricalOverlayDraw();
+                    } catch(e) {}
+                }, 50);
+                tvForceFit = false;
+            }
+        }
+        // ─────────────────────────────────────────────────────────────────────
+
+        // Exposure level lines, expected moves and historical bubbles. Also redrawn on their own
+        // when the live stream pushes new overlays, leaving the (streamed) candles as they are.
+        function applyTVPriceOverlays(priceData) {
             // Remove old dynamic price lines before rebuilding current snapshot and historical overlays.
             tvExposurePriceLines.forEach(l => { try { tvCandleSeries.removePriceLine(l); } catch(e){} });
             tvExposurePriceLines = [];
@@ -13423,26 +14341,16 @@ ${popoutHelperSource([getThemeValue, escapeTooltipHtml, stripTooltipHtml, format
             scheduleTVHistoricalOverlayDraw();
 
             tvApplyAutoscale();
-            if (tvActiveInds.size > 0) applyIndicators(tvIndicatorCandles, tvActiveInds);
-
-            // fitContent on first render, when auto-range is ON, or when explicitly forced (ticker change)
-            if (tvAutoRange || isFirstRender || tvForceFit) {
-                const _chart = tvPriceChart;
-                setTimeout(() => {
-                    try {
-                        _chart.timeScale().fitContent();
-                        _chart.priceScale('right').applyOptions({ autoScale: true });
-                        tvApplyAutoscale();
-                        if (tvRsiChart)  tvRsiChart.priceScale('right').applyOptions({ autoScale: true });
-                        if (tvMacdChart) tvMacdChart.priceScale('right').applyOptions({ autoScale: true });
-                        if (tvArvChart)  tvArvChart.priceScale('right').applyOptions({ autoScale: true });
-                        scheduleTVHistoricalOverlayDraw();
-                    } catch(e) {}
-                }, 50);
-                tvForceFit = false;
-            }
         }
-        // ─────────────────────────────────────────────────────────────────────
+
+        function applyPriceOverlays(overlays) {
+            if (!lastPriceData || !tvPriceChart || !document.getElementById('price').checked) return;
+            // Latest-level lines are a display toggle kept on the page, not part of the pushed data
+            lastPriceData = { ...lastPriceData, ...overlays, show_latest_level_lines: getShowLatestLevelLinesSetting() };
+            tvLastPriceData = lastPriceData;
+            applyTVPriceOverlays(lastPriceData);
+            pushDataToPopout('price-chart');
+        }
 
         // Standalone price chart renderer — called by /update_price without touching other charts.
         function applyPriceData(priceJson) {
@@ -13483,11 +14391,12 @@ ${popoutHelperSource([getThemeValue, escapeTooltipHtml, stripTooltipHtml, format
             }
         }
 
-        // ── Throttled price history fetcher ───────────────────────────────────
-        // Fetches candle history + exposure levels from /update_price.
-        // Real-time ticks come from SSE; this only handles the historical snapshot
-        // and exposure level overlays, so it runs at most every 30 seconds unless
-        // forced (ticker change or visible settings change).
+        // ── Price history snapshot ────────────────────────────────────────────
+        // Fetches candle history + exposure levels from /update_price when the chart's
+        // settings change. Real-time candles come from /price_stream and level overlays
+        // from the live chart stream, so otherwise it only re-reads every few minutes to
+        // reconcile anything a stream missed.
+        const PRICE_HISTORY_RESYNC_MS = 5 * 60 * 1000;
         let _priceHistoryLastMs = 0;
         let _priceHistoryLastKey = '';
         let _priceHistoryInFlight = false;
@@ -13590,8 +14499,9 @@ ${popoutHelperSource([getThemeValue, escapeTooltipHtml, stripTooltipHtml, format
                 return;
             }
             const now = Date.now();
-            // Skip if nothing changed and it's been less than 30 seconds
-            if (!force && key === _priceHistoryLastKey && now - _priceHistoryLastMs < 30000) return;
+            // Skip if nothing changed: live candles come from /price_stream and level overlays
+            // from the live chart stream; this snapshot is only re-read as a safety resync
+            if (!force && key === _priceHistoryLastKey && now - _priceHistoryLastMs < PRICE_HISTORY_RESYNC_MS) return;
             _priceHistoryLastMs = now;
             _priceHistoryLastKey = key;
             _priceHistoryPendingRefresh = false;
@@ -13629,6 +14539,7 @@ ${popoutHelperSource([getThemeValue, escapeTooltipHtml, stripTooltipHtml, format
                 price: document.getElementById('price').checked,
                 gamma: document.getElementById('gamma').checked,
                 heatmap: document.getElementById('heatmap').checked,
+                forecast: document.getElementById('forecast').checked,
                 delta: document.getElementById('delta').checked,
                 vanna: document.getElementById('vanna').checked,
                 charm: document.getElementById('charm').checked,
@@ -13641,6 +14552,18 @@ ${popoutHelperSource([getThemeValue, escapeTooltipHtml, stripTooltipHtml, format
                 large_trades: document.getElementById('large_trades').checked,
                 centroid: document.getElementById('centroid').checked
             };
+
+            if (selectedCharts.forecast && data.forecast_candles) {
+                // The same snapshot comes back with every update until the server refreshes it
+                if (data.forecast_candles !== lastForecastCandlePayload) {
+                    lastForecastCandlePayload = data.forecast_candles;
+                    setForecastCandles(typeof data.forecast_candles === 'string'
+                        ? JSON.parse(data.forecast_candles) : data.forecast_candles);
+                }
+                // Quotes keep the surface's last candle moving even with the price chart off
+                const streamTicker = (document.getElementById('ticker').value || '').trim();
+                if (streamTicker && isStreaming) connectPriceStream(streamTicker);
+            }
 
             // Handle price chart separately (TradingView Lightweight Charts)
             if (selectedCharts.price && data.price) {
@@ -14390,6 +15313,7 @@ ${popoutHelperSource([getThemeValue, escapeTooltipHtml, stripTooltipHtml, format
             clearInterval(updateInterval);
             if (marketContextTimer) clearInterval(marketContextTimer);
             disconnectPriceStream();
+            closeLiveStream();
             Object.values(charts).forEach(chart => {
                 Plotly.purge(chart);
             });
@@ -14410,8 +15334,9 @@ ${popoutHelperSource([getThemeValue, escapeTooltipHtml, stripTooltipHtml, format
                 if (tickerVal) connectPriceStream(tickerVal);
             } else {
                 clearInterval(updateInterval);
-                // Disconnect real-time price stream when pausing
+                // Disconnect real-time price and chart streams when pausing
                 disconnectPriceStream();
+                closeLiveStream();
             }
         }
         
@@ -14427,6 +15352,8 @@ ${popoutHelperSource([getThemeValue, escapeTooltipHtml, stripTooltipHtml, format
                 exposure_metric: document.getElementById('exposure_metric').value,
                 heatmap_type: document.getElementById('heatmap_type').value,
                 heatmap_coloring_mode: document.getElementById('heatmap_coloring_mode').value,
+                forecast_type: document.getElementById('forecast_type').value,
+                forecast_range: document.getElementById('forecast_range').value,
                 delta_adjusted_exposures: document.getElementById('delta_adjusted_exposures').checked,
                 calculate_in_notional: document.getElementById('calculate_in_notional').checked,
                 show_calls: document.getElementById('show_calls').checked,
@@ -14456,6 +15383,7 @@ ${popoutHelperSource([getThemeValue, escapeTooltipHtml, stripTooltipHtml, format
                     price: document.getElementById('price').checked,
                     gamma: document.getElementById('gamma').checked,
                     heatmap: document.getElementById('heatmap').checked,
+                    forecast: document.getElementById('forecast').checked,
                     delta: document.getElementById('delta').checked,
                     vanna: document.getElementById('vanna').checked,
                     charm: document.getElementById('charm').checked,
@@ -14482,6 +15410,8 @@ ${popoutHelperSource([getThemeValue, escapeTooltipHtml, stripTooltipHtml, format
             if (settings.exposure_metric) document.getElementById('exposure_metric').value = settings.exposure_metric;
             if (settings.heatmap_type) document.getElementById('heatmap_type').value = settings.heatmap_type;
             if (settings.heatmap_coloring_mode) document.getElementById('heatmap_coloring_mode').value = settings.heatmap_coloring_mode;
+            if (settings.forecast_type) document.getElementById('forecast_type').value = settings.forecast_type;
+            if (settings.forecast_range) document.getElementById('forecast_range').value = settings.forecast_range;
             if (settings.delta_adjusted_exposures !== undefined) document.getElementById('delta_adjusted_exposures').checked = settings.delta_adjusted_exposures;
             if (settings.calculate_in_notional !== undefined) document.getElementById('calculate_in_notional').checked = settings.calculate_in_notional;
             if (settings.show_calls !== undefined) document.getElementById('show_calls').checked = settings.show_calls;
@@ -14780,15 +15710,15 @@ def _safe_chart(name, builder, *args, **kwargs):
         return None
 
 
-@app.route('/update', methods=['POST'])
-def update():
-    data = request.get_json()
+def build_update_payload(data):
+    """Compute the exposure charts + price info for one selection. Returns (payload, status).
+    Charts are Plotly figure JSON strings (the options chain is an HTML string)."""
     ticker = data.get('ticker')
     expiry = data.get('expiry')  # This can now be a list or single value
     
     ticker = format_ticker(ticker) 
     if not ticker or not expiry:
-        return jsonify({'error': 'Missing ticker or expiry'}), 400
+        return {'error': 'Missing ticker or expiry'}, 400
     
     # Handle both single expiry and multiple expiries
     if isinstance(expiry, list):
@@ -14801,8 +15731,8 @@ def update():
         # is gone, so drop it and flag the response so the page reloads its expiry list.
         expiry_dates, expired_expiries = split_expired_expiries(expiry_dates, ticker)
         if not expiry_dates:
-            return jsonify({'error': 'The selected expiry has expired - select a new expiration',
-                            'expired_expiries': expired_expiries})
+            return {'error': 'The selected expiry has expired - select a new expiration',
+                    'expired_expiries': expired_expiries}, 200
 
         # Setting: use volume or OI for exposure weighting
         exposure_metric = data.get('exposure_metric', "Open Interest")
@@ -14821,7 +15751,7 @@ def update():
             calls, puts = fetch_options_for_multiple_dates(ticker, expiry_dates, exposure_metric=exposure_metric, delta_adjusted=delta_adjusted, calculate_in_notional=calculate_in_notional)
         
         if calls.empty and puts.empty:
-            return jsonify({'error': 'No options data found'})
+            return {'error': 'No options data found'}, 200
 
         # Reuse the spot price cached by fetch_options_for_date (from the chain response)
         # to avoid a redundant separate quote API call.  Fall back to a live quote only if
@@ -14832,13 +15762,18 @@ def update():
         else:
             S = get_current_price(ticker)
         if S is None:
-            return jsonify({'error': 'Could not fetch current price'})
+            return {'error': 'Could not fetch current price'}, 200
 
         expiry_key = build_expiry_selection_key(expiry_dates)
 
         # Cache options data so /update_price can use it without re-fetching
-        _options_cache[(ticker, expiry_key)] = {'calls': calls.copy(), 'puts': puts.copy(), 'S': S}
-        
+        # 'formula' records the weighting settings these exposures were computed with, so the
+        # exposure surface can refuse a cache that predates a settings change
+        _options_cache[(ticker, expiry_key)] = {
+            'calls': calls.copy(), 'puts': puts.copy(), 'S': S,
+            'formula': (exposure_metric, bool(delta_adjusted), calculate_in_notional),
+        }
+
         # Get strike range
         strike_range = float(data.get('strike_range', 0.1))
         
@@ -14851,6 +15786,8 @@ def update():
             if complete_snapshot:
                 store_interval_data(ticker, S, strike_range, calls, puts, expiry_key=expiry_key)
                 store_centroid_data(ticker, S, calls, puts, expiry_key=expiry_key)
+                record_surface_snapshot(ticker, S, calls, puts, expiry_key, exposure_metric,
+                                        delta_adjusted, calculate_in_notional)
 
             register_collector_selection(
                 ticker, expiry_dates, strike_range, exposure_metric,
@@ -14972,6 +15909,40 @@ def update():
         if data.get('show_large_trades', True):
             response['large_trades'] = _safe_chart('large_trades', create_large_trades_table, calls, puts, S, strike_range, call_color, put_color, expiry_dates, ticker=ticker)
 
+        if data.get('show_price', False) and data.get('levels_types'):
+            # Level overlays for the price chart the page loaded; its candles come from the
+            # price stream, so only the overlays are sent here (skipped until a chart is loaded)
+            loaded_chart = live_price_chart_times(ticker, int(data.get('timeframe', 1)))
+            if loaded_chart:
+                display_date_key, chart_times = loaded_chart
+                response['price_overlays'] = _safe_chart(
+                    'price_overlays', build_price_overlays, ticker, calls, puts, S, display_date_key,
+                    chart_times, data.get('levels_types'),
+                    exposure_levels_count=int(data.get('levels_count', 3)), call_color=call_color,
+                    put_color=put_color, strike_range=strike_range, highlight_max_level=highlight_max_level,
+                    max_level_color=max_level_color, coloring_mode=coloring_mode,
+                    selected_expiries=expiry_dates,
+                    show_latest_level_lines=data.get('show_latest_level_lines', True), seed_history=False,
+                )
+
+        if data.get('show_forecast', False):
+            # None until its first (background) build finishes; the page keeps the last one meanwhile
+            forecast_type = normalize_level_type(data.get('forecast_type', 'GEX'))
+            forecast_range = float(data.get('forecast_range', 1.5)) / 100
+            forecast_timeframe = int(data.get('timeframe', 5))
+            response['forecast'] = _safe_chart(
+                'forecast', get_exposure_forecast_chart,
+                (ticker, expiry_key, forecast_type, exposure_metric, bool(delta_adjusted), calculate_in_notional,
+                 forecast_range, forecast_timeframe, call_color, put_color),
+                calls=calls, puts=puts, S=S, ticker=ticker, exposure_type=forecast_type,
+                exposure_metric=exposure_metric, delta_adjusted=bool(delta_adjusted),
+                calculate_in_notional=calculate_in_notional, price_range=forecast_range,
+                timeframe=forecast_timeframe, call_color=call_color, put_color=put_color,
+                selected_expiries=expiry_dates,
+            )
+            response['forecast_candles'] = _safe_chart(
+                'forecast candles', forecast_candles_payload, ticker, forecast_timeframe, call_color, put_color)
+
         
         # Drop charts whose builder failed (logged by _safe_chart)
         response = {key: value for key, value in response.items() if value is not None}
@@ -15077,60 +16048,352 @@ def update():
                 'iv_stats': iv_stats,
             }
         
-        return jsonify(response)
+        return response, 200
         
     except Exception as e:
         import traceback
         traceback.print_exc()
-        return jsonify({'error': str(e)}), 500
+        return {'error': str(e)}, 500
 
-@app.route('/update_heatmap', methods=['POST'])
-def update_heatmap():
-    data = request.get_json()
-    ticker = format_ticker(data.get('ticker'))
-    expiry = data.get('expiry')
 
-    if not ticker or not expiry:
-        return jsonify({'error': 'Missing ticker or expiry'}), 400
+@app.route('/update', methods=['POST'])
+def update():
+    payload, status = build_update_payload(request.get_json() or {})
+    return jsonify(payload), status
 
-    if isinstance(expiry, list):
-        expiry_dates = expiry
-    else:
-        expiry_dates = [expiry]
+# ── Live exposure stream ─────────────────────────────────────────────────────
+# Pages subscribe to a selection (ticker, expiries, chart settings) instead of polling
+# /update. Each distinct selection has one worker thread that rebuilds the charts every
+# LIVE_REFRESH_SEC and pushes only the entries that changed, over Server-Sent Events, to
+# every page subscribed to it. A slow page never queues up stale frames: it is sent the
+# latest value of whatever changed since its last send.
+#
+# Frames are JSON: {"sub": n, "full": bool, "set": {key: value}, "del": [key, ...]} for data,
+# or {"sub": n, "error": text, ...} when the build fails. "sub" echoes the page's
+# subscription number so it can drop frames meant for a selection it has moved away from.
 
-    try:
-        expiry_key = build_expiry_selection_key(expiry_dates)
-        cached = _options_cache.get((ticker, expiry_key), {})
-        calls = cached.get('calls')
-        puts = cached.get('puts')
-        S = cached.get('S')
+LIVE_REFRESH_SEC = 1.0
+LIVE_HEARTBEAT_SEC = 15      # comment line so a dead connection is noticed
+LIVE_WORKER_IDLE_SEC = 10    # keep a selection's worker briefly after its last page leaves
+LIVE_CLIENT_TTL_SEC = 300    # forget a page whose stream has been gone this long
+LIVE_ERROR_RESEND_SEC = 10   # repeat a persisting error so the page keeps showing it
+LIVE_TEMPLATE_KEY = '_plotly_template'
+_LIVE_CLIENT_ID_RE = re.compile(r'^[A-Za-z0-9-]{8,64}$')
 
-        if calls is None or puts is None or S is None:
-            return jsonify({'error': 'Heatmap cache not ready'}), 409
+# Every figure carries plotly.py's default template (~7 KB, most of each chart). It is
+# stripped from each chart and sent once per connection; the page puts it back.
+_DEFAULT_PLOTLY_TEMPLATE = json.loads(go.Figure().to_json())['layout'].get('template')
+_DEFAULT_PLOTLY_TEMPLATE_TEXT = json.dumps(_DEFAULT_PLOTLY_TEMPLATE, separators=(',', ':'))
 
-        heatmap = create_exposure_heatmap(
-            calls,
-            puts,
-            S,
-            float(data.get('strike_range', 0.1)),
-            data.get('show_calls', True),
-            data.get('show_puts', True),
-            data.get('show_net', True),
-            data.get('call_color', '#00ff00'),
-            data.get('put_color', '#ff0000'),
-            expiry_dates,
-            heatmap_type=normalize_level_type(data.get('heatmap_type', 'GEX')),
-            heatmap_coloring_mode=data.get('heatmap_coloring_mode', 'Global'),
+
+def _live_entries(payload):
+    """/update payload -> {key: compact JSON text}, with figure templates split out."""
+    entries = {LIVE_TEMPLATE_KEY: _DEFAULT_PLOTLY_TEMPLATE_TEXT}
+    for key, value in payload.items():
+        if isinstance(value, str) and value.startswith('{'):
+            try:
+                figure = json.loads(value)
+            except ValueError:
+                figure = None
+            if isinstance(figure, dict) and isinstance(figure.get('layout'), dict):
+                if figure['layout'].get('template') == _DEFAULT_PLOTLY_TEMPLATE:
+                    del figure['layout']['template']
+                value = figure
+        entries[key] = json.dumps(value, separators=(',', ':'))
+    return entries
+
+
+class _LiveClient:
+    """One page (identified by an id it generates), across stream reconnects."""
+    def __init__(self, client_id):
+        self.id = client_id
+        self.sub = 0
+        self.settings = None
+        self.settings_key = None
+        self.selection = None
+        self.stream_token = 0      # newest stream connection; older ones exit
+        self.connected = False
+        self.last_seen = time.time()
+        self.dirty = set()         # entries changed since the last send
+        self.removed = set()       # entries dropped since the last send
+        self.full = False          # next frame replaces the page's data
+        self.error = None          # error frame waiting to be sent
+        self.wake = threading.Event()
+
+
+class _LiveSelection:
+    """One distinct set of /update settings and the worker that rebuilds it."""
+    def __init__(self, key, settings):
+        self.key = key
+        self.settings = settings
+        self.clients = set()
+        self.entries = {}          # entry key -> JSON text from the last good build
+        self.error = None          # error frame fields from the last build, if it failed
+        self.error_sent_at = 0.0
+        self.idle_since = None
+        self.kick = threading.Event()
+
+
+class LiveHub:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._clients = {}
+        self._selections = {}
+
+    # -- page-facing ----------------------------------------------------------------
+    def subscribe(self, client_id, sub, settings):
+        key = json.dumps(settings, sort_keys=True)
+        with self._lock:
+            self._sweep()
+            client = self._client(client_id)
+            if sub < client.sub:
+                return   # an older request that arrived late
+            previous = client.settings if client.settings_key not in (None, key) else None
+            client.sub = sub
+            client.settings, client.settings_key = settings, key
+            if client.connected:
+                self._attach(client)
+            if previous is not None and not self._watched(previous):
+                drop_collector_selection(previous.get('ticker'), previous.get('expiry'))
+            client.full = True
+            client.wake.set()
+
+    def unsubscribe(self, client_id):
+        with self._lock:
+            client = self._clients.pop(client_id, None)
+            if client:
+                self._detach(client)
+                client.stream_token += 1   # ends its stream
+                client.wake.set()
+
+    def connect(self, client_id):
+        with self._lock:
+            self._sweep()
+            client = self._client(client_id)
+            client.stream_token += 1
+            client.connected = True
+            if client.settings_key:
+                self._attach(client)
+            client.full = True
+            client.wake.set()
+            return client, client.stream_token
+
+    def disconnect(self, client, token):
+        with self._lock:
+            if client.stream_token != token:
+                return
+            client.connected = False
+            client.last_seen = time.time()
+            self._detach(client)
+
+    def next_frames(self, client, token):
+        """Frames to send on this connection ([] when nothing is new), or None once the
+        connection has been replaced or the page unsubscribed."""
+        with self._lock:
+            if client.stream_token != token or self._clients.get(client.id) is not client:
+                return None
+            client.wake.clear()
+            frames = []
+            if client.error is not None:
+                frames.append(json.dumps({'sub': client.sub, **client.error}))
+                client.error = None
+            selection = client.selection
+            if selection is None or not selection.entries:
+                return frames
+            if client.full:
+                keys, removed = list(selection.entries), []
+            elif client.dirty or client.removed:
+                keys, removed = [k for k in client.dirty if k in selection.entries], sorted(client.removed)
+            else:
+                return frames
+            body = ','.join(f'{json.dumps(k)}:{selection.entries[k]}' for k in keys)
+            frames.append(f'{{"sub":{client.sub},"full":{"true" if client.full else "false"},'
+                          f'"set":{{{body}}},"del":{json.dumps(removed)}}}')
+            client.full = False
+            client.dirty.clear()
+            client.removed.clear()
+            return frames
+
+    # -- internals (hold self._lock) ---------------------------------------------------
+    def _watched(self, settings):
+        """Whether a connected page shows the same ticker and expiries as `settings`."""
+        target = (format_ticker(settings.get('ticker')), build_expiry_selection_key(settings.get('expiry')))
+        return any(
+            client.connected and client.settings is not None
+            and (format_ticker(client.settings.get('ticker')),
+                 build_expiry_selection_key(client.settings.get('expiry'))) == target
+            for client in self._clients.values()
         )
 
-        return jsonify({
-            'heatmap': heatmap,
-            'selected_expiries': expiry_dates,
-        })
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return jsonify({'error': str(e)}), 500
+    def _client(self, client_id):
+        client = self._clients.get(client_id)
+        if client is None:
+            client = self._clients[client_id] = _LiveClient(client_id)
+        client.last_seen = time.time()
+        return client
+
+    def _sweep(self):
+        cutoff = time.time() - LIVE_CLIENT_TTL_SEC
+        for client_id, client in list(self._clients.items()):
+            if not client.connected and client.last_seen < cutoff:
+                self._detach(client)
+                del self._clients[client_id]
+
+    def _attach(self, client):
+        selection = client.selection
+        if selection is not None and selection.key == client.settings_key:
+            return
+        self._detach(client)
+        selection = self._selections.get(client.settings_key)
+        if selection is None:
+            selection = self._selections[client.settings_key] = _LiveSelection(client.settings_key, client.settings)
+            threading.Thread(target=self._run, args=(selection,), daemon=True,
+                             name=f"live-{client.settings.get('ticker')}").start()
+        elif not selection.clients:
+            selection.kick.set()   # it stopped building while nobody watched; refresh now
+        selection.clients.add(client)
+        selection.idle_since = None
+        client.selection = selection
+        client.dirty.clear()
+        client.removed.clear()
+        client.error = selection.error
+
+    def _detach(self, client):
+        selection = client.selection
+        client.selection = None
+        if selection is not None:
+            selection.clients.discard(client)
+            if not selection.clients:
+                selection.idle_since = time.time()
+                selection.kick.set()   # recheck now rather than after a long backoff wait
+
+    def _publish(self, selection, payload):
+        with self._lock:
+            if payload.get('error'):
+                error = {k: payload[k] for k in ('error', 'expired_expiries') if k in payload}
+                now = time.time()
+                if error == selection.error and now - selection.error_sent_at < LIVE_ERROR_RESEND_SEC:
+                    return
+                selection.error, selection.error_sent_at = error, now
+                for client in selection.clients:
+                    client.error = error
+                    client.wake.set()
+                return
+            selection.error = None
+            entries = _live_entries(payload)
+            changed = {k for k, text in entries.items() if selection.entries.get(k) != text}
+            removed = set(selection.entries) - set(entries)
+            selection.entries = entries
+            if not (changed or removed):
+                return
+            for client in selection.clients:
+                client.dirty -= removed
+                client.dirty |= changed
+                client.removed -= changed
+                client.removed |= removed
+                client.wake.set()
+
+    def _run(self, selection):
+        failures = 0
+        while True:
+            with self._lock:
+                idle = not selection.clients
+                if idle and time.time() - (selection.idle_since or 0) >= LIVE_WORKER_IDLE_SEC:
+                    if self._selections.get(selection.key) is selection:
+                        del self._selections[selection.key]
+                    return
+            started = time.time()
+            if not idle:   # don't call Schwab for a selection nobody is watching
+                try:
+                    payload, _status = build_update_payload(dict(selection.settings))
+                except Exception as e:
+                    import traceback
+                    traceback.print_exc()
+                    payload = {'error': str(e)}
+                self._publish(selection, payload)
+                failures = failures + 1 if payload.get('error') else 0
+            # Back off while builds keep failing (Schwab outage, expired token)
+            delay = LIVE_REFRESH_SEC if failures < 3 else min(60, 5 * 2 ** (failures - 3))
+            wait = started + delay - time.time()
+            if idle:   # wake in time to exit once the idle grace period is over
+                wait = min(wait, (selection.idle_since or 0) + LIVE_WORKER_IDLE_SEC - time.time())
+            selection.kick.wait(max(0.0, wait))
+            selection.kick.clear()
+
+
+live_hub = LiveHub()
+
+
+def _live_client_id(value):
+    value = str(value or '')
+    return value if _LIVE_CLIENT_ID_RE.match(value) else None
+
+
+@app.route('/live/subscribe', methods=['POST'])
+def live_subscribe():
+    """Point a page's live stream at a selection (the same settings /update takes)."""
+    data = request.get_json(silent=True) or {}
+    client_id = _live_client_id(data.get('client'))
+    settings = data.get('settings')
+    if not client_id or not isinstance(settings, dict):
+        return jsonify({'error': 'Missing client or settings'}), 400
+    try:
+        sub = int(data.get('sub') or 0)
+    except (TypeError, ValueError):
+        return jsonify({'error': 'Bad subscription number'}), 400
+    live_hub.subscribe(client_id, sub, settings)
+    return jsonify({'ok': True})
+
+
+@app.route('/live/unsubscribe', methods=['POST'])
+def live_unsubscribe():
+    # Sent with navigator.sendBeacon on pause/unload
+    data = request.get_json(force=True, silent=True) or {}
+    client_id = _live_client_id(data.get('client'))
+    if client_id:
+        live_hub.unsubscribe(client_id)
+    return jsonify({'ok': True})
+
+
+@app.route('/live/stream')
+def live_stream():
+    """Server-Sent Events stream of chart updates for one page."""
+    client_id = _live_client_id(request.args.get('client'))
+    if not client_id:
+        return jsonify({'error': 'Missing client id'}), 400
+    # One gzip context for the whole connection, flushed per frame: repeated chart
+    # structure across frames compresses against earlier frames.
+    use_gzip = 'gzip' in request.headers.get('Accept-Encoding', '').lower()
+    client, token = live_hub.connect(client_id)
+
+    def generate():
+        compressor = zlib.compressobj(6, zlib.DEFLATED, 31) if use_gzip else None
+
+        def encode(text):
+            data = text.encode('utf-8')
+            if compressor is None:
+                return data
+            return compressor.compress(data) + compressor.flush(zlib.Z_SYNC_FLUSH)
+
+        try:
+            yield encode('retry: 3000\n\n')
+            while True:
+                frames = live_hub.next_frames(client, token)
+                if frames is None:
+                    return
+                if frames:
+                    yield encode(''.join(f'data: {frame}\n\n' for frame in frames))
+                elif not client.wake.wait(LIVE_HEARTBEAT_SEC):
+                    yield encode(': ping\n\n')
+        finally:
+            live_hub.disconnect(client, token)
+
+    headers = {'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'}
+    if use_gzip:
+        headers['Content-Encoding'] = 'gzip'
+        headers['Vary'] = 'Accept-Encoding'
+    return Response(generate(), mimetype='text/event-stream', headers=headers)
+
 
 @app.route('/update_price', methods=['POST'])
 def update_price():
@@ -15212,6 +16475,7 @@ def update_price():
                     'calls': calls.copy(),
                     'puts': puts.copy(),
                     'S': spot,
+                    'formula': (exposure_metric, bool(delta_adjusted), calculate_in_notional),
                 }
 
         price_chart = prepare_price_chart_data(

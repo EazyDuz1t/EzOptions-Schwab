@@ -21,6 +21,7 @@ A real-time options trading dashboard that integrates with the Schwab API to pro
 - **Vanna Exposure** - Analyze volatility-price sensitivity
 - **Charm, Speed, and Vomma** - Advanced Greek exposures
 - **Historical Bubble Levels** - Historical exposure tracking over time
+- **Exposure Surface** - Smoothed price-by-time heatmap of any exposure re-priced through the session close, with peak, trough and zero-flip lines.
 
 ### 🎯 Interactive Charts
 - Customizable strike range filtering
@@ -149,7 +150,7 @@ The application uses SQLite to store historical bubble levels data:
 - Stores minute-by-minute exposure data
 - Automatic cleanup of old data
 - Only regular-session data is recorded (holidays and half-days come from Schwab's market-hours API)
-- While the server is running, a background collector keeps recording the selections viewed that day about once a minute, even with no browser open
+- While the server is running, a background collector keeps recording the ticker/expiries on screen about once a minute, even when paused or with the browser closed. Tickers you switch away from are not recorded
 - A page left open overnight reloads its expiry list on the new day. Selections made with the quick buttons (Today / This Wk / +1 Wk / +2 Wks / +1 Mo / All) are rules and re-apply each day and on ticker changes — Today always shows the nearest (0DTE) expiry, This Wk the rest of the current week. Hand-picked dates stay as picked; once they expire the selection is left empty until you pick again (hand-picking only today's expiry counts as 0DTE)
 - If updates keep failing (e.g. Schwab maintenance), auto-update backs off and retries on its own instead of pausing
 
