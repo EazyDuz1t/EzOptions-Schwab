@@ -1904,6 +1904,18 @@ def hex_to_rgba(hex_color, alpha=1.0):
         hex_color = ''.join([c*2 for c in hex_color])
     return f'rgba({int(hex_color[0:2], 16)}, {int(hex_color[2:4], 16)}, {int(hex_color[4:6], 16)}, {alpha})'
 
+def shade_hex_color(hex_color, amount):
+    """Brighter (amount > 0, toward white) or darker (amount < 0, toward black) version of a hex
+    color, keeping its hue and saturation; amount is the fraction of the way to go."""
+    import colorsys
+    hex_color = hex_color.lstrip('#')
+    if len(hex_color) == 3:
+        hex_color = ''.join([c*2 for c in hex_color])
+    r, g, b = (int(hex_color[i:i + 2], 16) / 255 for i in (0, 2, 4))
+    h, l, s = colorsys.rgb_to_hls(r, g, b)
+    l = l + (1 - l) * amount if amount > 0 else l * (1 + amount)
+    return '#' + ''.join(f'{round(c * 255):02X}' for c in colorsys.hls_to_rgb(h, l, s))
+
 def get_colors(base_color, values, max_val, coloring_mode='Solid'):
     """
     Apply coloring mode to a set of values.
@@ -2992,10 +3004,11 @@ def create_exposure_forecast_chart(calls, puts, S, ticker, exposure_type='GEX', 
 
     if not one_sided:
         add_track_trace(find_forecast_zero_tracks(smoothed, prices), 'Zero', '#F5F5F5', width=1.5, dash='dot')
+    # Brighter versions of the call (peak) and put (trough) colors, so they stand out on the surface
     add_track_trace(find_forecast_extrema_tracks(smoothed, prices, 'trough', 0.06 * peak_abs),
-                    f'{display_name} Trough', '#FFD600')
+                    f'{display_name} Trough', shade_hex_color(put_color, 0.5))
     add_track_trace(find_forecast_extrema_tracks(smoothed, prices, 'peak', 0.06 * peak_abs),
-                    f'{display_name} Peak', '#00E676')
+                    f'{display_name} Peak', shade_hex_color(call_color, 0.5))
     # The candles aren't part of this figure: the page draws them from 'forecast_candles' and
     # live quotes, so they don't wait on this (slow) build
 
