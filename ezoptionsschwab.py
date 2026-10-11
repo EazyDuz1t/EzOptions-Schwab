@@ -142,6 +142,12 @@ def init_db():
                 cursor.execute("ALTER TABLE interval_data ADD COLUMN expiry_key TEXT NOT NULL DEFAULT ''")
             except sqlite3.OperationalError:
                 pass
+            # Rows recorded before the current exposure formulas keep version 1 and are no
+            # longer read (their nets can't be converted: calls and puts were summed together)
+            try:
+                cursor.execute('ALTER TABLE interval_data ADD COLUMN formula_version INTEGER NOT NULL DEFAULT 1')
+            except sqlite3.OperationalError:
+                pass
 
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS interval_session_data (
@@ -384,15 +390,27 @@ def resolve_level_value_column(level_type):
     return normalized_type
 
 
-def combine_level_values(level_type, call_value, put_value):
+# How each exposure nets calls and puts: GEX (dealers long calls, short puts) and Volume are
+# calls - puts, Abs GEX adds magnitudes, and every other exposure adds the two sides' own
+# signed values. Bump EXPOSURE_FORMULA_VERSION whenever stored exposure values change meaning,
+# so history recorded under other formulas isn't mixed in.
+EXPOSURE_FORMULA_VERSION = 4
+
+
+def put_net_contribution(level_type, put_value):
+    """A put-side value as it enters the net (what put-only views show)."""
     normalized_type = normalize_level_type(level_type)
-    if normalized_type == 'GEX':
-        return call_value - put_value
     if normalized_type == 'AbsGEX':
+        return abs(put_value)
+    if normalized_type in ('GEX', 'Volume'):
+        return -put_value
+    return put_value
+
+
+def combine_level_values(level_type, call_value, put_value):
+    if normalize_level_type(level_type) == 'AbsGEX':
         return abs(call_value) + abs(put_value)
-    if normalized_type == 'Volume':
-        return call_value - put_value
-    return call_value + put_value
+    return call_value + put_net_contribution(level_type, put_value)
 
 
 HEATMAP_TITLE_DISPLAY_NAMES = {
@@ -421,33 +439,37 @@ def build_expiry_selection_key(expiry_dates):
 
 
 def calculate_expected_move_snapshot(calls, puts, spot_price):
-    """Return the current ATM straddle-based expected move snapshot."""
+    """ATM straddle implied move for the nearest selected expiry: call + put price at each strike
+    where both legs are quoted, interpolated to spot between the strikes around it."""
     if calls is None or puts is None or calls.empty or puts.empty or not spot_price:
         return None
 
-    strikes_sorted = sorted(calls['strike'].unique())
-    if not strikes_sorted:
-        return None
-
-    atm_strike = min(strikes_sorted, key=lambda strike: abs(strike - spot_price))
-
-    def _get_mid(df, strike):
-        row = df.loc[df['strike'] == strike]
-        if row is None or row.empty:
+    if 'expiration' in calls.columns and 'expiration' in puts.columns:
+        nearest = min(set(calls['expiration'].dropna()) & set(puts['expiration'].dropna()), default=None)
+        if nearest is None:
             return None
-        bid = row['bid'].values[0]
-        ask = row['ask'].values[0]
-        if bid > 0 and ask > 0:
-            return (bid + ask) / 2
-        if bid > 0:
-            return bid
-        if ask > 0:
-            return ask
-        return None
+        calls = calls[calls['expiration'] == nearest]
+        puts = puts[puts['expiration'] == nearest]
+    if 'am_settled' in calls.columns and 'am_settled' in puts.columns:
+        # The PM-settled series trades through the whole session; use it when it is listed
+        pm_calls = calls[calls['am_settled'] != True]
+        pm_puts = puts[puts['am_settled'] != True]
+        if not pm_calls.empty and not pm_puts.empty:
+            calls, puts = pm_calls, pm_puts
 
-    call_mid = _get_mid(calls, atm_strike)
-    put_mid = _get_mid(puts, atm_strike)
-    expected_move = (call_mid or 0) + (put_mid or 0)
+    def leg_prices(df):
+        # Mid of a two-sided quote, else whichever side is quoted
+        bid, ask = df['bid'].astype(float), df['ask'].astype(float)
+        price = np.where((bid > 0) & (ask >= bid), (bid + ask) / 2, np.where(bid > 0, bid, ask))
+        return pd.Series(price, index=df['strike'].astype(float)).where(lambda v: v > 0).dropna().groupby(level=0).mean()
+
+    straddles = (leg_prices(calls) + leg_prices(puts)).dropna().sort_index()
+    if straddles.empty:
+        return None
+    strikes = straddles.index.to_numpy(dtype=float)
+    atm_strike = float(strikes[np.argmin(np.abs(strikes - spot_price))])
+    # Flat beyond the outermost quoted strikes
+    expected_move = float(np.interp(spot_price, strikes, straddles.to_numpy(dtype=float)))
     if expected_move <= 0:
         return None
 
@@ -574,7 +596,8 @@ def store_interval_data(ticker, price, strike_range, calls, puts, expiry_key='')
     range_calls = calls[(calls['strike'] >= min_strike) & (calls['strike'] <= max_strike)]
     range_puts = puts[(puts['strike'] >= min_strike) & (puts['strike'] <= max_strike)]
 
-    # Build per-strike net exposures using vectorized groupby instead of iterrows
+    # Build per-strike net exposures using vectorized groupby instead of iterrows. Puts enter
+    # each net as put_net_contribution does (flipped for GEX and volume)
     _agg_src = ['strike', 'GEX', 'DEX', 'VEX', 'Charm', 'volume', 'Speed', 'Vomma', 'Color']
     _sum_cols = ['call_gamma','put_gamma','net_gamma','net_delta','net_vanna',
                  'net_charm','net_volume','net_speed','net_vomma','net_color']
@@ -633,6 +656,7 @@ def store_interval_data(ticker, price, strike_range, calls, puts, expiry_key='')
         grouped['abs_gex_total'].tolist(),
         [expiry_key] * n,
         [current_date] * n,
+        [EXPOSURE_FORMULA_VERSION] * n,
     ))
 
     with _db_write_lock:
@@ -651,9 +675,9 @@ def store_interval_data(ticker, price, strike_range, calls, puts, expiry_key='')
                     INSERT INTO interval_data (
                         ticker, timestamp, price, strike, net_gamma, net_delta, net_vanna,
                         net_charm, net_volume, net_speed, net_vomma, net_color,
-                        abs_gex_total, expiry_key, date
+                        abs_gex_total, expiry_key, date, formula_version
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''', rows_to_insert)
 
                 if expected_move_snapshot:
@@ -689,19 +713,19 @@ def get_interval_data(ticker, date=None, expiry_key=None):
                     SELECT timestamp, price, strike, net_gamma, net_delta, net_vanna, net_charm,
                         abs_gex_total, net_volume, net_speed, net_vomma, net_color
                     FROM interval_data
-                    WHERE ticker = ? AND date = ?
+                    WHERE ticker = ? AND date = ? AND formula_version = ?
                       AND timestamp >= ? AND timestamp <= ?
                     ORDER BY timestamp, strike
-                ''', (ticker, date, open_ts, close_ts))
+                ''', (ticker, date, EXPOSURE_FORMULA_VERSION, open_ts, close_ts))
             else:
                 cursor.execute('''
                     SELECT timestamp, price, strike, net_gamma, net_delta, net_vanna, net_charm,
                         abs_gex_total, net_volume, net_speed, net_vomma, net_color
                     FROM interval_data
-                    WHERE ticker = ? AND date = ? AND expiry_key = ?
+                    WHERE ticker = ? AND date = ? AND expiry_key = ? AND formula_version = ?
                       AND timestamp >= ? AND timestamp <= ?
                     ORDER BY timestamp, strike
-                ''', (ticker, date, expiry_key, open_ts, close_ts))
+                ''', (ticker, date, expiry_key, EXPOSURE_FORMULA_VERSION, open_ts, close_ts))
             return cursor.fetchall()
 
 
@@ -731,15 +755,21 @@ def get_interval_session_data(ticker, date=None, expiry_key=None):
                 ''', (ticker, date, expiry_key, open_ts, close_ts))
             return cursor.fetchall()
 
+def _current_formula_clause(table):
+    """SQL filter keeping only rows recorded under the current exposure formulas."""
+    return f' AND formula_version = {EXPOSURE_FORMULA_VERSION}' if table == 'interval_data' else ''
+
+
 def get_last_session_date(ticker, table='interval_data', expiry_key=None):
     """Return the most recent date that has data for ticker, or None."""
+    current = _current_formula_clause(table)
     with closing(get_options_db_connection()) as conn:
         with closing(conn.cursor()) as cursor:
             if expiry_key is None:
-                cursor.execute(f'SELECT MAX(date) FROM {table} WHERE ticker = ?', (ticker,))
+                cursor.execute(f'SELECT MAX(date) FROM {table} WHERE ticker = ?{current}', (ticker,))
             else:
                 cursor.execute(
-                    f'SELECT MAX(date) FROM {table} WHERE ticker = ? AND expiry_key = ?',
+                    f'SELECT MAX(date) FROM {table} WHERE ticker = ? AND expiry_key = ?{current}',
                     (ticker, expiry_key),
                 )
             row = cursor.fetchone()
@@ -747,12 +777,13 @@ def get_last_session_date(ticker, table='interval_data', expiry_key=None):
 
 def get_latest_session_expiry_key(ticker, table):
     """Return (date, expiry_key) of the most-sampled selection on the latest date with data."""
+    current = _current_formula_clause(table)
     with closing(get_options_db_connection()) as conn:
         with closing(conn.cursor()) as cursor:
             cursor.execute(f'''
                 SELECT date, expiry_key
                 FROM {table}
-                WHERE ticker = ? AND date = (SELECT MAX(date) FROM {table} WHERE ticker = ?)
+                WHERE ticker = ?{current} AND date = (SELECT MAX(date) FROM {table} WHERE ticker = ?{current})
                 GROUP BY expiry_key
                 ORDER BY COUNT(*) DESC
                 LIMIT 1
@@ -1057,31 +1088,30 @@ def option_underlying(ticker):
     proxy = get_futures_proxy(ticker)
     return proxy[0] if proxy else ticker
 
-def format_display_ticker(ticker):
-    """Helper function to format tickers for display and data filtering"""
-    if not ticker:
-        return []
-    ticker = ticker.upper()
-    if ticker.startswith('/'):
-        return [ticker]
-    elif ticker in ['$SPX', 'SPX']:
-        # For SPX, return SPXW for options symbols and $SPX for underlying
-        return ['SPXW', '$SPX']
-    elif ticker in ['$NDX', 'NDX']:
-        # For NDX, return NDXP for options symbols and $NDX for underlying
-        return ['NDXP', '$NDX']
-    elif ticker in ['$VIX', 'VIX']:
-        # For VIX, return VIX for options symbols and $VIX for underlying
-        return ['VIX', '$VIX']
-    elif ticker in ['$RUT', 'RUT']:
-        # PM-settled RUTW, like SPXW for SPX
-        return ['RUTW', '$RUT']
-    elif ticker in ['$DJX', 'DJX']:
-        # PM-settled DJXW, like SPXW for SPX
-        return ['DJXW', '$DJX']
-    elif ticker == 'MARKET2':
-        return ['SPY']
-    return [ticker]
+def option_roots(ticker):
+    """OCC roots of the standard option contracts on `ticker`. Adjusted roots (AAPL1, ...) are
+    left out: their deliverable isn't 100 shares, so the exposure formulas don't apply."""
+    ticker = format_ticker(ticker)
+    if ticker in INDEX_OPTION_ROOTS:
+        return INDEX_OPTION_ROOTS[ticker]
+    if ticker == 'MARKET2':
+        return ('SPY',)
+    return (ticker,)
+
+
+def option_root(symbol):
+    """OCC root of a Schwab option symbol ('SPXW  261016C05000000' -> 'SPXW'): everything before
+    the 15-character date + type + strike tail."""
+    symbol = str(symbol)
+    return symbol[:-15].strip() if len(symbol) > 15 else symbol.split()[0]
+
+
+def is_am_settled(option, root):
+    """Schwab's settlementType ('A'/'P') when present, else by root."""
+    settlement = str(option.get('settlementType') or '').upper()
+    if settlement in ('A', 'P'):
+        return settlement == 'A'
+    return root in AM_SETTLED_ROOTS
 
 def format_large_number(num):
     """Format large numbers with suffixes (K, M, B, T)"""
@@ -1178,13 +1208,34 @@ def aggregate_by_strike(df, value_columns, strike_grid):
 T_EXPIRATION_FLOOR_MINUTES = 60
 SECONDS_PER_YEAR = 365 * 24 * 3600
 
-def calculate_time_to_expiration(expiry_date):
+# Settlement. Standard (third-Friday) index options and all VIX options are AM-settled: they
+# stop trading the day before and settle on the expiry morning's opening prints (the SOQ), so
+# their clock runs out at 9:30 AM ET. Everything else here is PM-settled at the 4:00 PM close.
+AM_SETTLED_ROOTS = frozenset({'SPX', 'NDX', 'RUT', 'DJX', 'VIX', 'VIXW'})
+# Option roots per index: the AM-settled standard monthly plus the PM-settled weeklies/dailies
+INDEX_OPTION_ROOTS = {
+    '$SPX': ('SPX', 'SPXW'),
+    '$NDX': ('NDX', 'NDXP'),
+    '$RUT': ('RUT', 'RUTW'),
+    '$DJX': ('DJX', 'DJXW'),
+    '$VIX': ('VIX', 'VIXW'),
+}
+
+
+def expiry_datetime(expiry_date, am_settled=False):
+    """The ET moment a contract expiring on `expiry_date` settles."""
+    et_tz = pytz.timezone('US/Eastern')
+    settle = timedelta(hours=9, minutes=30) if am_settled else timedelta(hours=16)
+    return et_tz.localize(datetime.combine(expiry_date, datetime.min.time()) + settle)
+
+
+def calculate_time_to_expiration(expiry_date, am_settled=False):
     """
     Calculate time to expiration in years using Eastern Time.
 
     Uses a 60-minute floor per CBOE VIX1D near-term handling so Black-Scholes
     Greeks do not blow up in the final hour. Returns 0.0 after expiration
-    (4:00 PM ET on expiry day for standard equity/PM-settled options).
+    (4:00 PM ET on expiry day, or 9:30 AM ET for AM-settled contracts).
 
     expiry_date: datetime.date object or string 'YYYY-MM-DD'
     Returns: time in years (float), or 0.0 if already expired
@@ -1198,9 +1249,7 @@ def calculate_time_to_expiration(expiry_date):
         elif isinstance(expiry_date, datetime):
             expiry_date = expiry_date.date()
             
-        # Standard equity / PM-settled index options expire at 4:00 PM ET
-        expiry_dt = datetime.combine(expiry_date, datetime.min.time()) + timedelta(hours=16)
-        expiry_dt = et_tz.localize(expiry_dt)
+        expiry_dt = expiry_datetime(expiry_date, am_settled)
         
         seconds_left = (expiry_dt - now_et).total_seconds()
         if seconds_left <= 0:
@@ -1357,6 +1406,21 @@ def fetch_options_for_date(ticker, date, exposure_metric="Open Interest", delta_
             if c.empty and p.empty: continue
             
             is_base = (comp_tick == base_ticker)
+            if not is_base:
+                # A SPY contract carries a fraction (SPY/SPX price) of an SPX contract's notional:
+                # restate its counts and share-denominated exposures in SPX-equivalent units.
+                # Dollar exposures need nothing, except Speed, which is per 1-point move (one
+                # SPX point is only that fraction of a SPY point).
+                unit = comp_price / base_price
+                share_cols = ['openInterest', 'volume']
+                if not calculate_in_notional:
+                    share_cols += ['GEX', 'DEX', 'VEX', 'Charm', 'Color']
+                for frame in (c, p):
+                    if frame.empty:
+                        continue
+                    for col in share_cols:
+                        frame[col] = frame[col] * unit
+                    frame['Speed'] = frame['Speed'] * (unit if calculate_in_notional else unit ** 2)
 
             if not c.empty:
                 c = c.copy()
@@ -1416,11 +1480,13 @@ def fetch_options_for_date(ticker, date, exposure_metric="Open Interest", delta_
         def aggregate_market_data(df):
             if df.empty: return df
             sum_cols = ['openInterest', 'volume', 'GEX', 'DEX', 'VEX', 'Charm', 'Speed', 'Vomma', 'Color']
+            # AM- and PM-settled rows stay apart: they run on different clocks
+            keys = ['strike', 'am_settled'] if 'am_settled' in df.columns else ['strike']
             agg_dict = {col: 'sum' for col in sum_cols if col in df.columns}
             for col in df.columns:
-                if col not in agg_dict and col != 'strike':
+                if col not in agg_dict and col not in keys:
                     agg_dict[col] = 'first'
-            return df.groupby('strike', as_index=False).agg(agg_dict)
+            return df.groupby(keys, as_index=False).agg(agg_dict)
 
         combined_calls = aggregate_market_data(combined_calls)
         combined_puts = aggregate_market_data(combined_puts)
@@ -1441,97 +1507,48 @@ def fetch_options_for_date(ticker, date, exposure_metric="Open Interest", delta_
             # Cache spot price so /update can skip a redundant quote API call
             _chain_spot_cache[ticker] = (S, time.time())
 
-        # Calculate time to expiration in years (60-min CBOE floor applied inside)
-        t = calculate_time_to_expiration(expiry)
-        r = 0.02  # risk-free rate (2% as default to match Yahoo script)
-        
+        roots = option_roots(ticker)
+        expiry_date_obj = expiry  # datetime.date — same for all options in this call
         calls_data = []
         puts_data = []
-        display_tickers = format_display_ticker(ticker)
-        expiry_date_obj = expiry  # datetime.date — same for all options in this call
 
-        # Parse options into plain dicts WITHOUT computing Greeks (vectorized below)
-        for exp_date, strikes in chain.get('callExpDateMap', {}).items():
-            if exp_date.split(':')[0] != date:
-                continue
-            for strike, options in strikes.items():
-                for option in options:
-                    if any(option['symbol'].startswith(dt) for dt in display_tickers):
-                        K = float(option['strikePrice'])
-                        raw_vol = float(option.get('volatility', -999.0))
-                        vol = (raw_vol / 100) if raw_vol > 0 else 0.20
+        # Parse options into plain dicts WITHOUT computing Greeks (priced below)
+        for map_key, rows in (('callExpDateMap', calls_data), ('putExpDateMap', puts_data)):
+            for exp_date, strikes in chain.get(map_key, {}).items():
+                if exp_date.split(':')[0] != date:
+                    continue
+                for strike, options in strikes.items():
+                    for option in options:
+                        root = option_root(option['symbol'])
+                        if root not in roots:
+                            continue
+                        try:
+                            raw_vol = float(option.get('volatility', -999.0))
+                        except (TypeError, ValueError):
+                            raw_vol = -999.0
                         last = float(option['last'])
                         bid = float(option['bid'])
                         ask = float(option['ask'])
-                        calls_data.append({
+                        rows.append({
                             'contractSymbol': option['symbol'],
-                            'strike': K,
+                            'strike': float(option['strikePrice']),
                             'lastPrice': last,
                             'bid': bid,
                             'ask': ask,
                             'volume': int(option['totalVolume']),
                             'openInterest': int(option['openInterest']),
-                            'impliedVolatility': vol,
+                            # Missing IV stays NaN; price_option_chain solves or interpolates it
+                            'impliedVolatility': raw_vol / 100 if raw_vol > 0 else np.nan,
                             'inTheMoney': option['inTheMoney'],
                             'expiration': expiry_date_obj,
+                            'am_settled': is_am_settled(option, root),
                             'side': infer_side(last, bid, ask),
                         })
 
-        for exp_date, strikes in chain.get('putExpDateMap', {}).items():
-            if exp_date.split(':')[0] != date:
-                continue
-            for strike, options in strikes.items():
-                for option in options:
-                    if any(option['symbol'].startswith(dt) for dt in display_tickers):
-                        K = float(option['strikePrice'])
-                        raw_vol = float(option.get('volatility', -999.0))
-                        vol = (raw_vol / 100) if raw_vol > 0 else 0.20
-                        last = float(option['last'])
-                        bid = float(option['bid'])
-                        ask = float(option['ask'])
-                        puts_data.append({
-                            'contractSymbol': option['symbol'],
-                            'strike': K,
-                            'lastPrice': last,
-                            'bid': bid,
-                            'ask': ask,
-                            'volume': int(option['totalVolume']),
-                            'openInterest': int(option['openInterest']),
-                            'impliedVolatility': vol,
-                            'inTheMoney': option['inTheMoney'],
-                            'expiration': expiry_date_obj,
-                            'side': infer_side(last, bid, ask),
-                        })
-
-        def _apply_vectorized_greeks(option_list, flag_int):
-            """Vectorized Greek + exposure computation for a list of option dicts."""
-            if not option_list:
-                return pd.DataFrame()
-            df = pd.DataFrame(option_list)
-            if t <= 0:
-                for col in ('delta','gamma','theta','vega','rho','DEX','GEX','VEX','Charm','Speed','Vomma','Color'):
-                    df[col] = 0.0
-                return df
-
-            K_arr = df['strike'].to_numpy(dtype=float)
-            sigma_arr = df['impliedVolatility'].to_numpy(dtype=float)
-
-            weight_arr = exposure_weights(df, exposure_metric)
-
-            results = _compute_all_greeks_and_exposures_vectorized(
-                np.full(len(df), flag_int, dtype=np.int8),
-                S, K_arr, t, sigma_arr, weight_arr,
-                r=r, q=0,
-                delta_adjusted=delta_adjusted,
-                calculate_in_notional=calculate_in_notional,
-            )
-            for col, arr in results.items():
-                df[col] = arr
-            return df
-
-        calls = _apply_vectorized_greeks(calls_data, 0)
-        puts = _apply_vectorized_greeks(puts_data, 1)
-        return calls, puts
+        return price_option_chain(
+            ticker, expiry, pd.DataFrame(calls_data), pd.DataFrame(puts_data), S, chain_risk_free_rate(chain),
+            exposure_metric, delta_adjusted, calculate_in_notional,
+        )
         
     except Exception as e:
         msg = f"Error fetching options chain: {e}"
@@ -1665,6 +1682,190 @@ def _compute_all_greeks_and_exposures_vectorized(
                  'DEX', 'GEX', 'VEX', 'Charm', 'Speed', 'Vomma', 'Color')
         return {name: out[name] for name in order}
     return out
+
+
+# ── Pricing model inputs ──
+# Each expiry is priced off its own forward, implied from put-call parity, which carries the
+# rate, dividends and (for futures-proxied indexes) the futures basis in one number; the
+# Black-Scholes dividend yield is backed out of it. Model inputs are kept on every row
+# (rate, div_yield, model_spot_ratio) so the exposure surface re-prices with the same model.
+DEFAULT_RISK_FREE_RATE = float(os.getenv('EZOPTIONS_RISK_FREE_RATE', '0.039'))  # ~3-month T-bill, Aug 2026
+DEFAULT_DIVIDEND_YIELD = 0.0  # only until a forward has been implied for the expiry
+DEFAULT_IMPLIED_VOL = 0.20    # only when no contract in the expiry has a usable IV
+# VIX options settle on the VIX future of their expiry, which can sit far from spot VIX, so
+# they are priced with Black-76 on that future (Black-Scholes with S = F and q = r)
+FORWARD_PRICED_UNDERLYINGS = frozenset({'$VIX'})
+GREEK_COLUMNS = ('delta', 'gamma', 'vega', 'vanna', 'theta', 'rho',
+                 'DEX', 'GEX', 'VEX', 'Charm', 'Speed', 'Vomma', 'Color')
+_FORWARD_STRIKES = 8  # strikes nearest spot averaged into the implied forward
+_expiry_carry_cache = {}  # (ticker, expiry, am_settled) -> last good annualized ln(F/S)/t
+
+
+def chain_risk_free_rate(chain):
+    """Schwab's chain interestRate (a percent) when it is sane, else DEFAULT_RISK_FREE_RATE."""
+    try:
+        rate = float((chain or {}).get('interestRate'))
+    except (TypeError, ValueError):
+        return DEFAULT_RISK_FREE_RATE
+    if rate > 1:
+        rate /= 100.0
+    return rate if 0 < rate < 0.2 else DEFAULT_RISK_FREE_RATE
+
+
+def _quote_mids(df):
+    """Mid of each two-sided quote by strike (averaged over roots sharing a strike)."""
+    quoted = df[(df['bid'] > 0) & (df['ask'] >= df['bid'])]
+    return ((quoted['bid'] + quoted['ask']) / 2).groupby(quoted['strike']).mean()
+
+
+def implied_forward(calls, puts, S, t, rate):
+    """Forward for one expiry from put-call parity, C - P = e^(-rt) (F - K): the median over the
+    strikes nearest spot with two-sided quotes on both the call and the put. None if none."""
+    if t <= 0 or calls.empty or puts.empty:
+        return None
+    call_mids, put_mids = _quote_mids(calls), _quote_mids(puts)
+    both = call_mids.index.intersection(put_mids.index)
+    if len(both) == 0:
+        return None
+    strikes = sorted(both, key=lambda k: abs(k - S))[:_FORWARD_STRIKES]
+    forwards = [k + (call_mids[k] - put_mids[k]) * math.exp(rate * t) for k in strikes]
+    return float(np.median(forwards))
+
+
+def _expiry_carry(ticker, expiry, am_settled, calls, puts, S, t, rate, forward_priced):
+    """Annualized ln(F/S)/t for one expiry. Measured only while options trade (outside the
+    session the quotes are stale against a moving spot); the last good value is reused then.
+    None until one has been measured. A forward implausibly far from spot is ignored, except
+    for forward-priced underlyings (VIX futures can sit tens of percent from spot)."""
+    key = (ticker, expiry, bool(am_settled))
+    if t > 0 and is_market_hours():
+        forward = implied_forward(calls, puts, S, t, rate)
+        if forward and forward > 0:
+            log_ratio = math.log(forward / S)
+            if forward_priced or abs(log_ratio) <= 0.002 + 0.5 * t:
+                _expiry_carry_cache[key] = log_ratio / t
+    return _expiry_carry_cache.get(key)
+
+
+def _bsm_prices(flags, S, K, t, sigma, r, q):
+    sqrt_t = math.sqrt(t)
+    d1 = (np.log(S / K) + (r - q + 0.5 * sigma ** 2) * t) / (sigma * sqrt_t)
+    d2 = d1 - sigma * sqrt_t
+    disc_q, disc_r = math.exp(-q * t), math.exp(-r * t)
+    call = S * disc_q * norm.cdf(d1) - K * disc_r * norm.cdf(d2)
+    put = K * disc_r * norm.cdf(-d2) - S * disc_q * norm.cdf(-d1)
+    return np.where(flags == 0, call, put)
+
+
+def implied_vols_from_prices(flags, S, K, t, prices, r, q, lo=0.005, hi=5.0, iterations=60):
+    """Black-Scholes implied vol by bisection (vectorized); NaN where the price is outside what
+    the model can produce between `lo` and `hi` vol (e.g. below intrinsic)."""
+    prices = np.asarray(prices, dtype=float)
+    lo_arr = np.full(len(prices), lo)
+    hi_arr = np.full(len(prices), hi)
+    valid = (np.isfinite(prices)
+             & (prices > _bsm_prices(flags, S, K, t, lo_arr, r, q))
+             & (prices < _bsm_prices(flags, S, K, t, hi_arr, r, q)))
+    for _ in range(iterations):
+        mid = 0.5 * (lo_arr + hi_arr)
+        above = _bsm_prices(flags, S, K, t, mid, r, q) > prices
+        hi_arr = np.where(above, mid, hi_arr)
+        lo_arr = np.where(above, lo_arr, mid)
+    return np.where(valid, 0.5 * (lo_arr + hi_arr), np.nan)
+
+
+def _model_implied_vols(calls, puts, model_spot, t, rate, q, solve_all=False):
+    """(call IVs, put IVs) on the model's own forward and clock. Schwab's IV is kept where it has
+    one (unless `solve_all`, for underlyings Schwab's IV isn't measured against). The rest come
+    from the smile across strikes, read off the out-of-the-money side at each strike (its price
+    is nearly all time value; an in-the-money or zero-bid quote pins the IV down poorly, which
+    is also why Cboe's VIX method uses out-of-the-money quotes): solved from the quote mid at
+    the strike when possible, else interpolated across strikes."""
+    forward = model_spot * math.exp((rate - q) * t)
+    sides = {}
+    smile = {}  # strike -> (out-of-the-money?, iv)
+    for flag, df in ((0, calls), (1, puts)):
+        if df.empty:
+            continue
+        K = df['strike'].to_numpy(dtype=float)
+        bid = df['bid'].to_numpy(dtype=float)
+        ask = df['ask'].to_numpy(dtype=float)
+        schwab_iv = df['impliedVolatility'].to_numpy(dtype=float)
+        has_schwab = np.isfinite(schwab_iv) & (schwab_iv > 0)
+        kept = has_schwab & (not solve_all)
+        own = np.where(kept, schwab_iv, np.nan)
+        solvable = ~kept & (bid > 0) & (ask >= bid)
+        if solvable.any():
+            own[solvable] = implied_vols_from_prices(
+                np.full(int(solvable.sum()), flag, dtype=np.int8), model_spot, K[solvable], t,
+                (bid[solvable] + ask[solvable]) / 2, rate, q)
+        otm = (K >= forward) if flag == 0 else (K < forward)
+        for k, iv, is_otm in zip(K, own, otm):
+            if np.isfinite(iv) and iv > 0 and (k not in smile or (is_otm and not smile[k][0])):
+                smile[k] = (bool(is_otm), float(iv))
+        sides[flag] = (K, own, kept, has_schwab, schwab_iv)
+
+    smile_k = np.array(sorted(smile))
+    smile_iv = np.array([smile[k][1] for k in smile_k])
+    out = []
+    for flag in (0, 1):
+        if flag not in sides:
+            out.append(np.array([]))
+            continue
+        K, own, kept, has_schwab, schwab_iv = sides[flag]
+        if len(smile_k):
+            # Flat beyond the outermost strikes with a usable IV
+            iv = np.where(kept, own, np.interp(K, smile_k, smile_iv))
+        else:
+            iv = np.where(has_schwab, schwab_iv, DEFAULT_IMPLIED_VOL)
+        out.append(iv)
+    return out[0], out[1]
+
+
+def price_option_chain(ticker, expiry, calls, puts, S, rate, exposure_metric, delta_adjusted,
+                       calculate_in_notional):
+    """Greeks and exposures for one expiry's calls and puts. AM- and PM-settled contracts are
+    priced as separate groups, each on its own clock and implied forward."""
+    forward_priced = format_ticker(ticker) in FORWARD_PRICED_UNDERLYINGS
+    priced = {0: [], 1: []}
+    for am_settled in (False, True):
+        group = {flag: (df[df['am_settled'] == am_settled] if not df.empty else df)
+                 for flag, df in ((0, calls), (1, puts))}
+        if group[0].empty and group[1].empty:
+            continue
+        # 60-min CBOE floor applied inside
+        t = calculate_time_to_expiration(expiry, am_settled=am_settled)
+        carry = _expiry_carry(ticker, expiry, am_settled, group[0], group[1], S, t, rate, forward_priced)
+        if forward_priced:
+            spot_ratio, q = (math.exp(carry * t) if carry is not None else 1.0), rate
+        else:
+            spot_ratio, q = 1.0, (rate - carry if carry is not None else DEFAULT_DIVIDEND_YIELD)
+        model_spot = S * spot_ratio
+        model_ivs = (_model_implied_vols(group[0], group[1], model_spot, t, rate, q, solve_all=forward_priced)
+                     if t > 0 else None)
+        for flag, df in group.items():
+            if df.empty:
+                continue
+            df = df.copy()
+            df['rate'] = rate
+            df['div_yield'] = q
+            df['model_spot_ratio'] = spot_ratio
+            if t <= 0:
+                df['impliedVolatility'] = df['impliedVolatility'].fillna(DEFAULT_IMPLIED_VOL)
+                for col in GREEK_COLUMNS:
+                    df[col] = 0.0
+            else:
+                df['impliedVolatility'] = model_ivs[flag]
+                results = _compute_all_greeks_and_exposures_vectorized(
+                    np.full(len(df), flag, dtype=np.int8), model_spot, df['strike'].to_numpy(dtype=float), t,
+                    df['impliedVolatility'].to_numpy(dtype=float), exposure_weights(df, exposure_metric),
+                    r=rate, q=q, delta_adjusted=delta_adjusted, calculate_in_notional=calculate_in_notional,
+                )
+                for col, arr in results.items():
+                    df[col] = arr
+            priced[flag].append(df)
+    return tuple(pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+                 for frames in (priced[0], priced[1]))
 
 
 def get_current_price(ticker):
@@ -2299,7 +2500,7 @@ def create_exposure_heatmap(calls, puts, S, strike_range=0.02, show_calls=True, 
                 exposure_value = call_value
             elif mode_label == 'Put':
                 # Show the put's contribution to net: only GEX/Volume subtract puts
-                exposure_value = -put_value if normalized_type in ('GEX', 'Volume') else put_value
+                exposure_value = put_net_contribution(normalized_type, put_value)
             else:
                 exposure_value = combine_level_values(normalized_type, call_value, put_value)
 
@@ -2342,7 +2543,7 @@ def create_exposure_heatmap(calls, puts, S, strike_range=0.02, show_calls=True, 
     if mode_label == 'Call':
         total_net_exposure = total_call_exposure
     elif mode_label == 'Put':
-        total_net_exposure = -total_put_exposure
+        total_net_exposure = put_net_contribution(normalized_type, total_put_exposure)
     else:
         total_net_exposure = combine_level_values(normalized_type, total_call_exposure, total_put_exposure)
 
@@ -2543,6 +2744,7 @@ FORECAST_ELEMENT_BUDGET = 150000  # contracts x price rows evaluated per time co
 FORECAST_CACHE_TTL_SEC = 20
 FORECAST_CANDLE_TTL_SEC = 15
 FORECAST_SMOOTH_SIGMA = (1.6, 0.8)  # gaussian sigma in (price rows, time columns)
+FORECAST_MAX_PANELS = 6  # per-expiry view: the nearest expiries beyond this are left out
 _forecast_cache = {}  # key -> {'json', 'at', 'refreshing'}
 _forecast_candle_cache = {}  # (ticker, timeframe) -> (candles, fetched_at)
 _forecast_lock = threading.Lock()
@@ -2559,17 +2761,44 @@ def _forecast_session(ticker):
     return None
 
 
-def _forecast_time_to_expiry(expiry_date, when_et):
-    """Years from `when_et` to the 4:00 PM ET expiry; 0 once expired. Only a 2-minute guard keeps
-    the Greeks finite, so 0DTE gamma keeps sharpening into the close (the live charts floor this
-    at 60 minutes instead)."""
-    et_tz = pytz.timezone('US/Eastern')
-    expiry_dt = et_tz.localize(datetime.combine(expiry_date, datetime.min.time()) + timedelta(hours=16))
-    minutes_left = (expiry_dt - when_et).total_seconds() / 60.0
+def _forecast_time_to_expiry(expiry_date, when_et, am_settled=False):
+    """Years from `when_et` to settlement (4:00 PM ET, or 9:30 AM ET when AM-settled); 0 once
+    expired. Only a 2-minute guard keeps the Greeks finite, so 0DTE gamma keeps sharpening into
+    the close (the live charts floor this at 60 minutes instead)."""
+    minutes_left = (expiry_datetime(expiry_date, am_settled) - when_et).total_seconds() / 60.0
     if minutes_left <= 0:
         return 0.0
     minutes_left = max(minutes_left, 2.0)
     return minutes_left * 60.0 / SECONDS_PER_YEAR
+
+
+def _expiry_as_date(expiry):
+    if isinstance(expiry, datetime):
+        return expiry.date()
+    if isinstance(expiry, str):
+        return datetime.strptime(expiry[:10], '%Y-%m-%d').date()
+    return expiry
+
+
+def _settlement_groups(df):
+    """One side of the chain split per expiry and settlement (AM/PM): each is one clock and one
+    set of model inputs. Yields (expiry_date, model_inputs, rows)."""
+    keys = ['expiration', 'am_settled'] if 'am_settled' in df.columns else ['expiration']
+    for _, rows in df.groupby(keys, dropna=False):
+        first = rows.iloc[0]
+
+        def value(col, default):
+            v = first.get(col, default)
+            return default if pd.isna(v) else v
+
+        inputs = {
+            'am_settled': bool(value('am_settled', False)),
+            'rate': float(value('rate', DEFAULT_RISK_FREE_RATE)),
+            'q': float(value('div_yield', DEFAULT_DIVIDEND_YIELD)),
+            # Price -> model underlying (the VIX future for VIX options; 1 elsewhere)
+            'spot_ratio': float(value('model_spot_ratio', 1.0)),
+        }
+        yield _expiry_as_date(first['expiration']), inputs, rows
 
 
 def _forecast_contract_groups(df, flag, exposure_metric, value_column, spot_index, window, delta_adjusted,
@@ -2591,19 +2820,16 @@ def _forecast_contract_groups(df, flag, exposure_metric, value_column, spot_inde
     outside = float(outside_values.sum())
     df = df[modeled]
     groups = []
-    for expiry, rows in df.groupby('expiration'):
-        expiry_date = expiry if not isinstance(expiry, datetime) else expiry.date()
-        if isinstance(expiry_date, str):
-            expiry_date = datetime.strptime(expiry_date[:10], '%Y-%m-%d').date()
+    for expiry_date, inputs, rows in _settlement_groups(df):
         K = rows['_K'].to_numpy(dtype=float)
         sigma = rows['impliedVolatility'].to_numpy(dtype=float)
         weight = rows['_w'].to_numpy(dtype=float)
         flags = np.full(len(rows), flag, dtype=np.int8)
         scale = np.ones(len(rows))
-        live_t = calculate_time_to_expiration(expiry_date)
+        live_t = calculate_time_to_expiration(expiry_date, inputs['am_settled'])
         if live_t > 0:
             model = _compute_all_greeks_and_exposures_vectorized(
-                flags, spot_index, K, live_t, sigma, weight, r=0.02, q=0,
+                flags, spot_index * inputs['spot_ratio'], K, live_t, sigma, weight, r=inputs['rate'], q=inputs['q'],
                 delta_adjusted=delta_adjusted, calculate_in_notional=calculate_in_notional,
                 only={value_column},
             )[value_column]
@@ -2613,6 +2839,7 @@ def _forecast_contract_groups(df, flag, exposure_metric, value_column, spot_inde
             scale = np.clip(scale, 1e-3, 1e3)
         groups.append({
             'expiry': expiry_date, 'flags': flags, 'K': K, 'sigma': sigma, 'weight': weight, 'scale': scale,
+            **inputs,
         })
     return groups, outside
 
@@ -2630,13 +2857,13 @@ def compute_exposure_forecast_surface(call_groups, put_groups, spot_grid_index, 
         for side, groups in (('call', call_groups), ('put', put_groups)):
             total = np.zeros(len(spot_grid_index))
             for group in groups:
-                t = _forecast_time_to_expiry(group['expiry'], when)
+                t = _forecast_time_to_expiry(group['expiry'], when, group['am_settled'])
                 if t <= 0:
                     continue
                 live = True
                 values = _compute_all_greeks_and_exposures_vectorized(
-                    group['flags'][None, :], spot_col, group['K'][None, :], t,
-                    group['sigma'][None, :], group['weight'][None, :], r=0.02, q=0,
+                    group['flags'][None, :], spot_col * group['spot_ratio'], group['K'][None, :], t,
+                    group['sigma'][None, :], group['weight'][None, :], r=group['rate'], q=group['q'],
                     delta_adjusted=delta_adjusted, calculate_in_notional=calculate_in_notional,
                     only={value_column},
                 )[value_column] * group['scale'][None, :]
@@ -2743,16 +2970,20 @@ def forecast_candles_payload(ticker, timeframe, call_color, put_color):
     }
 
 
+def _index_price_scale(calls, puts):
+    """Chart price per index point (futures map index options onto their own scale); else 1."""
+    for frame in (calls, puts):
+        if not frame.empty and 'index_price_scale' in frame.columns:
+            return float(frame['index_price_scale'].iloc[0])
+    return 1.0
+
+
 def _surface_inputs(calls, puts, S, exposure_type, exposure_metric, delta_adjusted, calculate_in_notional, window):
     """(value_column, price_scale, call_groups, put_groups, outside) for re-pricing the chain.
     Futures options are the index's: the model runs in index space, and chart prices map to it
     by dividing by `price_scale`."""
     value_column = resolve_level_value_column(exposure_type)
-    scale = 1.0
-    for frame in (calls, puts):
-        if not frame.empty and 'index_price_scale' in frame.columns:
-            scale = float(frame['index_price_scale'].iloc[0])
-            break
+    scale = _index_price_scale(calls, puts)
     spot_index = S / scale
     abs_values = exposure_type == 'AbsGEX'
     call_groups, call_outside = _forecast_contract_groups(
@@ -2764,29 +2995,40 @@ def _surface_inputs(calls, puts, S, exposure_type, exposure_metric, delta_adjust
 
 # ── Exposure surface history ──
 # Once a minute per viewed selection, the "now" column (exposure across a price grid) of every
-# exposure type is recorded, so the chart can draw the past from what was actually shown at
-# the time. Re-pricing the past with the current chain instead would repaint it with hindsight
-# (later IV and positions, and for Volume weighting, volume that hadn't traded yet).
+# exposure type is recorded under every weighting formula, so the chart can draw the past from
+# what would have been shown at the time whichever settings are picked later. Re-pricing the
+# past with the current chain instead would repaint it with hindsight (later IV and positions,
+# and for Volume weighting, volume that hadn't traded yet).
 SURFACE_HISTORY_RANGE = 0.08  # recorded grid spans spot +/- 8%
 SURFACE_HISTORY_POINTS = 241
-_surface_recording = set()  # (ticker, expiry_key, formula) being recorded right now
-_surface_last_minute = {}  # (ticker, expiry_key, formula) -> minute timestamp last recorded
+SURFACE_HISTORY_METRICS = ('Open Interest', 'Volume', 'Max OI vs Volume', 'OI + Volume')
+SURFACE_HISTORY_FORMULAS = tuple(
+    (metric, delta_adjusted, notional)
+    for metric in SURFACE_HISTORY_METRICS for delta_adjusted in (False, True) for notional in (False, True)
+)
+_SURFACE_VALUE_COLUMNS = frozenset(resolve_level_value_column(t) for t in FORECAST_TYPES)
+_surface_recording = set()  # (ticker, expiry_key) being recorded right now
+_surface_last_minute = {}  # (ticker, expiry_key) -> minute timestamp last recorded
 
 
 def surface_formula_key(exposure_metric, delta_adjusted, calculate_in_notional):
-    """The weighting settings a recording was made with; history only matches the same ones."""
-    return f"{exposure_metric}|{int(bool(delta_adjusted))}|{int(bool(calculate_in_notional))}"
+    """The weighting settings (and formula version) a recording was made with; history only
+    matches the same ones."""
+    return (f"v{EXPOSURE_FORMULA_VERSION}|{exposure_metric}|{int(bool(delta_adjusted))}"
+            f"|{int(bool(calculate_in_notional))}")
 
 
 def record_surface_snapshot(ticker, S, calls, puts, expiry_key, exposure_metric, delta_adjusted,
                             calculate_in_notional):
-    """Record this minute's surface column for every exposure type, at most once a minute per
-    selection. Runs in a background thread so it never slows the request that triggered it."""
+    """Record this minute's surface column for every exposure type and weighting formula, at
+    most once a minute per selection. The frames were built with the given (live) formula, which
+    calibrates the others. Runs in a background thread so it never slows the request that
+    triggered it."""
     if not S or calls is None or puts is None or (calls.empty and puts.empty) or not is_session_open(ticker):
         return
     now_et = datetime.now(pytz.timezone('US/Eastern'))
     minute = int(now_et.timestamp()) // 60 * 60
-    key = (ticker, expiry_key, surface_formula_key(exposure_metric, delta_adjusted, calculate_in_notional))
+    key = (ticker, expiry_key)
     with _forecast_lock:
         if _surface_last_minute.get(key) == minute or key in _surface_recording:
             return
@@ -2794,29 +3036,117 @@ def record_surface_snapshot(ticker, S, calls, puts, expiry_key, exposure_metric,
         _surface_last_minute[key] = minute  # one attempt per minute, even if it fails
     threading.Thread(
         target=_record_surface_snapshot, daemon=True,
-        args=(key, minute, now_et, S, calls.copy(), puts.copy(), exposure_metric, delta_adjusted,
-              calculate_in_notional),
+        args=(key, minute, now_et, S, calls.copy(), puts.copy(),
+              (exposure_metric, bool(delta_adjusted), bool(calculate_in_notional))),
     ).start()
 
 
-def _record_surface_snapshot(key, minute, now_et, S, calls, puts, exposure_metric, delta_adjusted,
-                             calculate_in_notional):
-    ticker, expiry_key, formula = key
+def record_surface_snapshots(ticker, S, calls, puts, expiry_dates, exposure_metric, delta_adjusted,
+                             calculate_in_notional, per_expiry=False):
+    """Record the selection's surface column and, with `per_expiry` (the surface drawn one panel
+    per expiry), each shown expiry's own, under the same key as selecting that expiry alone."""
+    record_surface_snapshot(ticker, S, calls, puts, build_expiry_selection_key(expiry_dates), exposure_metric,
+                            delta_adjusted, calculate_in_notional)
+    if not per_expiry or len(expiry_dates) < 2 or calls is None or puts is None:
+        return
+    for expiry in sorted(set(expiry_dates))[:FORECAST_MAX_PANELS]:
+        record_surface_snapshot(
+            ticker, S, _forecast_rows_for_expiry(calls, expiry), _forecast_rows_for_expiry(puts, expiry),
+            build_expiry_selection_key([expiry]), exposure_metric, delta_adjusted, calculate_in_notional)
+
+
+def _surface_history_side(df, flag, spot_index, prices_index, now_et, window, live_formula):
+    """One side of the chain re-priced at `now_et` across `prices_index` under every formula.
+    Returns ({(metric, delta_adjusted, notional): {exposure_type: values}}, any_expiry_live).
+
+    Exposure is linear in each contract's weight, so each Greek grid is computed once with unit
+    weights and then weighted per metric. Calibration (live exposure / model exposure, as in
+    _forecast_contract_groups) can only be measured for the live formula; the others reuse its
+    factors, which are 1 for everything but blended MARKET rows."""
+    totals = {formula: {t: np.zeros(len(prices_index)) for t in FORECAST_TYPES} for formula in SURFACE_HISTORY_FORMULAS}
+    if df is None or df.empty or 'expiration' not in df.columns:
+        return totals, False
+    live_metric, live_delta_adjusted, live_notional = live_formula
+    strike_col = 'index_strike' if 'index_strike' in df.columns else 'strike'
+    df = df[(df[strike_col].astype(float) > 0) & (exposure_weights(df, 'OI + Volume') > 0)]
+    spot_col = np.asarray(prices_index, dtype=float)[:, None]
+    any_live = False
+    for expiry_date, inputs, rows in _settlement_groups(df):
+        K = rows[strike_col].to_numpy(dtype=float)
+        sigma = rows['impliedVolatility'].to_numpy(dtype=float)
+        flags = np.full(len(rows), flag, dtype=np.int8)
+        unit = np.ones(len(rows))
+        weights = {metric: exposure_weights(rows, metric) for metric in SURFACE_HISTORY_METRICS}
+        # Far strikes barely move with price: their live exposure is held constant across the grid
+        modeled = np.abs(K / spot_index - 1.0) <= window
+        live_t = calculate_time_to_expiration(expiry_date, inputs['am_settled'])
+        grid_t = _forecast_time_to_expiry(expiry_date, now_et, inputs['am_settled'])
+        any_live = any_live or grid_t > 0
+        rate, q = inputs['rate'], inputs['q']
+        model_spot = spot_index * inputs['spot_ratio']
+        model_grid = spot_col * inputs['spot_ratio']
+
+        scale = {col: np.ones(len(rows)) for col in _SURFACE_VALUE_COLUMNS}
+        if live_t > 0:
+            model = _compute_all_greeks_and_exposures_vectorized(
+                flags, model_spot, K, live_t, sigma, weights[live_metric], r=rate, q=q,
+                delta_adjusted=live_delta_adjusted, calculate_in_notional=live_notional,
+                only=_SURFACE_VALUE_COLUMNS)
+            for col in _SURFACE_VALUE_COLUMNS:
+                if col not in rows.columns:
+                    continue
+                actual = rows[col].to_numpy(dtype=float)
+                usable = np.isfinite(model[col]) & (np.abs(model[col]) > 1e-12) & np.isfinite(actual)
+                scale[col] = np.clip(np.where(usable, actual / np.where(usable, model[col], 1.0), 1.0), 1e-3, 1e3)
+
+        for delta_adjusted in (False, True):
+            for notional in (False, True):
+                at_spot = _compute_all_greeks_and_exposures_vectorized(
+                    flags, model_spot, K, live_t, sigma, unit, r=rate, q=q, delta_adjusted=delta_adjusted,
+                    calculate_in_notional=notional, only=_SURFACE_VALUE_COLUMNS) if live_t > 0 else None
+                grid = _compute_all_greeks_and_exposures_vectorized(
+                    flags[modeled][None, :], model_grid, K[modeled][None, :], grid_t, sigma[modeled][None, :],
+                    unit[modeled][None, :], r=rate, q=q, delta_adjusted=delta_adjusted,
+                    calculate_in_notional=notional, only=_SURFACE_VALUE_COLUMNS,
+                ) if grid_t > 0 and modeled.any() else None
+                for exposure_type in FORECAST_TYPES:
+                    col = resolve_level_value_column(exposure_type)
+                    outside_values = np.nan_to_num(at_spot[col][~modeled] * scale[col][~modeled]) if at_spot is not None else None
+                    grid_values = np.nan_to_num(grid[col] * scale[col][modeled][None, :]) if grid is not None else None
+                    if exposure_type == 'AbsGEX':
+                        outside_values = np.abs(outside_values) if outside_values is not None else None
+                        grid_values = np.abs(grid_values) if grid_values is not None else None
+                    for metric, weight in weights.items():
+                        total = totals[(metric, delta_adjusted, notional)][exposure_type]
+                        if grid_values is not None:
+                            total += grid_values @ weight[modeled]
+                        if outside_values is not None:
+                            total += float(outside_values @ weight[~modeled])
+    return totals, any_live
+
+
+def _record_surface_snapshot(key, minute, now_et, S, calls, puts, live_formula):
+    ticker, expiry_key = key
     try:
         prices = np.linspace(S * (1 - SURFACE_HISTORY_RANGE), S * (1 + SURFACE_HISTORY_RANGE), SURFACE_HISTORY_POINTS)
         date = session_date_for(ticker, now_et).strftime('%Y-%m-%d')
+        scale = _index_price_scale(calls, puts)
+        window = SURFACE_HISTORY_RANGE + 0.02
+        sides = [
+            _surface_history_side(frame, flag, S / scale, prices / scale, now_et, window, live_formula)
+            for flag, frame in ((0, calls), (1, puts))
+        ]
+        if not any(live for _, live in sides):
+            return  # every selected expiry has expired
+        (call_totals, _), (put_totals, _) = sides
         rows = []
-        for exposure_type in FORECAST_TYPES:
-            value_column, scale, call_groups, put_groups, outside = _surface_inputs(
-                calls, puts, S, exposure_type, exposure_metric, delta_adjusted, calculate_in_notional,
-                window=SURFACE_HISTORY_RANGE + 0.02)
-            column = compute_exposure_forecast_surface(
-                call_groups, put_groups, prices / scale, [now_et], exposure_type, value_column,
-                delta_adjusted, calculate_in_notional, outside=outside)[:, 0]
-            if not np.all(np.isfinite(column)):
-                continue  # every selected expiry has expired
-            rows.append((ticker, expiry_key, formula, exposure_type, minute, date, float(S),
-                         float(prices[0]), float(prices[-1]), column.astype(np.float32).tobytes()))
+        for formula in SURFACE_HISTORY_FORMULAS:
+            formula_key = surface_formula_key(*formula)
+            for exposure_type in FORECAST_TYPES:
+                column = combine_level_values(
+                    exposure_type, call_totals[formula][exposure_type], put_totals[formula][exposure_type])
+                rows.append((ticker, expiry_key, formula_key, exposure_type, minute, date, float(S),
+                             float(prices[0]), float(prices[-1]), column.astype(np.float32).tobytes()))
         if rows:
             with _db_write_lock, closing(get_options_db_connection()) as conn:
                 conn.executemany('''
@@ -2850,19 +3180,158 @@ def get_surface_history(ticker, date, expiry_key, formula, exposure_type):
     return history
 
 
+def _forecast_rows_for_expiry(df, expiry):
+    """One side of the chain cut down to a single expiry ('YYYY-MM-DD')."""
+    if df is None or df.empty or 'expiration' not in df.columns:
+        return df
+    return df[pd.to_datetime(df['expiration'], errors='coerce').dt.date == _expiry_as_date(expiry)]
+
+
+def _forecast_panel(calls, puts, S, exposure_type, exposure_metric, delta_adjusted, calculate_in_notional,
+                    prices, half_width, times, step, now_et, history, element_budget):
+    """One smoothed surface over (prices, times) as (values, past_note), or (None, reason) when
+    there is nothing to draw. Fully past columns come from `history` (get_surface_history)."""
+    # Fewer contracts per time column for big multi-expiry selections keeps refreshes quick, but
+    # every strike the chart's price range reaches (plus a margin) is always re-priced
+    window = 0.15
+    min_window = min(window, max(0.03, half_width / S + 0.01))
+    while True:
+        value_column, scale, call_groups, put_groups, outside = _surface_inputs(
+            calls, puts, S, exposure_type, exposure_metric, delta_adjusted, calculate_in_notional, window)
+        contracts = sum(len(g['K']) for g in call_groups + put_groups)
+        if contracts * FORECAST_PRICE_POINTS <= element_budget or window <= min_window:
+            break
+        window = max(window * 0.8, min_window)
+    if not call_groups and not put_groups:
+        return None, 'no weighted contracts'
+
+    surface = compute_exposure_forecast_surface(
+        call_groups, put_groups, prices / scale, times, exposure_type, value_column,
+        delta_adjusted, calculate_in_notional, outside=outside,
+    )
+
+    # Columns that are fully in the past come from the recorded history where it exists, so the
+    # past isn't repainted with the current chain; only unrecorded past columns stay re-priced
+    history_ts = [entry[0] for entry in history]
+    half_step = timedelta(minutes=step / 2)
+    recorded_cols, repriced_cols = [], []
+    for j, center in enumerate(times):
+        if center + half_step > now_et:
+            continue  # the current and future columns are the projection
+        lo = bisect_left(history_ts, (center - half_step).timestamp())
+        hi = bisect_left(history_ts, (center + half_step).timestamp())
+        if hi > lo:
+            _, recorded_prices, recorded_values = history[hi - 1]  # latest recording in the step
+            recorded = np.interp(prices, recorded_prices, recorded_values, left=np.nan, right=np.nan)
+            # Prices outside the recorded grid (a very wide range or a big move) keep the re-priced value
+            surface[:, j] = np.where(np.isfinite(recorded), recorded, surface[:, j])
+            recorded_cols.append(j)
+        elif np.isfinite(surface[:, j]).any():
+            repriced_cols.append(j)
+    note = None
+    if repriced_cols:
+        if not recorded_cols:
+            note = 'past re-priced (not recorded)'
+        elif max(repriced_cols) < min(recorded_cols):
+            note = f"past re-priced before {(times[min(recorded_cols)] - half_step):%H:%M}"
+        else:
+            note = 'past partly re-priced (recording gaps)'
+
+    live_mask = np.isfinite(surface)
+    if not live_mask.any():
+        return None, 'expired for this session'
+
+    # Smooth only over live cells: dividing by the smoothed mask keeps expired (NaN) columns from
+    # being blended in as zeros, which would drag down the columns next to them
+    from scipy.ndimage import gaussian_filter
+    filled = gaussian_filter(np.where(live_mask, surface, 0.0), sigma=FORECAST_SMOOTH_SIGMA, mode='nearest')
+    weight = gaussian_filter(live_mask.astype(float), sigma=FORECAST_SMOOTH_SIGMA, mode='nearest')
+    return np.where(live_mask, filled / np.maximum(weight, 1e-9), np.nan), note
+
+
+def _add_forecast_panel_traces(fig, smoothed, prices, x_labels, exposure_type, unit_label, call_color, put_color,
+                               axis_suffix='', name_suffix='', legend_shown=None):
+    """Add one panel's heatmap and zero-flip / peak / trough lines on axes x<suffix>/y<suffix>.
+    Colors are scaled to this panel's own values. Returns the panel's largest |value|."""
+    display_name = INTERVAL_LEVEL_DISPLAY_NAMES.get(exposure_type, exposure_type)
+    axes = dict(xaxis='x' + axis_suffix, yaxis='y' + axis_suffix)
+    legend_shown = set() if legend_shown is None else legend_shown
+    peak_abs = float(np.nanmax(np.abs(smoothed)))
+    peak_abs = peak_abs if peak_abs > 0 else 1.0
+    color_max = float(np.nanpercentile(np.abs(smoothed), 99)) or peak_abs
+    one_sided = exposure_type == 'AbsGEX'
+
+    # Colors follow a square-root scale of |exposure| so weaker areas still show tint (exposure is
+    # very peaky, and on a linear scale everything but the biggest cells reads as black). The real
+    # values ride along in customdata for hover.
+    color_power = 0.5
+    scaled = np.clip(smoothed / color_max, -1.0, 1.0)
+    color_z = np.round(np.sign(scaled) * np.abs(scaled) ** color_power, 3)
+    # The real (unscaled) values ride along in customdata; the page's tooltip formats them with its
+    # K/M/B/T formatter. ~4 significant digits keeps the payload small.
+    decimals = 3 - int(math.floor(math.log10(color_max))) if color_max > 0 else 0
+    real_z = np.round(smoothed, decimals)
+    fig.add_trace(go.Heatmap(
+        # Plain lists, not numpy arrays: plotly 6 encodes numpy as base64 'bdata', which the page's
+        # Plotly.js may not decode (heatmap renders empty/black while list-based traces still draw)
+        x=x_labels, y=np.round(prices, 2).tolist(), z=color_z.tolist(), customdata=real_z.tolist(),
+        name=display_name + name_suffix, meta='forecast|' + unit_label,
+        colorscale=([[0.0, '#3A3A3A'], [1.0, call_color]] if one_sided
+                    else [[0.0, put_color], [0.5, '#3A3A3A'], [1.0, call_color]]),
+        zmin=0 if one_sided else -1, zmax=1, zmid=None if one_sided else 0,
+        # 'none' hides Plotly's own label but still fires the hover event the page's tooltip uses
+        zsmooth='best', hoverongaps=False, hoverinfo='none', showscale=False, **axes,
+    ))
+
+    def add_track_trace(tracks, name, color, width=2, dash=None):
+        xs, ys = [], []
+        for track in tracks:
+            xs.extend(x_labels[c] for c, _ in track)
+            ys.extend(round(p, 2) for _, p in track)
+            xs.append(None)
+            ys.append(None)
+        if not xs:
+            return
+        # One legend entry per kind of line, however many panels draw it
+        fig.add_trace(go.Scatter(x=xs, y=ys, mode='lines', name=name, legendgroup=name,
+                                 showlegend=name not in legend_shown, hoverinfo='skip',
+                                 line=dict(color=color, width=width, dash=dash, shape='spline', smoothing=0.8),
+                                 **axes))
+        legend_shown.add(name)
+
+    if not one_sided:
+        add_track_trace(find_forecast_zero_tracks(smoothed, prices), 'Zero', '#F5F5F5', width=1.5, dash='dot')
+    # Brighter versions of the call (peak) and put (trough) colors, so they stand out on the surface
+    add_track_trace(find_forecast_extrema_tracks(smoothed, prices, 'trough', 0.06 * peak_abs),
+                    f'{display_name} Trough', shade_hex_color(put_color, 0.5))
+    add_track_trace(find_forecast_extrema_tracks(smoothed, prices, 'peak', 0.06 * peak_abs),
+                    f'{display_name} Peak', shade_hex_color(call_color, 0.5))
+    return peak_abs
+
+
 def create_exposure_forecast_chart(calls, puts, S, ticker, exposure_type='GEX', exposure_metric='Open Interest',
                                    delta_adjusted=False, calculate_in_notional=True, price_range=0.015,
                                    timeframe=5, call_color='#00FF00', put_color='#FF0000',
-                                   selected_expiries=None):
+                                   selected_expiries=None, split_expiries=False):
+    """The exposure surface. With several expiries selected it is either their sum (one panel) or,
+    with `split_expiries`, one panel per expiry side by side on a shared price axis, each colored
+    to its own scale (the nearest FORECAST_MAX_PANELS expiries)."""
     exposure_type = normalize_level_type(exposure_type)
     if exposure_type not in FORECAST_TYPES:
         exposure_type = 'GEX'
-    value_column = resolve_level_value_column(exposure_type)
     display_name = INTERVAL_LEVEL_DISPLAY_NAMES.get(exposure_type, exposure_type)
     title_name = HEATMAP_TITLE_DISPLAY_NAMES.get(exposure_type, display_name)
     text_color, grid_color, background_color = '#CCCCCC', '#333333', '#1E1E1E'
     weight_label = exposure_metric + (', Δ-adjusted' if delta_adjusted else '')
-    title = build_chart_title_text(f'{title_name} Surface ({weight_label})', selected_expiries=selected_expiries)
+    expiries = sorted({str(expiry) for expiry in (selected_expiries or []) if expiry})
+    split = bool(split_expiries) and len(expiries) > 1
+    if split:
+        panel_expiries = expiries[:FORECAST_MAX_PANELS]
+        title = f'{title_name} Surface by Expiry ({weight_label})'
+        if len(expiries) > len(panel_expiries):
+            title += f' · nearest {len(panel_expiries)} of {len(expiries)}'
+    else:
+        title = build_chart_title_text(f'{title_name} Surface ({weight_label})', selected_expiries=selected_expiries)
 
     def empty_figure(message):
         fig = go.Figure()
@@ -2892,20 +3361,6 @@ def create_exposure_forecast_chart(calls, puts, S, ticker, exposure_type='GEX', 
     half_width = min(half_width, 0.15 * S)
     prices = np.linspace(S - half_width, S + half_width, FORECAST_PRICE_POINTS)
 
-    # Fewer contracts per time column for big multi-expiry selections keeps refreshes quick, but
-    # every strike the chart's price range reaches (plus a margin) is always re-priced
-    window = 0.15
-    min_window = min(window, max(0.03, half_width / S + 0.01))
-    while True:
-        value_column, scale, call_groups, put_groups, outside = _surface_inputs(
-            calls, puts, S, exposure_type, exposure_metric, delta_adjusted, calculate_in_notional, window)
-        contracts = sum(len(g['K']) for g in call_groups + put_groups)
-        if contracts * FORECAST_PRICE_POINTS <= FORECAST_ELEMENT_BUDGET or window <= min_window:
-            break
-        window = max(window * 0.8, min_window)
-    if not call_groups and not put_groups:
-        return empty_figure('No weighted contracts for the selected expiries')
-
     session_minutes = (session_close - session_open).total_seconds() / 60.0
     step = next((m for m in (5, 10, 15, 30, 60) if session_minutes / m <= FORECAST_MAX_TIME_COLUMNS), 60)
     # Each column is the middle of its time step, so the cells tile open -> close exactly and the
@@ -2913,115 +3368,92 @@ def create_exposure_forecast_chart(calls, puts, S, ticker, exposure_type='GEX', 
     times = [session_open + timedelta(minutes=step * (k + 0.5)) for k in range(math.ceil(session_minutes / step))]
     times = [t for t in times if t < session_close]
 
-    surface = compute_exposure_forecast_surface(
-        call_groups, put_groups, prices / scale, times, exposure_type, value_column,
-        delta_adjusted, calculate_in_notional, outside=outside,
-    )
+    # Each panel is (expiry or None for the summed selection, calls, puts, history selection key)
+    if split:
+        panel_specs = [(expiry, _forecast_rows_for_expiry(calls, expiry), _forecast_rows_for_expiry(puts, expiry),
+                        build_expiry_selection_key([expiry])) for expiry in panel_expiries]
+    else:
+        panel_specs = [(None, calls, puts, build_expiry_selection_key(selected_expiries))]
+    session_day = session_date_for(ticker, session_open)
+    formula = surface_formula_key(exposure_metric, delta_adjusted, calculate_in_notional)
+    # The panels share one budget so a split view refreshes about as fast as the summed one
+    element_budget = FORECAST_ELEMENT_BUDGET / len(panel_specs)
+    panels = []
+    for expiry, panel_calls, panel_puts, history_key in panel_specs:
+        history = get_surface_history(ticker, session_day.strftime('%Y-%m-%d'), history_key, formula, exposure_type)
+        values, info = _forecast_panel(
+            panel_calls, panel_puts, S, exposure_type, exposure_metric, delta_adjusted, calculate_in_notional,
+            prices, half_width, times, step, now_et, history, element_budget)
+        panels.append((expiry, values, info))
 
-    # Columns that are fully in the past come from the recorded history where it exists, so the
-    # past isn't repainted with the current chain; only unrecorded past columns stay re-priced
-    history = get_surface_history(
-        ticker, session_date_for(ticker, session_open).strftime('%Y-%m-%d'),
-        build_expiry_selection_key(selected_expiries),
-        surface_formula_key(exposure_metric, delta_adjusted, calculate_in_notional), exposure_type)
-    history_ts = [entry[0] for entry in history]
-    half_step = timedelta(minutes=step / 2)
-    recorded_cols, repriced_cols = [], []
-    for j, center in enumerate(times):
-        if center + half_step > now_et:
-            continue  # the current and future columns are the projection
-        lo = bisect_left(history_ts, (center - half_step).timestamp())
-        hi = bisect_left(history_ts, (center + half_step).timestamp())
-        if hi > lo:
-            _, recorded_prices, recorded_values = history[hi - 1]  # latest recording in the step
-            recorded = np.interp(prices, recorded_prices, recorded_values, left=np.nan, right=np.nan)
-            # Prices outside the recorded grid (a very wide range or a big move) keep the re-priced value
-            surface[:, j] = np.where(np.isfinite(recorded), recorded, surface[:, j])
-            recorded_cols.append(j)
-        elif np.isfinite(surface[:, j]).any():
-            repriced_cols.append(j)
-    if repriced_cols:
-        if not recorded_cols:
-            note = 'past re-priced (not recorded)'
-        elif max(repriced_cols) < min(recorded_cols):
-            note = f"past re-priced before {(times[min(recorded_cols)] - half_step):%H:%M}"
-        else:
-            note = 'past partly re-priced (recording gaps)'
+    drawn = [(values, info) for _, values, info in panels if values is not None]
+    if not drawn:
+        if split:
+            return empty_figure('No surface for the selected expiries')
+        return empty_figure({'no weighted contracts': 'No weighted contracts for the selected expiries'}.get(
+            panels[0][2], 'Selected expiries are already expired for this session'))
+    notes = {info for _, info in drawn if info}
+    if notes:
+        note = notes.pop() if len(notes) == 1 else 'past partly re-priced (recording gaps)'
         title += f" <span style='font-size:11px;font-weight:normal;color:#999999'>· {note}</span>"
 
-    live_mask = np.isfinite(surface)
-    if not live_mask.any():
-        return empty_figure('Selected expiries are already expired for this session')
-
-    # Smooth only over live cells: dividing by the smoothed mask keeps expired (NaN) columns from
-    # being blended in as zeros, which would drag down the columns next to them
-    from scipy.ndimage import gaussian_filter
-    filled = gaussian_filter(np.where(live_mask, surface, 0.0), sigma=FORECAST_SMOOTH_SIGMA, mode='nearest')
-    weight = gaussian_filter(live_mask.astype(float), sigma=FORECAST_SMOOTH_SIGMA, mode='nearest')
-    smoothed = np.where(live_mask, filled / np.maximum(weight, 1e-9), np.nan)
-
-    peak_abs = float(np.nanmax(np.abs(smoothed)))
-    peak_abs = peak_abs if peak_abs > 0 else 1.0
-    color_max = float(np.nanpercentile(np.abs(smoothed), 99)) or peak_abs
-    one_sided = exposure_type == 'AbsGEX'
-
+    unit_label = FORECAST_UNIT_LABELS[exposure_type].replace('{$}', '$' if calculate_in_notional else 'shares of')
     x_labels = [t.strftime('%Y-%m-%d %H:%M:%S') for t in times]
-    # Colors follow a square-root scale of |exposure| so weaker areas still show tint (exposure is
-    # very peaky, and on a linear scale everything but the biggest cells reads as black). The real
-    # values ride along in customdata for hover.
-    color_power = 0.5
-    scaled = np.clip(smoothed / color_max, -1.0, 1.0)
-    color_z = np.round(np.sign(scaled) * np.abs(scaled) ** color_power, 3)
-    # The real (unscaled) values ride along in customdata; the page's tooltip formats them with its
-    # K/M/B/T formatter. ~4 significant digits keeps the payload small.
-    decimals = 3 - int(math.floor(math.log10(color_max))) if color_max > 0 else 0
-    real_z = np.round(smoothed, decimals)
-    fig = go.Figure()
-    fig.add_trace(go.Heatmap(
-        # Plain lists, not numpy arrays: plotly 6 encodes numpy as base64 'bdata', which the page's
-        # Plotly.js may not decode (heatmap renders empty/black while list-based traces still draw)
-        x=x_labels, y=np.round(prices, 2).tolist(), z=color_z.tolist(), customdata=real_z.tolist(),
-        name=display_name, meta='forecast|' + FORECAST_UNIT_LABELS[exposure_type].replace(
-            '{$}', '$' if calculate_in_notional else 'shares of'),
-        colorscale=([[0.0, '#3A3A3A'], [1.0, call_color]] if one_sided
-                    else [[0.0, put_color], [0.5, '#3A3A3A'], [1.0, call_color]]),
-        zmin=0 if one_sided else -1, zmax=1, zmid=None if one_sided else 0,
-        # 'none' hides Plotly's own label but still fires the hover event the page's tooltip uses
-        zsmooth='best', hoverongaps=False, hoverinfo='none', showscale=False,
-    ))
-
-    def add_track_trace(tracks, name, color, width=2, dash=None):
-        xs, ys = [], []
-        for track in tracks:
-            xs.extend(x_labels[c] for c, _ in track)
-            ys.extend(round(p, 2) for _, p in track)
-            xs.append(None)
-            ys.append(None)
-        if not xs:
-            return
-        fig.add_trace(go.Scatter(x=xs, y=ys, mode='lines', name=name, hoverinfo='skip',
-                                 line=dict(color=color, width=width, dash=dash, shape='spline', smoothing=0.8)))
-
-    if not one_sided:
-        add_track_trace(find_forecast_zero_tracks(smoothed, prices), 'Zero', '#F5F5F5', width=1.5, dash='dot')
-    # Brighter versions of the call (peak) and put (trough) colors, so they stand out on the surface
-    add_track_trace(find_forecast_extrema_tracks(smoothed, prices, 'trough', 0.06 * peak_abs),
-                    f'{display_name} Trough', shade_hex_color(put_color, 0.5))
-    add_track_trace(find_forecast_extrema_tracks(smoothed, prices, 'peak', 0.06 * peak_abs),
-                    f'{display_name} Peak', shade_hex_color(call_color, 0.5))
-    # The candles aren't part of this figure: the page draws them from 'forecast_candles' and
-    # live quotes, so they don't wait on this (slow) build
-
+    x_range = [session_open.strftime('%Y-%m-%d %H:%M:%S'), session_close.strftime('%Y-%m-%d %H:%M:%S')]
     y_tick_format = '.2f' if S < 100 else ('.1f' if S < 1000 else '.0f')
     axis_common = dict(gridcolor=grid_color, linecolor=grid_color, showgrid=False, zeroline=False,
                        tickfont=dict(color=text_color))
+    fig = go.Figure()
+    legend_shown = set()
+    axes_layout, annotations = {}, []
+    count = len(panels)
+    gap = 0.012
+    width = (1.0 - gap * (count - 1)) / count
+    for i, (expiry, values, info) in enumerate(panels):
+        suffix = '' if i == 0 else str(i + 1)
+        x0 = i * (width + gap)
+        x1 = 1.0 if i == count - 1 else x0 + width
+        expiry_date = _expiry_as_date(expiry) if expiry else None
+        peak_abs = None
+        if values is not None:
+            name_suffix = f' · {expiry_date:%b} {expiry_date.day}' if expiry_date else ''
+            peak_abs = _add_forecast_panel_traces(
+                fig, values, prices, x_labels, exposure_type, unit_label, call_color, put_color,
+                axis_suffix=suffix, name_suffix=name_suffix, legend_shown=legend_shown)
+        # The panels share one price axis (labels on the right of the last) and one time zoom
+        xaxis = dict(type='date', range=x_range, tickformat='%H:%M', domain=[x0, x1], anchor='y' + suffix,
+                     rangeslider=dict(visible=False), **axis_common)
+        yaxis = dict(range=[float(prices[0]), float(prices[-1])], tickformat=y_tick_format, side='right',
+                     anchor='x' + suffix, showticklabels=i == count - 1, **axis_common)
+        if i:
+            xaxis['matches'] = 'x'
+            yaxis['matches'] = 'y'
+        if i == count - 1:
+            yaxis['title'] = dict(text='Price', font=dict(color=text_color))
+        axes_layout['xaxis' + suffix] = xaxis
+        axes_layout['yaxis' + suffix] = yaxis
+        if expiry_date is None:
+            continue
+        # Each panel is colored to its own scale, so its label carries the size of its peak
+        dte = (expiry_date - session_day).days
+        label = f'<b>{expiry_date:%a %b} {expiry_date.day}</b> · {dte}DTE'
+        if peak_abs is not None:
+            sign = '' if exposure_type == 'AbsGEX' else '±'
+            money = '$' if unit_label.startswith('$') else ''
+            label += f' · peak {sign}{money}{format_large_number(peak_abs)}'
+        annotations.append(dict(text=label, xref='paper', yref='paper', x=x0, y=1, xanchor='left', yanchor='top',
+                                showarrow=False, align='left', font=dict(color='#E6E6E6', size=11),
+                                bgcolor='rgba(20,20,20,0.7)', borderpad=3))
+        if values is None:
+            annotations.append(dict(text=info.capitalize(), xref='paper', yref='paper', x=(x0 + x1) / 2, y=0.5,
+                                    showarrow=False, font=dict(color=text_color, size=12)))
+    # The candles aren't part of this figure: the page draws them on every panel from
+    # 'forecast_candles' and live quotes, so they don't wait on this (slow) build
+
     fig.update_layout(
         title=build_left_aligned_title(title, text_color=text_color),
-        xaxis=dict(type='date', range=[session_open.strftime('%Y-%m-%d %H:%M:%S'),
-                                       session_close.strftime('%Y-%m-%d %H:%M:%S')], tickformat='%H:%M',
-                   rangeslider=dict(visible=False), **axis_common),
-        yaxis=dict(range=[float(prices[0]), float(prices[-1])], tickformat=y_tick_format, side='right',
-                   title=dict(text='Price', font=dict(color=text_color)), **axis_common),
+        **axes_layout,
+        annotations=annotations,
         # Just above the plot's top-left corner (in the header band, on the selectors' row), small
         # and without a box, so it never sits on the heatmap
         legend=dict(x=0, y=1, xanchor='left', yanchor='bottom', orientation='h',
@@ -3030,7 +3462,7 @@ def create_exposure_forecast_chart(calls, puts, S, ticker, exposure_type='GEX', 
         plot_bgcolor=background_color, paper_bgcolor=background_color, font=dict(color=text_color),
         margin=dict(l=76, r=52, t=48, b=32),
         hoverlabel=dict(bgcolor=background_color, font_size=12, font_family='Arial'),
-        uirevision=f"{ticker}|{exposure_type}|{price_range}|{session_open:%Y%m%d}|{timeframe}",
+        uirevision=f"{ticker}|{exposure_type}|{price_range}|{session_open:%Y%m%d}|{timeframe}|{count}",
         transition=dict(duration=0, easing='linear'),
     )
     return fig.to_json()
@@ -3120,12 +3552,7 @@ def create_exposure_chart(calls, puts, exposure_type, title, S, strike_range=0.0
     total_call_exposure = calls[exposure_type].sum() if not calls.empty and exposure_type in calls.columns else 0
     total_put_exposure = puts[exposure_type].sum() if not puts.empty and exposure_type in puts.columns else 0
 
-    if exposure_type == 'GEX':
-        total_net_exposure = total_call_exposure - total_put_exposure
-    elif exposure_type == 'DEX':
-        total_net_exposure = total_call_exposure + total_put_exposure
-    else:
-        total_net_exposure = total_call_exposure + total_put_exposure
+    total_net_exposure = combine_level_values(exposure_type, total_call_exposure, total_put_exposure)
     
     # Create the main title and net exposure as separate annotations
     fig = go.Figure()
@@ -3221,9 +3648,10 @@ def create_exposure_chart(calls, puts, exposure_type, title, S, strike_range=0.0
     if show_puts and not puts_df.empty:
         # Apply coloring mode
         put_colors = get_colors(put_color, puts_df[exposure_type], max_exposure, coloring_mode)
-        # Plot puts in the direction they contribute to net: GEX subtracts puts, every
-        # other exposure (DEX, Vanna, Charm, ...) adds the signed put value.
-        put_plot_values = (-puts_df[exposure_type] if exposure_type == 'GEX' else puts_df[exposure_type]).tolist()
+        # Plot puts in the direction they contribute to net: GEX subtracts puts, every other
+        # exposure (DEX, Vanna, Charm, ...) adds the signed put value. The bar text keeps the
+        # put's own value
+        put_plot_values = put_net_contribution(exposure_type, puts_df[exposure_type]).tolist()
 
         if horizontal:
             fig.add_trace(go.Bar(
@@ -3257,15 +3685,7 @@ def create_exposure_chart(calls, puts, exposure_type, title, S, strike_range=0.0
         for strike in all_strikes:
             call_value = calls_df[calls_df['strike'] == strike][exposure_type].sum() if not calls_df.empty else 0
             put_value = puts_df[puts_df['strike'] == strike][exposure_type].sum() if not puts_df.empty else 0
-            
-            if exposure_type == 'GEX':
-                net_value = call_value - put_value
-            elif exposure_type == 'DEX':
-                net_value = call_value + put_value
-            else:
-                net_value = call_value + put_value
-            
-            net_exposure.append(net_value)
+            net_exposure.append(combine_level_values(exposure_type, call_value, put_value))
         
         # Calculate max for net exposure normalization
         max_net_exposure = max(abs(min(net_exposure)), abs(max(net_exposure))) if net_exposure else 1.0
@@ -3422,13 +3842,7 @@ def create_exposure_chart(calls, puts, exposure_type, title, S, strike_range=0.0
                 for strike in all_chain_strikes:
                     call_value = calls[calls['strike'] == strike][exposure_type].sum() if not calls.empty else 0
                     put_value = puts[puts['strike'] == strike][exposure_type].sum() if not puts.empty else 0
-                    if exposure_type == 'GEX':
-                        net_value = call_value - put_value
-                    elif exposure_type == 'DEX':
-                        net_value = call_value + put_value
-                    else:
-                        net_value = call_value + put_value
-                    chain_net_exposure.append(net_value)
+                    chain_net_exposure.append(combine_level_values(exposure_type, call_value, put_value))
 
                 # Find the strike with the max absolute net exposure (or max/min depending on sign of total net)
                 if chain_net_exposure:
@@ -4106,7 +4520,8 @@ def build_historical_levels_overlay(ticker, display_date, chart_times, latest_pr
         )
         base_color = call_color if point['value'] >= 0 else put_color
         formatted_value = format_large_number(point['value'])
-        side_label = 'Call' if point['value'] >= 0 else 'Put'
+        # The sign of the dealer-signed net, not which side the contracts are on
+        side_label = '+' if point['value'] >= 0 else '−'
         historical_points.append({
             'time': point['time'],
             'price': round(point['price'], 4),
@@ -4297,17 +4712,7 @@ def build_price_overlays(ticker, calls, puts, current_price, display_date_key, c
                 all_strikes_set = set(call_ex.keys()) | set(put_ex.keys())
                 levels = {}
                 for strike in all_strikes_set:
-                    c_val = call_ex.get(strike, 0)
-                    p_val = put_ex.get(strike, 0)
-                    if etype == 'GEX':
-                        net_val = c_val - p_val
-                    elif etype == 'AbsGEX':
-                        net_val = abs(c_val) + abs(p_val)
-                    elif etype == 'Volume':
-                        net_val = c_val - p_val
-                    else:
-                        net_val = c_val + p_val
-                    levels[strike] = net_val
+                    levels[strike] = combine_level_values(etype, call_ex.get(strike, 0), put_ex.get(strike, 0))
 
                 top = sorted(levels.items(), key=lambda x: abs(x[1]), reverse=True)[:exposure_levels_count]
                 for strike, val in top:
@@ -5424,8 +5829,9 @@ _collector_thread = None
 
 
 def register_collector_selection(ticker, expiry_dates, strike_range, exposure_metric,
-                                 delta_adjusted, calculate_in_notional, stored=False):
-    """Remember a selection a page is showing so the collector can keep recording it."""
+                                 delta_adjusted, calculate_in_notional, stored=False, surface_split=False):
+    """Remember a selection a page is showing so the collector can keep recording it.
+    `surface_split`: its exposure surface is drawn per expiry, so each expiry is recorded too."""
     if not BACKGROUND_COLLECT_ENABLED:
         return
     expiry_key = build_expiry_selection_key(expiry_dates)
@@ -5443,6 +5849,7 @@ def register_collector_selection(ticker, expiry_dates, strike_range, exposure_me
             'exposure_metric': exposure_metric,
             'delta_adjusted': delta_adjusted,
             'calculate_in_notional': calculate_in_notional,
+            'surface_split': bool(surface_split),
             'last_seen': now,
             'seen_date': session_date_for(ticker).strftime('%Y-%m-%d'),
         })
@@ -5482,8 +5889,9 @@ def _collect_selection(entry):
         return
     store_interval_data(ticker, S, entry['strike_range'], calls, puts, expiry_key=entry['expiry_key'])
     store_centroid_data(ticker, S, calls, puts, expiry_key=entry['expiry_key'])
-    record_surface_snapshot(ticker, S, calls, puts, entry['expiry_key'], entry['exposure_metric'],
-                            entry['delta_adjusted'], entry['calculate_in_notional'])
+    record_surface_snapshots(ticker, S, calls, puts, expiry_dates, entry['exposure_metric'],
+                             entry['delta_adjusted'], entry['calculate_in_notional'],
+                             per_expiry=entry.get('surface_split', False))
 
 
 def _collector_loop():
@@ -5928,6 +6336,9 @@ def index():
             height: auto !important;
             min-height: 0 !important;
             padding: 2px 4px !important;
+        }
+        .forecast-controls select[hidden] {
+            display: none;
         }
         #chart-control-staging .forecast-controls {
             position: static;
@@ -6724,40 +7135,413 @@ def index():
             background-color: #2e7d32;
             border-color: #4caf50;
         }
+        /* Every chart, the price chart included, is a tile on one 12-column grid. Its place
+           (CSS order), width (--tile-span) and height (--chart-height, or
+           --price-chart-height for the price tile) come from the saved dashboard layout. */
         .chart-grid {
             display: grid;
-            grid-template-columns: 1fr;
+            grid-template-columns: repeat(12, minmax(0, 1fr));
             gap: 5px;
             width: 100%;
+            align-items: start;
         }
-        
-        /* Add new CSS for the responsive grid layout */
+
         .charts-grid {
+            display: contents;
+        }
+
+        .chart-grid > .price-chart-container,
+        .charts-grid > .chart-container {
+            grid-column: span var(--tile-span, 6);
+        }
+
+        body.mobile-layout .chart-grid > .price-chart-container,
+        body.mobile-layout .charts-grid > .chart-container {
+            grid-column: 1 / -1;
+        }
+
+        /* Free layout: the grid becomes a canvas (its height is set from the lowest chart) and
+           each chart sits at --free-x/--free-y with width --free-w, stacked by --free-z */
+        .chart-grid.layout-free {
+            display: block;
+            position: relative;
+        }
+        .chart-grid.layout-free > .price-chart-container:not(.fullscreen),
+        .chart-grid.layout-free .charts-grid > .chart-container:not(.fullscreen) {
+            position: absolute;
+            left: calc(var(--free-x, 0) * 100%);
+            top: var(--free-y, 0px);
+            width: calc(var(--free-w, 0.5) * 100%);
+            margin: 0;
+            z-index: var(--free-z, 0);
+            box-sizing: border-box;
+            box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35);
+        }
+
+        /* Dashboard layout editor */
+        /* Chart checkboxes grow so every row of the selector runs edge to edge. The slot holding
+           "Edit layout" takes nearly all of its row's spare space, so the last row's checkboxes
+           keep their natural width and the button lines up with the right edge above it. */
+        #chart-selector .chart-checkbox {
+            flex: 1 1 auto;
+        }
+        .layout-edit-slot {
+            flex: 1000 1 auto;
+            display: flex;
+            justify-content: flex-end;
+        }
+        .layout-edit-toggle {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 6px 10px;
+            min-height: 0;
+            border-radius: 6px;
+            border: 1px solid var(--border-color);
+            background: var(--panel-bg-alt);
+            color: var(--text-secondary);
+            font: inherit;
+            cursor: pointer;
+        }
+        #chart-selector .layout-edit-toggle:hover {
+            border-color: var(--accent-color);
+            color: var(--text-primary);
+        }
+        #chart-selector .layout-edit-toggle.active {
+            background: var(--accent-soft);
+            border-color: var(--accent-color);
+            color: var(--text-primary);
+        }
+        body.mobile-layout .layout-edit-slot {
+            display: none;
+        }
+
+        #layout-edit-layer {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 0;
+            height: 0;
+            z-index: 450;
+        }
+        /* Free mode: no stacking context of its own, so each frame (z-index = its chart's) sits
+           just above its own chart and under any chart that overlaps it */
+        #layout-edit-layer.is-free {
+            z-index: auto;
+        }
+        #layout-edit-layer[hidden],
+        #layout-edit-bar[hidden] {
+            display: none;
+        }
+
+        .layout-col-guides {
+            position: absolute;
             display: grid;
-            gap: 5px;
-            width: 100%;
+            grid-template-columns: repeat(12, minmax(0, 1fr));
+            pointer-events: none;
+            opacity: 0;
+            transition: opacity 0.15s ease;
+        }
+        .layout-col-guides span {
+            background: color-mix(in srgb, var(--accent-color) 7%, transparent);
+            border-left: 1px dashed color-mix(in srgb, var(--accent-color) 35%, transparent);
+            border-right: 1px dashed color-mix(in srgb, var(--accent-color) 35%, transparent);
+        }
+        body.layout-resizing .layout-col-guides {
+            opacity: 1;
+        }
+
+        .layout-frame {
+            position: absolute;
+            top: 0;
+            left: 0;
+            box-sizing: border-box;
+            border: 2px dashed color-mix(in srgb, var(--accent-color) 55%, transparent);
+            border-radius: 10px;
+            background: color-mix(in srgb, var(--app-bg) 35%, transparent);
+            cursor: grab;
+            touch-action: none;
+            user-select: none;
+            outline: none;
+            transition: background-color 0.15s ease, border-color 0.15s ease;
+        }
+        .layout-frame:hover,
+        .layout-frame:focus-visible {
+            border-style: solid;
+            border-color: var(--accent-color);
+            background: color-mix(in srgb, var(--app-bg) 20%, transparent);
+        }
+        .layout-frame:focus-visible {
+            box-shadow: 0 0 0 3px var(--accent-soft);
+        }
+        .layout-frame.is-dragging {
+            border-style: solid;
+            border-color: var(--accent-color);
+            background: color-mix(in srgb, var(--accent-color) 16%, transparent);
+        }
+        .layout-frame.is-resizing {
+            border-style: solid;
+            border-color: var(--accent-color);
+        }
+        body.layout-dragging,
+        body.layout-dragging .layout-frame {
+            cursor: grabbing;
+        }
+        .layout-drag-source {
+            opacity: 0.25;
+            filter: grayscale(1);
+            transition: opacity 0.15s ease;
+        }
+
+        .layout-frame-bar {
+            position: absolute;
+            top: 10px;
+            left: 50%;
+            transform: translateX(-50%);
+            max-width: calc(100% - 20px);
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 5px 6px 5px 10px;
+            border-radius: 999px;
+            background: var(--panel-bg-strong);
+            border: 1px solid var(--border-color);
+            box-shadow: var(--overlay-shadow);
+            color: var(--text-primary);
+            font-size: 12px;
+            white-space: nowrap;
+        }
+        .layout-frame-grip {
+            display: inline-flex;
+            color: var(--text-muted);
+        }
+        .layout-frame-title {
+            font-weight: 600;
+            overflow: hidden;
+            text-overflow: ellipsis;
             min-width: 0;
-            align-items: stretch;
         }
-        
-        .charts-grid.one-chart {
-            grid-template-columns: 1fr;
+        .layout-frame-size {
+            color: var(--text-muted);
+            font-variant-numeric: tabular-nums;
         }
-        
-        .charts-grid.two-charts {
-            grid-template-columns: repeat(2, minmax(0, 1fr));
+        .layout-frame.is-resizing .layout-frame-size {
+            color: var(--accent-color);
+            font-weight: 600;
         }
-        
-        .charts-grid.three-charts {
-            grid-template-columns: repeat(2, minmax(0, 1fr));
+        .layout-frame-presets {
+            display: inline-flex;
+            padding: 2px;
+            gap: 2px;
+            border-radius: 999px;
+            background: var(--panel-bg);
         }
-        
-        .charts-grid.four-charts {
-            grid-template-columns: repeat(2, minmax(0, 1fr));
+        .layout-frame-bar button {
+            border: none;
+            background: transparent;
+            color: var(--text-secondary);
+            font-size: 12px;
+            line-height: 1;
+            padding: 4px 8px;
+            min-height: 0;
+            border-radius: 999px;
+            cursor: pointer;
         }
-        
-        .charts-grid.many-charts {
-            grid-template-columns: repeat(2, minmax(0, 1fr));
+        .layout-frame-bar button:hover {
+            background: var(--panel-hover);
+            color: var(--text-primary);
+        }
+        .layout-frame-presets button.active {
+            background: var(--accent-color);
+            color: #fff;
+        }
+        .layout-frame-hide {
+            display: inline-flex;
+            align-items: center;
+        }
+        /* Narrow tiles keep the title and the controls, and drop the size readout */
+        .layout-frame.is-narrow .layout-frame-size {
+            display: none;
+        }
+
+        .layout-handle {
+            position: absolute;
+            z-index: 1;
+        }
+        /* Handles stay inside the 5px grid gap, where a neighbouring frame can't cover them */
+        .layout-handle-e {
+            top: 12px;
+            right: -2px;
+            bottom: 12px;
+            width: 12px;
+            cursor: ew-resize;
+        }
+        .layout-handle-s {
+            left: 12px;
+            right: 12px;
+            bottom: -2px;
+            height: 12px;
+            cursor: ns-resize;
+        }
+        .layout-handle-se {
+            right: -2px;
+            bottom: -2px;
+            width: 22px;
+            height: 22px;
+            cursor: nwse-resize;
+        }
+        .layout-handle-e::after,
+        .layout-handle-s::after {
+            content: '';
+            position: absolute;
+            border-radius: 3px;
+            background: var(--accent-color);
+            opacity: 0;
+            transition: opacity 0.15s ease;
+        }
+        .layout-handle-e::after {
+            top: 50%;
+            left: 3px;
+            width: 4px;
+            height: 44px;
+            transform: translateY(-50%);
+        }
+        .layout-handle-s::after {
+            left: 50%;
+            top: 3px;
+            width: 44px;
+            height: 4px;
+            transform: translateX(-50%);
+        }
+        .layout-frame:hover .layout-handle::after,
+        .layout-frame:focus-visible .layout-handle::after,
+        .layout-frame.is-resizing .layout-handle::after {
+            opacity: 1;
+        }
+        .layout-handle-se::after {
+            content: '';
+            position: absolute;
+            right: 6px;
+            bottom: 6px;
+            width: 10px;
+            height: 10px;
+            border-right: 3px solid var(--accent-color);
+            border-bottom: 3px solid var(--accent-color);
+            border-bottom-right-radius: 4px;
+        }
+
+        .layout-drag-ghost {
+            position: fixed;
+            top: 0;
+            left: 0;
+            z-index: 10050;
+            box-sizing: border-box;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+            padding: 12px;
+            border: 2px solid var(--accent-color);
+            border-radius: 10px;
+            background: var(--panel-bg-strong);
+            box-shadow: var(--overlay-shadow);
+            color: var(--text-primary);
+            font-size: 13px;
+            font-weight: 600;
+            pointer-events: none;
+            opacity: 0.94;
+            rotate: 1.5deg;
+        }
+
+        #layout-edit-bar {
+            position: fixed;
+            left: 50%;
+            bottom: 20px;
+            transform: translateX(-50%);
+            z-index: 10040;
+            display: flex;
+            align-items: center;
+            gap: 14px;
+            max-width: calc(100vw - 32px);
+            padding: 8px 8px 8px 16px;
+            border-radius: 999px;
+            background: var(--panel-bg-strong);
+            border: 1px solid var(--border-color);
+            box-shadow: var(--overlay-shadow);
+            color: var(--text-primary);
+            font-size: 13px;
+        }
+        #layout-edit-bar .layout-bar-title {
+            font-weight: 600;
+            white-space: nowrap;
+        }
+        #layout-edit-bar .layout-bar-hint {
+            color: var(--text-muted);
+            font-size: 12px;
+        }
+        #layout-edit-bar button {
+            padding: 6px 14px;
+            min-height: 0;
+            border-radius: 999px;
+            border: 1px solid var(--border-color);
+            background: var(--panel-bg-alt);
+            color: var(--text-primary);
+            font-size: 13px;
+            cursor: pointer;
+            white-space: nowrap;
+        }
+        #layout-edit-bar button:hover {
+            border-color: var(--accent-color);
+        }
+        #layout-edit-bar button.primary {
+            background: var(--accent-color);
+            border-color: var(--accent-color);
+            color: #fff;
+        }
+        .layout-mode-switch {
+            display: inline-flex;
+            flex: 0 0 auto;
+            padding: 2px;
+            gap: 2px;
+            border-radius: 999px;
+            background: var(--panel-bg);
+            border: 1px solid var(--border-color);
+        }
+        #layout-edit-bar .layout-mode-switch button {
+            padding: 4px 12px;
+            border: none;
+            background: transparent;
+            color: var(--text-secondary);
+        }
+        #layout-edit-bar .layout-mode-switch button:hover {
+            color: var(--text-primary);
+        }
+        #layout-edit-bar .layout-mode-switch button.active {
+            background: var(--accent-color);
+            color: #fff;
+        }
+
+        .layout-snap-guide {
+            position: absolute;
+            top: 0;
+            left: 0;
+            z-index: 10000;
+            background: var(--accent-color);
+            pointer-events: none;
+        }
+        .layout-snap-guide[data-axis="x"] {
+            width: 1px;
+        }
+        .layout-snap-guide[data-axis="y"] {
+            height: 1px;
+        }
+        .layout-snap-guide[hidden] {
+            display: none;
+        }
+        @media screen and (max-width: 1100px) {
+            #layout-edit-bar .layout-bar-hint {
+                display: none;
+            }
         }
         #error-notification {
             position: fixed;
@@ -6840,11 +7624,9 @@ def index():
                 width: 22px;
                 height: 22px;
             }
-            .charts-grid.two-charts,
-            .charts-grid.three-charts,
-            .charts-grid.four-charts,
-            .charts-grid.many-charts {
-                grid-template-columns: 1fr;
+            .chart-grid > .price-chart-container,
+            .charts-grid > .chart-container {
+                grid-column: 1 / -1;
             }
             .chart-container {
                 height: 350px;
@@ -7351,6 +8133,7 @@ def index():
         }
         body[data-theme="neon"] .control-group,
         body[data-theme="neon"] .chart-checkbox,
+        body[data-theme="neon"] .layout-edit-toggle,
         body[data-theme="neon"] .expiry-options,
         body[data-theme="neon"] .levels-options,
         body[data-theme="neon"] .chart-container,
@@ -7953,6 +8736,12 @@ def index():
                 <input type="checkbox" id="centroid" checked>
                 <label for="centroid">Call vs Put Centroid Map</label>
             </div>
+            <span class="layout-edit-slot">
+                <button type="button" id="layout-edit-toggle" class="layout-edit-toggle" aria-pressed="false" title="Move and resize the charts on the dashboard">
+                    <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><rect x="1.5" y="1.5" width="5.5" height="7" rx="1"/><rect x="9" y="1.5" width="5.5" height="4" rx="1"/><rect x="9" y="7.5" width="5.5" height="7" rx="1"/><rect x="1.5" y="10.5" width="5.5" height="4" rx="1"/></svg>
+                    Edit layout
+                </button>
+            </span>
         </div>
 
         <div id="chart-control-staging" aria-hidden="true">
@@ -7995,6 +8784,10 @@ def index():
                     <option value="2">&plusmn;2%</option>
                     <option value="3">&plusmn;3%</option>
                     <option value="5">&plusmn;5%</option>
+                </select>
+                <select id="forecast_split" hidden title="Several expiries selected: sum them into one surface, or draw each expiry's own surface side by side (each colored to its own scale)">
+                    <option value="aggregate" selected>Sum expiries</option>
+                    <option value="split">Each expiry</option>
                 </select>
             </div>
         </div>
@@ -8732,6 +9525,11 @@ def index():
             };
         }
 
+        // Every axis of a layout (the exposure surface has one pair per expiry panel)
+        function plotlyAxisKeys(layout) {
+            return Object.keys(layout || {}).filter(key => /^[xy]axis[0-9]*$/.test(key));
+        }
+
         function applyThemeToPlotlyLayout(layout) {
             const theme = getThemeColors();
             layout.plot_bgcolor = theme.chartBg;
@@ -8748,7 +9546,7 @@ def index():
                 layout.hoverlabel.bgcolor = theme.panelBgAlt;
                 layout.hoverlabel.bordercolor = theme.borderColor;
             }
-            ['xaxis', 'yaxis', 'xaxis2', 'yaxis2'].forEach(axisKey => {
+            plotlyAxisKeys(layout).forEach(axisKey => {
                 const axis = layout[axisKey];
                 if (!axis) return;
                 axis.gridcolor = theme.gridColor;
@@ -8778,7 +9576,7 @@ def index():
                 'title.font.color': theme.textSecondary,
             };
             if (!div || !div._fullLayout) return relayout;
-            ['xaxis', 'yaxis', 'xaxis2', 'yaxis2'].forEach(axisKey => {
+            plotlyAxisKeys(div._fullLayout).forEach(axisKey => {
                 if (!div._fullLayout[axisKey]) return;
                 relayout[`${axisKey}.gridcolor`] = theme.gridColor;
                 relayout[`${axisKey}.linecolor`] = theme.borderColor;
@@ -9301,19 +10099,47 @@ def index():
             scheduleForecastCandlesDraw();
         }
 
-        function buildForecastCandleTrace() {
+        // The candles share the surface's call/put colors, so each one sits on a dark halo (the
+        // same bars drawn wider underneath) to stay readable over same-colored cells. The halo is
+        // its own trace so the colored body keeps its full size.
+        const FORECAST_CANDLE_HALO = { color: '#0A0A0A', width: 3 };
+
+        // The surface's panels (one per expiry when split) as x-axis ids: ['x', 'x2', ...]
+        function forecastPanelAxes(layout) {
+            const axes = ['x'];
+            while (layout && layout['xaxis' + (axes.length + 1)]) axes.push('x' + (axes.length + 1));
+            return axes;
+        }
+
+        // A halo and a candle trace for each panel of the surface whose layout is given
+        function buildForecastCandleTraces(layout) {
             const state = forecastCandleState;
             if (!state || !state.bars.length) return null;
             const { up, down } = state.colors;
-            return {
-                type: 'candlestick', name: 'OHLC', meta: 'forecast-candles', hoverinfo: 'skip',
+            const bars = {
                 x: state.bars.map(b => b.x), open: state.bars.map(b => b.o), high: state.bars.map(b => b.h),
                 low: state.bars.map(b => b.l), close: state.bars.map(b => b.c),
-                // Same look as the price chart; no separate outline (it swallows 1-minute bodies)
-                increasing: { line: { color: up, width: 1 }, fillcolor: up },
-                decreasing: { line: { color: down, width: 1 }, fillcolor: down },
-                whiskerwidth: 0,
             };
+            const halo = { line: { color: FORECAST_CANDLE_HALO.color, width: FORECAST_CANDLE_HALO.width },
+                           fillcolor: FORECAST_CANDLE_HALO.color };
+            const traces = [];
+            forecastPanelAxes(layout).forEach((xaxis, i) => {
+                const axes = { xaxis, yaxis: 'y' + xaxis.slice(1) };
+                const tag = i ? '|' + xaxis : '';
+                traces.push({
+                    type: 'candlestick', name: 'OHLC halo', meta: 'forecast-candles-halo' + tag, hoverinfo: 'skip',
+                    showlegend: false, ...bars, ...axes, increasing: halo, decreasing: halo, whiskerwidth: 0,
+                });
+                traces.push({
+                    type: 'candlestick', name: 'OHLC', meta: 'forecast-candles' + tag, hoverinfo: 'skip',
+                    legendgroup: 'forecast-candles', showlegend: i === 0, ...bars, ...axes,
+                    // Same look as the price chart; no outline of its own (it swallows 1-minute bodies)
+                    increasing: { line: { color: up, width: 1 }, fillcolor: up },
+                    decreasing: { line: { color: down, width: 1 }, fillcolor: down },
+                    whiskerwidth: 0,
+                });
+            });
+            return traces;
         }
 
         function scheduleForecastCandlesDraw() {
@@ -9324,22 +10150,27 @@ def index():
             }, FORECAST_CANDLE_DRAW_MS);
         }
 
-        // Update only the candle trace; the surface itself is left alone
+        // Update only the candle traces; the surface itself is left alone
         function drawForecastCandles() {
             if (popoutWindows['forecast-chart']) pushDataToPopout('forecast-chart');
             const el = document.getElementById('forecast-chart');
             if (!el || !el._fullLayout || !Array.isArray(el.data) || !isPlotlyContainerVisible(el)) return;
-            const trace = buildForecastCandleTrace();
-            if (!trace) return;
-            const idx = el.data.findIndex(t => t.meta === 'forecast-candles');
+            const traces = buildForecastCandleTraces(el.layout);
+            if (!traces) return;
+            const indices = traces.map(trace => el.data.findIndex(t => t.meta === trace.meta));
             try {
-                if (idx < 0) {
-                    Plotly.addTraces(el, trace);
+                if (indices.some(idx => idx < 0)) {
+                    // Any missing: re-add them all so each halo stays under its candles
+                    const stale = el.data.map((t, idx) => String(t.meta || '').startsWith('forecast-candles') ? idx : -1)
+                        .filter(idx => idx >= 0);
+                    if (stale.length) Plotly.deleteTraces(el, stale);
+                    Plotly.addTraces(el, traces);
                 } else {
                     Plotly.restyle(el, {
-                        x: [trace.x], open: [trace.open], high: [trace.high], low: [trace.low], close: [trace.close],
-                        increasing: [trace.increasing], decreasing: [trace.decreasing],
-                    }, [idx]);
+                        x: traces.map(t => t.x), open: traces.map(t => t.open), high: traces.map(t => t.high),
+                        low: traces.map(t => t.low), close: traces.map(t => t.close),
+                        increasing: traces.map(t => t.increasing), decreasing: traces.map(t => t.decreasing),
+                    }, indices);
                 }
             } catch (e) {}
         }
@@ -10423,10 +11254,10 @@ ${popoutHelperSource([getThemeValue, escapeTooltipHtml, stripTooltipHtml, format
                 ? (lastPriceData ? JSON.stringify(lastPriceData) : null)
                 : lastData[dataKey];
             // The surface figure has no candles; send the live ones along with it
-            const candleTrace = dataKey === 'forecast' && chartPayload ? buildForecastCandleTrace() : null;
-            if (candleTrace) {
-                const figure = JSON.parse(chartPayload);
-                figure.data.push(candleTrace);
+            const figure = dataKey === 'forecast' && chartPayload ? JSON.parse(chartPayload) : null;
+            const candleTraces = figure ? buildForecastCandleTraces(figure.layout) : null;
+            if (candleTraces) {
+                figure.data.push(...candleTraces);
                 chartPayload = JSON.stringify(figure);
             }
 
@@ -10552,9 +11383,18 @@ ${popoutHelperSource([getThemeValue, escapeTooltipHtml, stripTooltipHtml, format
         document.getElementById('exposure_metric').addEventListener('change', updateData);
         document.getElementById('heatmap_type').addEventListener('change', updateData);
         document.getElementById('heatmap_coloring_mode').addEventListener('change', updateData);
-        ['forecast_type', 'forecast_range'].forEach(id => {
+        ['forecast_type', 'forecast_range', 'forecast_split'].forEach(id => {
             document.getElementById(id).addEventListener('change', updateData);
         });
+
+        // Summing vs. one panel per expiry only means something with several expiries selected
+        function syncForecastSplitControl() {
+            document.getElementById('forecast_split').hidden = getSelectedExpiryValues().length < 2;
+        }
+
+        function forecastSplitActive() {
+            return getSelectedExpiryValues().length > 1 && document.getElementById('forecast_split').value === 'split';
+        }
         document.getElementById('levels_count').addEventListener('input', refreshPriceLevelsOnly);
         document.getElementById('abs_gex_opacity').addEventListener('input', updateData);
 
@@ -10984,8 +11824,14 @@ ${popoutHelperSource([getThemeValue, escapeTooltipHtml, stripTooltipHtml, format
             const chartData = typeof rawChartData === 'string' ? JSON.parse(rawChartData) : rawChartData;
             if (key === 'forecast') {
                 // Candles aren't in the surface figure; carry the live ones into each new build
-                const candleTrace = buildForecastCandleTrace();
-                if (candleTrace) chartData.data.push(candleTrace);
+                const candleTraces = buildForecastCandleTraces(chartData.layout);
+                if (candleTraces) chartData.data.push(...candleTraces);
+                // One panel per expiry needs a full row, unless the layout gives the tile a width
+                const spanFull = forecastPanelAxes(chartData.layout).length > 1;
+                if (container.classList.contains('chart-span-full') !== spanFull) {
+                    container.classList.toggle('chart-span-full', spanFull);
+                    applyChartLayout();
+                }
             }
             const baseMargins = chartData.layout.margin || {l: 44, r: 28, t: 44, b: 28};
 
@@ -11455,6 +12301,7 @@ ${popoutHelperSource([getThemeValue, escapeTooltipHtml, stripTooltipHtml, format
                 show_forecast: true,
                 forecast_type: document.getElementById('forecast_type').value,
                 forecast_range: parseFloat(document.getElementById('forecast_range').value),
+                forecast_split: forecastSplitActive(),
                 timeframe: parseInt(document.getElementById('timeframe').value, 10),
             };
         }
@@ -14670,8 +15517,8 @@ ${popoutHelperSource([getThemeValue, escapeTooltipHtml, stripTooltipHtml, format
                 chartsGrid.querySelectorAll('.chart-container').forEach(forgetPlotlyContainer);
                 chartsGrid.innerHTML = '';
             } else {
-                chartsGrid.style.display = 'grid';
-                
+                chartsGrid.style.display = '';
+
                 // Only rebuild if chart selection changed
                 if (needsGridRebuild) {
                     mountHeatmapControls(null);
@@ -14679,21 +15526,7 @@ ${popoutHelperSource([getThemeValue, escapeTooltipHtml, stripTooltipHtml, format
                     chartsGrid.querySelectorAll('.chart-container').forEach(forgetPlotlyContainer);
                     chartsGrid.querySelectorAll('.js-plotly-plot').forEach(el => { try { Plotly.purge(el); } catch (e) {} });
                     chartsGrid.innerHTML = '';
-                    chartsGrid.className = 'charts-grid';
-                    
-                    // Add appropriate class based on number of enabled charts
-                    if (regularCharts.length === 1) {
-                        chartsGrid.classList.add('one-chart');
-                    } else if (regularCharts.length === 2) {
-                        chartsGrid.classList.add('two-charts');
-                    } else if (regularCharts.length === 3) {
-                        chartsGrid.classList.add('three-charts');
-                    } else if (regularCharts.length === 4) {
-                        chartsGrid.classList.add('four-charts');
-                    } else {
-                        chartsGrid.classList.add('many-charts');
-                    }
-                    
+
                     regularCharts.forEach(([key, selected]) => {
                         const newContainer = document.createElement('div');
                         newContainer.className = 'chart-container';
@@ -14747,6 +15580,8 @@ ${popoutHelperSource([getThemeValue, escapeTooltipHtml, stripTooltipHtml, format
                 }
             });
             
+            applyChartLayout();
+
             // Add fullscreen and popout buttons to all chart containers
             document.querySelectorAll('.chart-container').forEach(c => { addFullscreenButton(c); addPopoutButton(c); });
 
@@ -15201,7 +16036,8 @@ ${popoutHelperSource([getThemeValue, escapeTooltipHtml, stripTooltipHtml, format
         function updateExpiryDisplay() {
             const checkedBoxes = document.querySelectorAll('.expiry-option input[type="checkbox"]:checked');
             const expiryText = document.getElementById('expiry-text');
-            
+            syncForecastSplitControl();
+
             if (checkedBoxes.length === 0) {
                 expiryText.textContent = expiredSelectionNotice || 'Select expiry dates...';
             } else if (checkedBoxes.length === 1) {
@@ -15355,6 +16191,933 @@ ${popoutHelperSource([getThemeValue, escapeTooltipHtml, stripTooltipHtml, format
         
         document.getElementById('streamToggle').addEventListener('click', toggleStreaming);
 
+        // --- Dashboard layout ---
+        // Two modes. Grid: each chart is a tile on the 12-column #chart-grid, placed by CSS
+        // order and --tile-span. Free: #chart-grid becomes a canvas and each tile is absolutely
+        // positioned anywhere (x and width as fractions of the canvas width, so they follow the
+        // window; y in px), may overlap, and the one last clicked is on top. Either way the
+        // layout only sets CSS on the tiles, so chart DOM is never moved or rebuilt.
+        // "Edit layout" lays a frame over every tile (in a layer of its own, outside the chart
+        // DOM) for dragging and resizing. The layout lives in localStorage and saved settings.
+        const LAYOUT_STORAGE_KEY = 'ezoptions.chartLayout.v1';
+        const LAYOUT_SNAP_DISTANCE = 8;    // free mode: px within which an edge snaps to another
+        const LAYOUT_FREE_MIN_WIDTH = 240;
+        const LAYOUT_FREE_KEY_STEP = 10;
+        const LAYOUT_FREE_EDIT_ROOM = 260; // free mode: empty canvas below the charts while editing
+        const LAYOUT_COLUMNS = 12;
+        const LAYOUT_MIN_SPAN = 3;
+        const LAYOUT_HEIGHT_STEP = 10;
+        const LAYOUT_KEY_HEIGHT_STEP = 20;
+        const LAYOUT_HEIGHT_SNAP = 14;   // px within which a height snaps to a row neighbour's
+        const LAYOUT_DEFAULT_HEIGHT = { price: 680, other: 500 };
+        const LAYOUT_MIN_HEIGHT = { price: 280, other: 220 };
+        const LAYOUT_MAX_HEIGHT = 1600;
+        const LAYOUT_WIDTH_PRESETS = [[4, '⅓'], [6, '½'], [8, '⅔'], [12, 'Full']];
+        const LAYOUT_SPAN_LABELS = { 3: '¼', 4: '⅓', 6: '½', 8: '⅔', 9: '¾', 12: 'Full' };
+        const LAYOUT_GRIP_SVG = '<svg viewBox="0 0 10 16" width="8" height="13" fill="currentColor" aria-hidden="true"><circle cx="2.5" cy="3" r="1.5"/><circle cx="7.5" cy="3" r="1.5"/><circle cx="2.5" cy="8" r="1.5"/><circle cx="7.5" cy="8" r="1.5"/><circle cx="2.5" cy="13" r="1.5"/><circle cx="7.5" cy="13" r="1.5"/></svg>';
+        const LAYOUT_HIDE_SVG = '<svg viewBox="0 0 12 12" width="10" height="10" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M2 2l8 8M10 2l-8 8"/></svg>';
+
+        let chartLayout = loadChartLayout();
+        const layoutEditor = { active: false, layer: null, guides: null, snapGuides: null, bar: null, frames: new Map(), raf: 0, drag: null, resize: null, flipUntil: 0 };
+
+        function normalizeChartLayout(raw) {
+            const layout = { mode: 'grid', order: [], tiles: {}, free: {} };
+            if (!raw || typeof raw !== 'object') return layout;
+            if (raw.mode === 'free') layout.mode = 'free';
+            if (Array.isArray(raw.order)) layout.order = raw.order.filter(key => typeof key === 'string');
+            if (raw.free && typeof raw.free === 'object') {
+                Object.entries(raw.free).forEach(([key, saved]) => {
+                    if (!saved || typeof saved !== 'object') return;
+                    const x = Number(saved.x), y = Number(saved.y), w = Number(saved.w);
+                    if (!(x >= 0 && x < 1 && y >= 0 && w > 0 && w <= 1)) return;
+                    const entry = { x, y: Math.round(y), w: Math.min(w, 1 - x), z: parseInt(saved.z, 10) || 0 };
+                    const height = parseInt(saved.height, 10);
+                    if (height > 0) entry.height = Math.min(LAYOUT_MAX_HEIGHT, height);
+                    layout.free[key] = entry;
+                });
+            }
+            if (raw.tiles && typeof raw.tiles === 'object') {
+                Object.entries(raw.tiles).forEach(([key, saved]) => {
+                    if (!saved || typeof saved !== 'object') return;
+                    const tile = {};
+                    const span = parseInt(saved.span, 10);
+                    const height = parseInt(saved.height, 10);
+                    if (span >= LAYOUT_MIN_SPAN && span <= LAYOUT_COLUMNS) tile.span = span;
+                    if (height > 0) tile.height = Math.min(LAYOUT_MAX_HEIGHT, height);
+                    if (Object.keys(tile).length) layout.tiles[key] = tile;
+                });
+            }
+            return layout;
+        }
+
+        function loadChartLayout() {
+            try {
+                return normalizeChartLayout(JSON.parse(localStorage.getItem(LAYOUT_STORAGE_KEY)));
+            } catch (e) {
+                return normalizeChartLayout(null);
+            }
+        }
+
+        function hasStoredChartLayout() {
+            try { return localStorage.getItem(LAYOUT_STORAGE_KEY) !== null; } catch (e) { return false; }
+        }
+
+        function storeChartLayout() {
+            try { localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify(chartLayout)); } catch (e) {}
+        }
+
+        function setChartLayout(raw) {
+            chartLayout = normalizeChartLayout(raw);
+            storeChartLayout();
+            applyChartLayout();
+        }
+
+        function chartTitle(key) {
+            const label = document.querySelector('#chart-selector label[for="' + key + '"]');
+            return label ? label.textContent.trim() : key;
+        }
+
+        // Saved order first, then any chart it doesn't name in chart-selector order
+        function fullChartOrder() {
+            const order = chartLayout.order.slice();
+            document.querySelectorAll('#chart-selector .chart-checkbox input').forEach(cb => {
+                if (!order.includes(cb.id)) order.push(cb.id);
+            });
+            return order;
+        }
+
+        // Visible tiles, in on-screen order
+        function getLayoutTiles() {
+            const tiles = [];
+            const price = document.querySelector('#chart-grid > .price-chart-container');
+            if (price && price.style.display !== 'none' && document.getElementById('price').checked) {
+                tiles.push({ key: 'price', el: price });
+            }
+            document.querySelectorAll('#chart-grid .charts-grid > .chart-container').forEach(el => {
+                tiles.push({ key: el.id.replace(/-chart$/, ''), el });
+            });
+            const order = fullChartOrder();
+            return tiles.sort((a, b) => order.indexOf(a.key) - order.indexOf(b.key));
+        }
+
+        function tileSpan(tile, tiles) {
+            const saved = chartLayout.tiles[tile.key];
+            if (saved && saved.span) return saved.span;
+            if (tile.key === 'price' || tile.el.classList.contains('chart-span-full')) return LAYOUT_COLUMNS;
+            // A lone chart beside the price chart gets the whole row
+            return tiles.filter(t => t.key !== 'price').length === 1 ? LAYOUT_COLUMNS : LAYOUT_COLUMNS / 2;
+        }
+
+        // The height the layout controls: the plot pane for the price tile (its toolbar and
+        // indicator panes sit on top of it), the whole tile otherwise
+        function tileHeight(tile) {
+            const el = tile.key === 'price' ? document.getElementById('price-chart') : tile.el;
+            return el ? Math.round(el.getBoundingClientRect().height) : 0;
+        }
+
+        function tileHeightLimits(key) {
+            const kind = key === 'price' ? 'price' : 'other';
+            return { min: LAYOUT_MIN_HEIGHT[kind], max: LAYOUT_MAX_HEIGHT, fallback: LAYOUT_DEFAULT_HEIGHT[kind] };
+        }
+
+        // Phones always get the single-column grid
+        function freeLayoutActive() {
+            return chartLayout.mode === 'free' && !document.body.classList.contains('mobile-layout');
+        }
+
+        function topFreeZ() {
+            return Object.values(chartLayout.free).reduce((top, entry) => Math.max(top, entry.z || 0), 0);
+        }
+
+        // Charts shown for the first time in free mode go in rows below the others
+        function placeNewFreeTiles(tiles) {
+            const gap = parseFloat(getComputedStyle(document.getElementById('chart-grid')).columnGap) || 0;
+            let bottom = 0;
+            tiles.forEach(tile => {
+                const entry = chartLayout.free[tile.key];
+                if (entry) bottom = Math.max(bottom, entry.y + tile.el.offsetHeight);
+            });
+            let rowY = bottom ? bottom + gap : 0;
+            let rowX = 0;
+            let rowHeight = 0;
+            let z = topFreeZ();
+            let placed = false;
+            tiles.forEach(tile => {
+                if (chartLayout.free[tile.key]) return;
+                const w = tile.key === 'price' ? 1 : 0.5;
+                if (rowX + w > 1.001) {
+                    rowY += rowHeight + gap;
+                    rowX = 0;
+                    rowHeight = 0;
+                }
+                chartLayout.free[tile.key] = { x: rowX, y: rowY, w, z: ++z };
+                rowX += w;
+                rowHeight = Math.max(rowHeight, tile.el.offsetHeight);
+                placed = true;
+            });
+            if (placed) storeChartLayout();
+        }
+
+        // Free positions copied from where the grid draws each chart, so switching is seamless
+        function captureGridIntoFree(onlyMissing) {
+            (layoutEditor.animations || new Map()).forEach(animation => animation.cancel());
+            const mode = chartLayout.mode;
+            chartLayout.mode = 'grid';
+            applyChartLayout();
+            const canvas = document.getElementById('chart-grid').getBoundingClientRect();
+            let z = topFreeZ();
+            getLayoutTiles().forEach(tile => {
+                if (onlyMissing && chartLayout.free[tile.key]) return;
+                const r = tile.el.getBoundingClientRect();
+                const x = Math.max(0, (r.left - canvas.left) / canvas.width);
+                chartLayout.free[tile.key] = {
+                    x,
+                    y: Math.max(0, Math.round(r.top - canvas.top)),
+                    w: Math.min(1 - x, r.width / canvas.width),
+                    height: tileHeight(tile),
+                    z: ++z,
+                };
+            });
+            chartLayout.mode = mode;
+        }
+
+        // In free mode the canvas has no height of its own; it reaches the lowest chart
+        function updateFreeCanvasHeight(tiles) {
+            const grid = document.getElementById('chart-grid');
+            if (!freeLayoutActive()) {
+                grid.style.height = '';
+                return;
+            }
+            let bottom = 0;
+            (tiles || getLayoutTiles()).forEach(tile => {
+                const entry = chartLayout.free[tile.key];
+                if (entry) bottom = Math.max(bottom, entry.y + tile.el.offsetHeight);
+            });
+            grid.style.height = (bottom + (layoutEditor.active ? LAYOUT_FREE_EDIT_ROOM : 0)) + 'px';
+        }
+
+        // Tiles change height on their own too (e.g. price indicator panes)
+        const freeTileResizeObserver = typeof ResizeObserver === 'undefined' ? null
+            : new ResizeObserver(() => updateFreeCanvasHeight());
+
+        function applyChartLayout() {
+            const grid = document.getElementById('chart-grid');
+            const tiles = getLayoutTiles();
+            const order = fullChartOrder();
+            const free = freeLayoutActive();
+            grid.classList.toggle('layout-free', free);
+            if (free) placeNewFreeTiles(tiles);
+            tiles.forEach(tile => {
+                const el = tile.el;
+                el.style.order = String(order.indexOf(tile.key));
+                el.style.setProperty('--tile-span', String(tileSpan(tile, tiles)));
+                const entry = free ? chartLayout.free[tile.key] : null;
+                if (entry) {
+                    el.style.setProperty('--free-x', String(entry.x));
+                    el.style.setProperty('--free-y', entry.y + 'px');
+                    el.style.setProperty('--free-w', String(entry.w));
+                    el.style.setProperty('--free-z', String(entry.z || 0));
+                }
+                const height = entry ? entry.height : (chartLayout.tiles[tile.key] || {}).height;
+                const heightVar = tile.key === 'price' ? '--price-chart-height' : '--chart-height';
+                if (height) el.style.setProperty(heightVar, height + 'px');
+                else el.style.removeProperty(heightVar);
+                if (freeTileResizeObserver) freeTileResizeObserver.observe(el);
+            });
+            updateFreeCanvasHeight(tiles);
+            if (layoutEditor.active) syncLayoutFrames();
+        }
+
+        function setTileLayout(key, patch) {
+            if (freeLayoutActive()) {
+                const entry = Object.assign({}, chartLayout.free[key]);
+                if (patch.span) {
+                    entry.w = patch.span / LAYOUT_COLUMNS;
+                    entry.x = Math.min(entry.x, 1 - entry.w);
+                }
+                if (patch.height) entry.height = patch.height;
+                chartLayout.free[key] = entry;
+            } else {
+                chartLayout.tiles[key] = Object.assign({}, chartLayout.tiles[key], patch);
+            }
+            applyChartLayout();
+            storeChartLayout();
+        }
+
+        function bringTileToFront(key) {
+            const keys = Object.keys(chartLayout.free).filter(k => k !== key);
+            if (!chartLayout.free[key]) return;
+            if (keys.every(k => (chartLayout.free[k].z || 0) < (chartLayout.free[key].z || 0))) return;
+            // Renumber 1..n so z-indexes stay small
+            keys.sort((a, b) => (chartLayout.free[a].z || 0) - (chartLayout.free[b].z || 0));
+            keys.concat(key).forEach((k, i) => { chartLayout.free[k].z = i + 1; });
+            applyChartLayout();
+            storeChartLayout();
+        }
+
+        function setLayoutMode(mode) {
+            if (mode === chartLayout.mode) return;
+            const before = snapshotTileRects();
+            if (mode === 'free') captureGridIntoFree(true);
+            chartLayout.mode = mode;
+            applyChartLayout();
+            playTileFlip(before);
+            storeChartLayout();
+            syncLayoutEditBar();
+        }
+
+        // Reorders the visible charts; hidden charts keep their slots in the saved order
+        function setVisibleChartOrder(visibleKeys) {
+            const visible = new Set(visibleKeys);
+            let next = 0;
+            chartLayout.order = fullChartOrder().map(key => visible.has(key) ? visibleKeys[next++] : key);
+            const before = snapshotTileRects();
+            applyChartLayout();
+            playTileFlip(before);
+            storeChartLayout();
+        }
+
+        function snapshotTileRects() {
+            const rects = new Map();
+            getLayoutTiles().forEach(tile => rects.set(tile.el, tile.el.getBoundingClientRect()));
+            return rects;
+        }
+
+        // FLIP: tiles glide from where they were drawn to their new grid slot
+        function playTileFlip(before) {
+            const animations = layoutEditor.animations || (layoutEditor.animations = new Map());
+            animations.forEach(animation => animation.cancel());
+            animations.clear();
+            if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+            before.forEach((from, el) => {
+                if (!el.isConnected) return;
+                const to = el.getBoundingClientRect();
+                const dx = from.left - to.left;
+                const dy = from.top - to.top;
+                if (Math.abs(dx) < 1 && Math.abs(dy) < 1) return;
+                animations.set(el, el.animate(
+                    [{ transform: 'translate(' + dx + 'px, ' + dy + 'px)' }, { transform: 'none' }],
+                    { duration: 220, easing: 'cubic-bezier(0.2, 0.8, 0.2, 1)' }
+                ));
+            });
+            layoutEditor.flipUntil = performance.now() + 230;
+        }
+
+        // Grid: back to the default arrangement. Free: line the charts up the way the grid has them.
+        function resetChartLayout() {
+            const before = snapshotTileRects();
+            if (freeLayoutActive()) {
+                chartLayout.free = {};
+                captureGridIntoFree(false);
+            } else {
+                chartLayout = Object.assign(normalizeChartLayout(null), { mode: chartLayout.mode, free: chartLayout.free });
+            }
+            applyChartLayout();
+            playTileFlip(before);
+            storeChartLayout();
+        }
+
+        function ensureLayoutEditorDom() {
+            if (layoutEditor.layer) return;
+            const layer = document.createElement('div');
+            layer.id = 'layout-edit-layer';
+            layer.hidden = true;
+            const guides = document.createElement('div');
+            guides.className = 'layout-col-guides';
+            guides.setAttribute('aria-hidden', 'true');
+            guides.innerHTML = '<span></span>'.repeat(LAYOUT_COLUMNS);
+            layer.appendChild(guides);
+            const snapGuides = ['x', 'y'].map(axis => {
+                const line = document.createElement('div');
+                line.className = 'layout-snap-guide';
+                line.dataset.axis = axis;
+                line.hidden = true;
+                layer.appendChild(line);
+                return line;
+            });
+            document.body.appendChild(layer);
+
+            const bar = document.createElement('div');
+            bar.id = 'layout-edit-bar';
+            bar.hidden = true;
+            bar.setAttribute('role', 'toolbar');
+            bar.setAttribute('aria-label', 'Layout editing');
+            bar.innerHTML =
+                '<span class="layout-bar-title">Editing layout</span>' +
+                '<span class="layout-mode-switch" role="radiogroup" aria-label="Layout mode">' +
+                    '<button type="button" role="radio" data-mode="grid" title="Charts sit in rows on a 12-column grid">Grid</button>' +
+                    '<button type="button" role="radio" data-mode="free" title="Place charts anywhere, overlapping if you like">Free</button>' +
+                '</span>' +
+                '<span class="layout-bar-hint"></span>' +
+                '<button type="button" data-action="reset">Reset</button>' +
+                '<button type="button" data-action="done" class="primary">Done</button>';
+            bar.querySelectorAll('[data-mode]').forEach(btn => {
+                btn.addEventListener('click', () => setLayoutMode(btn.dataset.mode));
+            });
+            bar.querySelector('[data-action="reset"]').addEventListener('click', resetChartLayout);
+            bar.querySelector('[data-action="done"]').addEventListener('click', () => setLayoutEditing(false));
+            document.body.appendChild(bar);
+
+            layoutEditor.layer = layer;
+            layoutEditor.guides = guides;
+            layoutEditor.snapGuides = snapGuides;
+            layoutEditor.bar = bar;
+            syncLayoutEditBar();
+        }
+
+        function syncLayoutEditBar() {
+            const bar = layoutEditor.bar;
+            if (!bar) return;
+            const free = chartLayout.mode === 'free';
+            bar.querySelectorAll('[data-mode]').forEach(btn => {
+                const on = btn.dataset.mode === chartLayout.mode;
+                btn.classList.toggle('active', on);
+                btn.setAttribute('aria-checked', on ? 'true' : 'false');
+            });
+            bar.querySelector('.layout-bar-hint').textContent = free
+                ? 'Drag charts anywhere and resize them from their edges. Edges snap to neighbours (hold Alt to place freely); the chart you click comes to the front.'
+                : 'Drag a chart to move it, drag its edges to resize. On a focused chart: arrows move, Shift+arrows resize.';
+            bar.querySelector('[data-action="reset"]').title = free
+                ? 'Line the charts up the way the grid has them'
+                : 'Back to the default arrangement';
+        }
+
+        // Lines along the edge a dragged or resized chart has snapped to (canvas coordinates)
+        function showSnapGuides(snap) {
+            const [vertical, horizontal] = layoutEditor.snapGuides || [];
+            if (!vertical) return;
+            const showX = !!snap && snap.x !== null;
+            const showY = !!snap && snap.y !== null;
+            vertical.hidden = !showX;
+            horizontal.hidden = !showY;
+            if (!showX && !showY) return;
+            const origin = layoutEditor.layer.getBoundingClientRect();
+            const canvas = document.getElementById('chart-grid').getBoundingClientRect();
+            const left = canvas.left - origin.left;
+            const top = canvas.top - origin.top;
+            if (showX) {
+                vertical.style.transform = 'translate(' + (left + snap.x) + 'px, ' + top + 'px)';
+                vertical.style.height = canvas.height + 'px';
+            }
+            if (showY) {
+                horizontal.style.transform = 'translate(' + left + 'px, ' + (top + snap.y) + 'px)';
+                horizontal.style.width = canvas.width + 'px';
+            }
+        }
+
+        // Free mode: the nearest pull, within LAYOUT_SNAP_DISTANCE, of the given box edges to the
+        // canvas edges and to other charts: lined up with the same edge, or one grid gap off the
+        // opposite edge (sitting beside it)
+        function snapFreeBox(key, box, xEdges, yEdges) {
+            const grid = document.getElementById('chart-grid');
+            const canvas = grid.getBoundingClientRect();
+            const gap = parseFloat(getComputedStyle(grid).columnGap) || 0;
+            const targets = { left: [0], right: [canvas.width], top: [0], bottom: [] };
+            getLayoutTiles().forEach(tile => {
+                if (tile.key === key) return;
+                const r = tile.el.getBoundingClientRect();
+                const left = r.left - canvas.left, right = r.right - canvas.left;
+                const top = r.top - canvas.top, bottom = r.bottom - canvas.top;
+                targets.left.push(left, right + gap);
+                targets.right.push(right, left - gap);
+                targets.top.push(top, bottom + gap);
+                targets.bottom.push(bottom, top - gap);
+            });
+            const nearest = edges => {
+                let best = null;
+                edges.forEach(edge => targets[edge].forEach(target => {
+                    const d = target - box[edge];
+                    if (Math.abs(d) <= LAYOUT_SNAP_DISTANCE && (!best || Math.abs(d) < Math.abs(best.d))) best = { d, line: target };
+                }));
+                return best;
+            };
+            const sx = nearest(xEdges);
+            const sy = nearest(yEdges);
+            return { dx: sx ? sx.d : 0, dy: sy ? sy.d : 0, x: sx ? sx.line : null, y: sy ? sy.line : null };
+        }
+
+        function setLayoutEditing(active) {
+            if (active === layoutEditor.active) return;
+            if (active && document.body.classList.contains('mobile-layout')) return;
+            ensureLayoutEditorDom();
+            layoutEditor.active = active;
+            document.body.classList.toggle('layout-editing', active);
+            const toggle = document.getElementById('layout-edit-toggle');
+            toggle.classList.toggle('active', active);
+            toggle.setAttribute('aria-pressed', active ? 'true' : 'false');
+            layoutEditor.layer.hidden = !active;
+            layoutEditor.bar.hidden = !active;
+            if (active) {
+                if (queryFullscreenCharts().length) {
+                    exitAllFullscreenCharts();
+                    resizeChartsAfterFullscreen();
+                }
+                syncLayoutEditBar();
+                applyChartLayout();
+                layoutEditor.raf = requestAnimationFrame(layoutEditorTick);
+            } else {
+                cancelAnimationFrame(layoutEditor.raf);
+                endLayoutDrag();
+                endLayoutResize();
+                layoutEditor.frames.forEach(frame => frame.remove());
+                layoutEditor.frames.clear();
+                applyChartLayout();
+            }
+        }
+
+        function layoutEditorTick() {
+            if (!layoutEditor.active) return;
+            if (layoutEditor.drag && layoutEditor.drag.started) autoScrollLayoutDrag();
+            syncLayoutFrames();
+            layoutEditor.raf = requestAnimationFrame(layoutEditorTick);
+        }
+
+        function setStyleIfChanged(el, prop, value) {
+            if (el.style[prop] !== value) el.style[prop] = value;
+        }
+
+        // Keeps one frame over each visible tile (runs every animation frame while editing)
+        function syncLayoutFrames() {
+            const { layer, frames } = layoutEditor;
+            if (!layer) return;
+            const origin = layer.getBoundingClientRect();
+            const tiles = getLayoutTiles();
+            const free = freeLayoutActive();
+            layer.classList.toggle('is-free', free);
+            const seen = new Set();
+            tiles.forEach(tile => {
+                seen.add(tile.key);
+                let frame = frames.get(tile.key);
+                if (!frame) {
+                    frame = createLayoutFrame(tile.key);
+                    frames.set(tile.key, frame);
+                    layer.appendChild(frame);
+                }
+                frame.__tile = tile;
+                const rect = tile.el.getBoundingClientRect();
+                setStyleIfChanged(frame, 'transform', 'translate(' + (rect.left - origin.left) + 'px, ' + (rect.top - origin.top) + 'px)');
+                setStyleIfChanged(frame, 'width', rect.width + 'px');
+                setStyleIfChanged(frame, 'height', rect.height + 'px');
+                frame.classList.toggle('is-narrow', rect.width < 520);
+
+                const entry = free ? chartLayout.free[tile.key] : null;
+                setStyleIfChanged(frame, 'zIndex', entry ? String(entry.z || 0) : '');
+                const span = tileSpan(tile, tiles);
+                const widthText = entry ? Math.round(entry.w * 100) + '%' : (LAYOUT_SPAN_LABELS[span] || span + '/12');
+                const sizeText = widthText + ' · ' + tileHeight(tile) + 'px';
+                const sizeEl = frame.querySelector('.layout-frame-size');
+                if (sizeEl.textContent !== sizeText) sizeEl.textContent = sizeText;
+                frame.querySelectorAll('[data-span]').forEach(btn => {
+                    const preset = Number(btn.dataset.span);
+                    btn.classList.toggle('active', entry ? Math.abs(entry.w - preset / LAYOUT_COLUMNS) < 0.002 : preset === span);
+                });
+            });
+            frames.forEach((frame, key) => {
+                if (!seen.has(key)) {
+                    frame.remove();
+                    frames.delete(key);
+                }
+            });
+
+            const grid = document.getElementById('chart-grid');
+            const gridRect = grid.getBoundingClientRect();
+            const guides = layoutEditor.guides;
+            setStyleIfChanged(guides, 'display', free ? 'none' : '');
+            setStyleIfChanged(guides, 'transform', 'translate(' + (gridRect.left - origin.left) + 'px, ' + (gridRect.top - origin.top) + 'px)');
+            setStyleIfChanged(guides, 'width', gridRect.width + 'px');
+            setStyleIfChanged(guides, 'height', gridRect.height + 'px');
+            setStyleIfChanged(guides, 'columnGap', getComputedStyle(grid).columnGap);
+        }
+
+        function createLayoutFrame(key) {
+            const frame = document.createElement('div');
+            frame.className = 'layout-frame';
+            frame.dataset.key = key;
+            frame.tabIndex = 0;
+            frame.setAttribute('role', 'group');
+            frame.setAttribute('aria-label', chartTitle(key) + '. Drag or use arrow keys to move; drag the edges or use Shift and arrow keys to resize.');
+            frame.innerHTML =
+                '<div class="layout-frame-bar">' +
+                    '<span class="layout-frame-grip">' + LAYOUT_GRIP_SVG + '</span>' +
+                    '<span class="layout-frame-title"></span>' +
+                    '<span class="layout-frame-size"></span>' +
+                    '<span class="layout-frame-presets">' +
+                        LAYOUT_WIDTH_PRESETS.map(([span, label]) =>
+                            '<button type="button" data-span="' + span + '" title="' + (span === LAYOUT_COLUMNS ? 'Full width' : label + ' width') + '">' + label + '</button>'
+                        ).join('') +
+                    '</span>' +
+                    '<button type="button" class="layout-frame-hide" title="Hide this chart">' + LAYOUT_HIDE_SVG + '</button>' +
+                '</div>' +
+                '<div class="layout-handle layout-handle-e" data-axis="x" title="Drag to change the width"></div>' +
+                '<div class="layout-handle layout-handle-s" data-axis="y" title="Drag to change the height"></div>' +
+                '<div class="layout-handle layout-handle-se" data-axis="xy" title="Drag to resize"></div>';
+            frame.querySelector('.layout-frame-title').textContent = chartTitle(key);
+            frame.querySelectorAll('[data-span]').forEach(btn => {
+                btn.addEventListener('click', () => setTileLayout(key, { span: Number(btn.dataset.span) }));
+            });
+            frame.querySelector('.layout-frame-hide').addEventListener('click', () => {
+                const checkbox = document.getElementById(key);
+                if (checkbox && checkbox.checked) {
+                    checkbox.checked = false;
+                    checkbox.dispatchEvent(new Event('change'));
+                }
+            });
+            frame.addEventListener('pointerdown', onLayoutFramePointerDown);
+            frame.addEventListener('keydown', onLayoutFrameKeyDown);
+            return frame;
+        }
+
+        function onLayoutFramePointerDown(e) {
+            if (e.button !== 0 || e.target.closest('button')) return;
+            const frame = e.currentTarget;
+            const tile = frame.__tile;
+            if (!tile || layoutEditor.drag || layoutEditor.resize) return;
+            e.preventDefault();
+            frame.focus({ preventScroll: true });
+            if (freeLayoutActive()) bringTileToFront(tile.key);
+            const handle = e.target.closest('.layout-handle');
+            if (handle) beginLayoutResize(frame, tile, handle.dataset.axis, e);
+            else beginLayoutDrag(frame, tile, e);
+            window.addEventListener('pointermove', onLayoutPointerMove);
+            window.addEventListener('pointerup', onLayoutPointerUp);
+            window.addEventListener('pointercancel', onLayoutPointerUp);
+        }
+
+        function onLayoutPointerMove(e) {
+            if (layoutEditor.drag) moveLayoutDrag(e);
+            else if (layoutEditor.resize) moveLayoutResize(e);
+        }
+
+        function onLayoutPointerUp() {
+            endLayoutDrag();
+            endLayoutResize();
+        }
+
+        function removeLayoutPointerListeners() {
+            window.removeEventListener('pointermove', onLayoutPointerMove);
+            window.removeEventListener('pointerup', onLayoutPointerUp);
+            window.removeEventListener('pointercancel', onLayoutPointerUp);
+        }
+
+        // --- Moving. Grid: the tile's own slot follows the pointer through the grid while a
+        // small ghost card rides under the cursor. Free: the chart itself follows the pointer. ---
+        function beginLayoutDrag(frame, tile, e) {
+            // The ghost keeps the grab point under the cursor, measured on the frame that was grabbed
+            const grabbed = frame.getBoundingClientRect();
+            const free = freeLayoutActive();
+            layoutEditor.drag = {
+                key: tile.key, el: tile.el, frame, grabbed,
+                startX: e.clientX, startY: e.clientY, x: e.clientX, y: e.clientY,
+                started: false, ghost: null, lockKey: null,
+                free, origin: free ? Object.assign({}, chartLayout.free[tile.key]) : null,
+                startScroll: window.scrollY, alt: e.altKey,
+            };
+        }
+
+        function updateFreeDrag() {
+            const drag = layoutEditor.drag;
+            const entry = chartLayout.free[drag.key];
+            if (!entry) return;
+            const width = document.getElementById('chart-grid').getBoundingClientRect().width;
+            const w = drag.origin.w * width;
+            const h = drag.el.offsetHeight;
+            const clampLeft = value => Math.max(0, Math.min(width - w, value));
+            let left = clampLeft(drag.origin.x * width + drag.x - drag.startX);
+            let top = Math.max(0, drag.origin.y + drag.y - drag.startY + window.scrollY - drag.startScroll);
+            const snap = drag.alt ? null : snapFreeBox(drag.key, { left, right: left + w, top, bottom: top + h }, ['left', 'right'], ['top', 'bottom']);
+            if (snap) {
+                left = clampLeft(left + snap.dx);
+                top = Math.max(0, top + snap.dy);
+            }
+            showSnapGuides(snap);
+            entry.x = left / width;
+            entry.y = Math.round(top);
+            applyChartLayout();
+        }
+
+        function startLayoutDragVisuals(drag) {
+            const rect = drag.grabbed;
+            const scale = Math.min(1, 280 / rect.width, 160 / rect.height);
+            const ghost = document.createElement('div');
+            ghost.className = 'layout-drag-ghost';
+            ghost.style.width = Math.round(rect.width * scale) + 'px';
+            ghost.style.height = Math.round(rect.height * scale) + 'px';
+            ghost.innerHTML = '<span class="layout-frame-grip">' + LAYOUT_GRIP_SVG + '</span><span></span>';
+            ghost.lastChild.textContent = chartTitle(drag.key);
+            document.body.appendChild(ghost);
+            drag.ghost = ghost;
+            drag.offsetX = Math.max(0, Math.min(rect.width, drag.startX - rect.left)) * scale;
+            drag.offsetY = Math.max(0, Math.min(rect.height, drag.startY - rect.top)) * scale;
+            drag.started = true;
+            drag.el.classList.add('layout-drag-source');
+            drag.frame.classList.add('is-dragging');
+            document.body.classList.add('layout-dragging');
+        }
+
+        function moveLayoutDrag(e) {
+            const drag = layoutEditor.drag;
+            drag.x = e.clientX;
+            drag.y = e.clientY;
+            drag.alt = e.altKey;
+            if (!drag.started) {
+                if (Math.hypot(drag.x - drag.startX, drag.y - drag.startY) < 5) return;
+                if (drag.free) {
+                    drag.started = true;
+                    drag.frame.classList.add('is-dragging');
+                    document.body.classList.add('layout-dragging');
+                } else {
+                    startLayoutDragVisuals(drag);
+                }
+            }
+            if (drag.free) {
+                updateFreeDrag();
+                return;
+            }
+            drag.ghost.style.transform = 'translate(' + (drag.x - drag.offsetX) + 'px, ' + (drag.y - drag.offsetY) + 'px)';
+            layoutDragHitTest();
+        }
+
+        // Moves the dragged tile into the slot of the tile under the pointer. That tile is then
+        // ignored until the pointer leaves it, so tiles of different sizes don't trade places
+        // back and forth.
+        function layoutDragHitTest() {
+            const drag = layoutEditor.drag;
+            if (!drag || !drag.started || performance.now() < layoutEditor.flipUntil) return;
+            const tiles = getLayoutTiles();
+            const keys = tiles.map(tile => tile.key);
+            const from = keys.indexOf(drag.key);
+            if (from < 0) return;
+            const target = tiles.find(tile => {
+                if (tile.key === drag.key) return false;
+                const r = tile.el.getBoundingClientRect();
+                return drag.x >= r.left && drag.x <= r.right && drag.y >= r.top && drag.y <= r.bottom;
+            });
+            let to = -1;
+            if (target) {
+                if (target.key === drag.lockKey) return;
+                to = keys.indexOf(target.key);
+                drag.lockKey = target.key;
+            } else {
+                drag.lockKey = null;
+                // Past the last tile (below it, or to its right on the last row): move to the end
+                const last = tiles[tiles.length - 1].el.getBoundingClientRect();
+                if (drag.y > last.bottom || (drag.y >= last.top && drag.x > last.right)) to = keys.length - 1;
+            }
+            if (to < 0 || to === from) return;
+            keys.splice(from, 1);
+            keys.splice(to, 0, drag.key);
+            setVisibleChartOrder(keys);
+        }
+
+        function autoScrollLayoutDrag() {
+            const drag = layoutEditor.drag;
+            const edge = 80;
+            let dy = 0;
+            if (drag.y < edge) dy = -Math.ceil((edge - drag.y) / 4);
+            else if (drag.y > window.innerHeight - edge) dy = Math.ceil((drag.y - (window.innerHeight - edge)) / 4);
+            if (!dy) return;
+            window.scrollBy(0, dy);
+            if (drag.free) updateFreeDrag();
+            else layoutDragHitTest();
+        }
+
+        function endLayoutDrag() {
+            const drag = layoutEditor.drag;
+            if (!drag) return;
+            layoutEditor.drag = null;
+            removeLayoutPointerListeners();
+            showSnapGuides(null);
+            if (drag.free && drag.started) storeChartLayout();
+            if (drag.ghost) drag.ghost.remove();
+            drag.el.classList.remove('layout-drag-source');
+            drag.frame.classList.remove('is-dragging');
+            document.body.classList.remove('layout-dragging');
+        }
+
+        // --- Resizing: width snaps to grid columns, height to 10px steps and to the height
+        // of a neighbour on the same row ---
+        function beginLayoutResize(frame, tile, axis, e) {
+            const grid = document.getElementById('chart-grid');
+            const gap = parseFloat(getComputedStyle(grid).columnGap) || 0;
+            const tiles = getLayoutTiles();
+            const tileRect = tile.el.getBoundingClientRect();
+            const height = tileHeight(tile);
+            layoutEditor.resize = {
+                key: tile.key, el: tile.el, frame, axis,
+                startX: e.clientX, startY: e.clientY,
+                startWidth: tileRect.width,
+                startHeight: height,
+                // Tile height outside the controlled pane (the price chart's toolbar and indicator panes)
+                chrome: tileRect.height - height,
+                gap,
+                colWidth: (grid.getBoundingClientRect().width - gap * (LAYOUT_COLUMNS - 1)) / LAYOUT_COLUMNS,
+                span: tileSpan(tile, tiles),
+                height,
+                free: freeLayoutActive(),
+            };
+            frame.classList.add('is-resizing');
+            document.body.classList.add('layout-resizing');
+            document.body.style.cursor = getComputedStyle(e.target).cursor;
+        }
+
+        function snapToRowHeight(resize, height) {
+            const selfTop = resize.el.getBoundingClientRect().top;
+            let best = height;
+            let bestDiff = LAYOUT_HEIGHT_SNAP + 1;
+            getLayoutTiles().forEach(tile => {
+                if (tile.key === resize.key) return;
+                const r = tile.el.getBoundingClientRect();
+                if (Math.abs(r.top - selfTop) > 2) return;
+                const candidate = Math.round(r.height - resize.chrome);
+                const diff = Math.abs(candidate - height);
+                if (diff < bestDiff) {
+                    best = candidate;
+                    bestDiff = diff;
+                }
+            });
+            return best;
+        }
+
+        // Free mode: the right and bottom edges follow the pointer and snap to other charts' edges
+        function moveFreeResize(e) {
+            const resize = layoutEditor.resize;
+            const entry = chartLayout.free[resize.key];
+            if (!entry) return;
+            const width = document.getElementById('chart-grid').getBoundingClientRect().width;
+            const left = entry.x * width;
+            const top = entry.y;
+            let right = left + resize.startWidth + e.clientX - resize.startX;
+            let bottom = top + resize.startHeight + resize.chrome + e.clientY - resize.startY;
+            const resizeX = resize.axis.includes('x');
+            const resizeY = resize.axis.includes('y');
+            const snap = e.altKey ? null : snapFreeBox(resize.key, { left, right, top, bottom }, resizeX ? ['right'] : [], resizeY ? ['bottom'] : []);
+            if (snap) {
+                right += snap.dx;
+                bottom += snap.dy;
+            }
+            showSnapGuides(snap);
+            if (resizeX) {
+                entry.w = Math.min(width - left, Math.max(LAYOUT_FREE_MIN_WIDTH, right - left)) / width;
+            }
+            if (resizeY) {
+                const limits = tileHeightLimits(resize.key);
+                let height = bottom - top - resize.chrome;
+                if (!snap || snap.y === null) height = Math.round(height / LAYOUT_HEIGHT_STEP) * LAYOUT_HEIGHT_STEP;
+                entry.height = Math.round(Math.max(limits.min, Math.min(limits.max, height)));
+            }
+            applyChartLayout();
+        }
+
+        function moveLayoutResize(e) {
+            const resize = layoutEditor.resize;
+            if (resize.free) {
+                moveFreeResize(e);
+                return;
+            }
+            const patch = {};
+            if (resize.axis.includes('x')) {
+                const span = Math.round((resize.startWidth + e.clientX - resize.startX + resize.gap) / (resize.colWidth + resize.gap));
+                patch.span = Math.max(LAYOUT_MIN_SPAN, Math.min(LAYOUT_COLUMNS, span));
+            }
+            if (resize.axis.includes('y')) {
+                const limits = tileHeightLimits(resize.key);
+                let height = Math.round((resize.startHeight + e.clientY - resize.startY) / LAYOUT_HEIGHT_STEP) * LAYOUT_HEIGHT_STEP;
+                height = snapToRowHeight(resize, height);
+                patch.height = Math.max(limits.min, Math.min(limits.max, height));
+            }
+            const changed = Object.keys(patch).some(prop => patch[prop] !== resize[prop]);
+            if (!changed) return;
+            Object.assign(resize, patch);
+            const tile = Object.assign({}, chartLayout.tiles[resize.key], patch);
+            chartLayout.tiles[resize.key] = tile;
+            applyChartLayout();
+        }
+
+        function endLayoutResize() {
+            const resize = layoutEditor.resize;
+            if (!resize) return;
+            layoutEditor.resize = null;
+            removeLayoutPointerListeners();
+            showSnapGuides(null);
+            resize.frame.classList.remove('is-resizing');
+            document.body.classList.remove('layout-resizing');
+            document.body.style.cursor = '';
+            storeChartLayout();
+            resizeChartsAfterFullscreen();
+        }
+
+        function onLayoutFrameKeyDown(e) {
+            const steps = { ArrowLeft: -1, ArrowUp: -1, ArrowRight: 1, ArrowDown: 1 };
+            if (!(e.key in steps)) return;
+            e.preventDefault();
+            const key = e.currentTarget.dataset.key;
+            const tiles = getLayoutTiles();
+            const tile = tiles.find(t => t.key === key);
+            if (!tile) return;
+            const step = steps[e.key];
+            const horizontal = e.key === 'ArrowLeft' || e.key === 'ArrowRight';
+            if (freeLayoutActive()) {
+                const entry = chartLayout.free[key];
+                if (!entry) return;
+                const width = document.getElementById('chart-grid').getBoundingClientRect().width;
+                const px = step * LAYOUT_FREE_KEY_STEP;
+                if (e.shiftKey && horizontal) {
+                    entry.w = Math.min(1 - entry.x, Math.max(LAYOUT_FREE_MIN_WIDTH / width, entry.w + px / width));
+                } else if (e.shiftKey) {
+                    const limits = tileHeightLimits(key);
+                    entry.height = Math.max(limits.min, Math.min(limits.max, tileHeight(tile) + step * LAYOUT_KEY_HEIGHT_STEP));
+                } else if (horizontal) {
+                    entry.x = Math.max(0, Math.min(1 - entry.w, entry.x + px / width));
+                } else {
+                    entry.y = Math.max(0, entry.y + px);
+                }
+                applyChartLayout();
+                storeChartLayout();
+                return;
+            }
+            if (e.shiftKey) {
+                if (horizontal) {
+                    const span = Math.max(LAYOUT_MIN_SPAN, Math.min(LAYOUT_COLUMNS, tileSpan(tile, tiles) + step));
+                    setTileLayout(key, { span });
+                } else {
+                    const limits = tileHeightLimits(key);
+                    const height = Math.max(limits.min, Math.min(limits.max, tileHeight(tile) + step * LAYOUT_KEY_HEIGHT_STEP));
+                    setTileLayout(key, { height });
+                }
+                return;
+            }
+            const keys = tiles.map(t => t.key);
+            const from = keys.indexOf(key);
+            const to = from + step;
+            if (to < 0 || to >= keys.length) return;
+            keys.splice(from, 1);
+            keys.splice(to, 0, key);
+            setVisibleChartOrder(keys);
+            requestAnimationFrame(() => {
+                const frame = layoutEditor.frames.get(key);
+                if (frame) frame.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+            });
+        }
+
+        document.getElementById('layout-edit-toggle').addEventListener('click', () => setLayoutEditing(!layoutEditor.active));
+        document.addEventListener('keydown', e => {
+            if (e.key === 'Escape' && layoutEditor.active) setLayoutEditing(false);
+        });
+        window.addEventListener('resize', () => {
+            if (layoutEditor.active && isMobileViewport()) setLayoutEditing(false);
+            // Crossing into or out of the phone layout switches free mode off or back on
+            applyChartLayout();
+        });
+        // Free mode: clicking a chart brings it in front of any it overlaps
+        document.getElementById('chart-grid').addEventListener('pointerdown', e => {
+            if (!freeLayoutActive()) return;
+            const el = e.target.closest('.price-chart-container, .charts-grid > .chart-container');
+            const tile = getLayoutTiles().find(t => t.el === el);
+            if (tile) bringTileToFront(tile.key);
+        }, true);
+        applyChartLayout();
+        // --- End dashboard layout ---
+
         // Settings save/load functions
         function gatherSettings() {
             return {
@@ -15367,6 +17130,7 @@ ${popoutHelperSource([getThemeValue, escapeTooltipHtml, stripTooltipHtml, format
                 heatmap_coloring_mode: document.getElementById('heatmap_coloring_mode').value,
                 forecast_type: document.getElementById('forecast_type').value,
                 forecast_range: document.getElementById('forecast_range').value,
+                forecast_split: document.getElementById('forecast_split').value,
                 delta_adjusted_exposures: document.getElementById('delta_adjusted_exposures').checked,
                 calculate_in_notional: document.getElementById('calculate_in_notional').checked,
                 show_calls: document.getElementById('show_calls').checked,
@@ -15391,6 +17155,7 @@ ${popoutHelperSource([getThemeValue, escapeTooltipHtml, stripTooltipHtml, format
                 // Indicator state
                 active_indicators: Array.from(tvActiveInds),
                 indicator_params: JSON.parse(JSON.stringify(tvIndicatorParams)),
+                chart_layout: chartLayout,
                 // Chart visibility
                 charts: {
                     price: document.getElementById('price').checked,
@@ -15412,7 +17177,7 @@ ${popoutHelperSource([getThemeValue, escapeTooltipHtml, stripTooltipHtml, format
             };
         }
         
-        function applySettings(settings) {
+        function applySettings(settings, explicitLoad = true) {
             if (settings.ticker) document.getElementById('ticker').value = settings.ticker;
             applyTheme(settings.theme || 'dark');
             if (settings.timeframe) document.getElementById('timeframe').value = settings.timeframe;
@@ -15425,6 +17190,7 @@ ${popoutHelperSource([getThemeValue, escapeTooltipHtml, stripTooltipHtml, format
             if (settings.heatmap_coloring_mode) document.getElementById('heatmap_coloring_mode').value = settings.heatmap_coloring_mode;
             if (settings.forecast_type) document.getElementById('forecast_type').value = settings.forecast_type;
             if (settings.forecast_range) document.getElementById('forecast_range').value = settings.forecast_range;
+            if (settings.forecast_split) document.getElementById('forecast_split').value = settings.forecast_split;
             if (settings.delta_adjusted_exposures !== undefined) document.getElementById('delta_adjusted_exposures').checked = settings.delta_adjusted_exposures;
             if (settings.calculate_in_notional !== undefined) document.getElementById('calculate_in_notional').checked = settings.calculate_in_notional;
             if (settings.show_calls !== undefined) document.getElementById('show_calls').checked = settings.show_calls;
@@ -15484,6 +17250,10 @@ ${popoutHelperSource([getThemeValue, escapeTooltipHtml, stripTooltipHtml, format
                     const checkbox = document.getElementById(chartId);
                     if (checkbox) checkbox.checked = settings.charts[chartId];
                 });
+            }
+            // The startup auto-load keeps layout edits this browser made since the last Save
+            if (settings.chart_layout && (explicitLoad || !hasStoredChartLayout())) {
+                setChartLayout(settings.chart_layout);
             }
             // Restore indicator parameters
             if (settings.indicator_params && typeof settings.indicator_params === 'object') {
@@ -15556,7 +17326,7 @@ ${popoutHelperSource([getThemeValue, escapeTooltipHtml, stripTooltipHtml, format
                         loadExpirations();
                     }
                 } else {
-                    applySettings(data);
+                    applySettings(data, showFeedback);
                     if (showFeedback) {
                         const btn = document.getElementById('loadSettings');
                         btn.classList.add('success');
@@ -15793,18 +17563,21 @@ def build_update_payload(data):
         # A chain missing some of the selected expiries would record a fake dip in the
         # history tables, so only persist complete snapshots.
         complete_snapshot = not (calls.attrs.get('partial_fetch') or puts.attrs.get('partial_fetch'))
+        # Exposure surface drawn one panel per expiry instead of summed
+        forecast_split = bool(data.get('show_forecast') and data.get('forecast_split')) and len(expiry_dates) > 1
 
         # Recording history must never take the charts down with it
         try:
             if complete_snapshot:
                 store_interval_data(ticker, S, strike_range, calls, puts, expiry_key=expiry_key)
                 store_centroid_data(ticker, S, calls, puts, expiry_key=expiry_key)
-                record_surface_snapshot(ticker, S, calls, puts, expiry_key, exposure_metric,
-                                        delta_adjusted, calculate_in_notional)
+                record_surface_snapshots(ticker, S, calls, puts, expiry_dates, exposure_metric,
+                                         delta_adjusted, calculate_in_notional, per_expiry=forecast_split)
 
             register_collector_selection(
                 ticker, expiry_dates, strike_range, exposure_metric,
                 delta_adjusted, calculate_in_notional, stored=complete_snapshot,
+                surface_split=forecast_split,
             )
 
             # Prune old sessions once per ET trading date
@@ -15946,12 +17719,12 @@ def build_update_payload(data):
             response['forecast'] = _safe_chart(
                 'forecast', get_exposure_forecast_chart,
                 (ticker, expiry_key, forecast_type, exposure_metric, bool(delta_adjusted), calculate_in_notional,
-                 forecast_range, forecast_timeframe, call_color, put_color),
+                 forecast_range, forecast_timeframe, call_color, put_color, forecast_split),
                 calls=calls, puts=puts, S=S, ticker=ticker, exposure_type=forecast_type,
                 exposure_metric=exposure_metric, delta_adjusted=bool(delta_adjusted),
                 calculate_in_notional=calculate_in_notional, price_range=forecast_range,
                 timeframe=forecast_timeframe, call_color=call_color, put_color=put_color,
-                selected_expiries=expiry_dates,
+                selected_expiries=expiry_dates, split_expiries=forecast_split,
             )
             response['forecast_candles'] = _safe_chart(
                 'forecast candles', forecast_candles_payload, ticker, forecast_timeframe, call_color, put_color)
@@ -15981,30 +17754,11 @@ def build_update_payload(data):
 
             # --- Always Calculate Expected Move Range (same as chart logic) ---
             expected_move_range = None
-            strikes_sorted = sorted(calls['strike'].unique()) if not calls.empty else []
-            if strikes_sorted:
-                atm_strike = min(strikes_sorted, key=lambda x: abs(x - S))
-                def get_mid(df, strike):
-                    row = df.loc[df['strike'] == strike]
-                    if row is not None and not row.empty:
-                        bid = row['bid'].values[0]
-                        ask = row['ask'].values[0]
-                        if bid > 0 and ask > 0:
-                            return (bid + ask) / 2
-                        elif bid > 0:
-                            return bid
-                        elif ask > 0:
-                            return ask
-                    return None
-                call_mid_atm = get_mid(calls, atm_strike)
-                put_mid_atm = get_mid(puts, atm_strike)
-                straddle = (call_mid_atm if call_mid_atm is not None else 0) + (put_mid_atm if put_mid_atm is not None else 0)
-                # Expected Move = ATM Straddle (most common market formula)
-                expected_move = straddle
-                if expected_move > 0:
-                    upper = S + expected_move
-                    lower = S - expected_move
-                    expected_move_range = {'lower': round(lower, 2), 'upper': round(upper, 2), 'move': round(expected_move, 2)}
+            expected_move = calculate_expected_move_snapshot(calls, puts, S)
+            if expected_move:
+                expected_move_range = {'lower': round(expected_move['lower'], 2),
+                                       'upper': round(expected_move['upper'], 2),
+                                       'move': round(expected_move['move'], 2)}
 
             if quote_data:
                 ticker_data = quote_entry(quote_data, quote_ticker) or {}
